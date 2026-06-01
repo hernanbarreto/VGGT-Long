@@ -262,6 +262,47 @@ class VGGT_Long:
 
         return predictions if is_loop or range_2 is not None else None
     
+    def _stac_write_origins(self, chunk_data, K):
+        """STAC patch: write per-point origins (frame_global = REAL frame number,
+        pixel_row/col, confidence) for chunk K using the SAME confidence mask that
+        save_confident_pointcloud_batch uses for the PLY. Computed in THIS process →
+        guaranteed 1:1 with the PLY points (no cross-process float-boundary drift that
+        made CloudComPy drop the origins). Saved next to the PLY as {K}_origins.npz."""
+        import re as _re
+        try:
+            ps = self.config['Model']['Pointcloud_Save']
+            coef = ps['conf_threshold_coef']
+            use_filter = ps.get('use_conf_filter', True)
+            wp = chunk_data['world_points']
+            if wp.ndim == 5:
+                wp = wp[0]
+            S, H, W = wp.shape[:3]
+            confs = chunk_data['world_points_conf'].reshape(-1)
+            cfs32 = confs.astype(np.float32)
+            thr = (float(np.mean(confs)) * coef) if use_filter else -1.0
+            mask = (cfs32 >= thr) & (cfs32 > 1e-5)           # identical to save_confident
+            surviving = np.flatnonzero(mask)
+            HW = H * W
+            frame_local = surviving // HW
+            within = surviving % HW
+            pixel_row = (within // W).astype(np.int16)
+            pixel_col = (within % W).astype(np.int16)
+            # real frame number = numeric stem of each processed frame's filename
+            start = self.chunk_indices[K][0]
+            real_per_local = np.array(
+                [int(_re.search(r'(\d+)', os.path.basename(self.img_list[start + fl])).group(1))
+                 if _re.search(r'(\d+)', os.path.basename(self.img_list[start + fl])) else (start + fl)
+                 for fl in range(S)], dtype=np.int32)
+            frame_global = real_per_local[frame_local]
+            np.savez_compressed(
+                os.path.join(self.pcd_dir, f"{K}_origins.npz"),
+                frame_global=frame_global, pixel_row=pixel_row, pixel_col=pixel_col,
+                confidence=cfs32[surviving].astype(np.float32),
+                scaled_resolution=np.array([H, W], np.int32))
+            print(f"[STAC] wrote {K}_origins.npz ({len(surviving)} pts, 1:1 with PLY)")
+        except Exception as _e:
+            print(f"[STAC] WARN: could not write {K}_origins.npz: {_e}")
+
     def process_long_sequence(self):
         if self.overlap >= self.chunk_size:
             raise ValueError(f"[SETTING ERROR] Overlap ({self.overlap}) must be less than chunk size ({self.chunk_size})")
@@ -496,6 +537,7 @@ class VGGT_Long:
                         if self.config['Model']['Pointcloud_Save'].get('use_conf_filter', True) else -1.0),
                     sample_ratio=self.config['Model']['Pointcloud_Save']['sample_ratio']
                 )
+                self._stac_write_origins(chunk_data_first, 0)
 
 
             aligned_chunk_data = np.load(os.path.join(self.result_aligned_dir, f"chunk_{chunk_idx+1}.npy"),
@@ -514,6 +556,7 @@ class VGGT_Long:
                     if self.config['Model']['Pointcloud_Save'].get('use_conf_filter', True) else -1.0),
                 sample_ratio=self.config['Model']['Pointcloud_Save']['sample_ratio']
             )
+            self._stac_write_origins(aligned_chunk_data, chunk_idx + 1)
 
         self.save_camera_poses()
         
