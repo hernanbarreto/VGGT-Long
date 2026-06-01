@@ -94,8 +94,9 @@ class LongSeqResult:
         self.all_camera_intrinsics = [] 
 
 class VGGT_Long:
-    def __init__(self, image_dir, save_dir, config):
+    def __init__(self, image_dir, save_dir, config, selected_frames=None):
         self.config = config
+        self.selected_frames = selected_frames  # STAC patch: optional keyframe subset
 
         self.chunk_size = self.config['Model']['chunk_size']
         self.overlap = self.config['Model']['overlap']
@@ -163,6 +164,28 @@ class VGGT_Long:
 
     def get_loop_pairs(self):
 
+        # STAC patch (resume): if loop_closures.txt already exists, load the pairs and
+        # SKIP the DINOv2/SALAD feature extraction (~20 min). Pairs are written as
+        # "i, j, sim" lines; "#" lines are headers/the image-path list.
+        loop_txt = os.path.join(self.output_dir, "loop_closures.txt")
+        if not self.useDBoW and os.path.exists(loop_txt):
+            try:
+                pairs = []
+                with open(loop_txt) as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        parts = [p.strip() for p in line.split(",")]
+                        if len(parts) >= 2:
+                            pairs.append((int(parts[0]), int(parts[1])))
+                self.loop_list = pairs
+                print(f"[STAC resume] loop_closures.txt found — {len(pairs)} loops loaded, "
+                      f"DINOv2 extraction skipped")
+                return
+            except Exception as _e:
+                print(f"[STAC resume] loop_closures.txt unreadable ({_e}) — re-detecting")
+
         if self.useDBoW: # DBoW2
             for frame_id, img_path in tqdm(enumerate(self.img_list)):
                 image_ori = np.array(Image.open(img_path))
@@ -195,12 +218,7 @@ class VGGT_Long:
             start_idx, end_idx = range_2
             chunk_image_paths += self.img_list[start_idx:end_idx]
 
-        predictions = self.model.infer_chunk(chunk_image_paths)
-        for key in predictions.keys():
-            if isinstance(predictions[key], torch.Tensor):
-                predictions[key] = predictions[key].cpu().numpy().squeeze(0)
-        
-        # Save predictions to disk instead of keeping in memory
+        # Resolve the output path FIRST so we can resume from an existing chunk.
         if is_loop:
             save_dir = self.result_loop_dir
             filename = f"loop_{range_1[0]}_{range_1[1]}_{range_2[0]}_{range_2[1]}.npy"
@@ -209,9 +227,28 @@ class VGGT_Long:
                 raise ValueError("chunk_idx must be provided when is_loop is False")
             save_dir = self.result_unaligned_dir
             filename = f"chunk_{chunk_idx}.npy"
-        
         save_path = os.path.join(save_dir, filename)
-                    
+
+        # STAC patch (resume): if this chunk's .npy already exists (prior run), load it
+        # and SKIP the expensive inference. Restore the camera state EXACTLY as the
+        # inference path does, so SIM3 + alignment + pose saving are unaffected. A
+        # corrupt/half-written file falls through and re-infers.
+        if os.path.exists(save_path):
+            try:
+                predictions = np.load(save_path, allow_pickle=True).item()
+                if not is_loop and range_2 is None:
+                    self.all_camera_poses.append((self.chunk_indices[chunk_idx], predictions['extrinsic']))
+                    self.all_camera_intrinsics.append((self.chunk_indices[chunk_idx], predictions['intrinsic']))
+                print(f'[STAC resume] {filename} on disk — inference skipped')
+                return predictions if is_loop or range_2 is not None else None
+            except Exception as _e:
+                print(f'[STAC resume] {filename} unreadable ({_e}) — re-inferring')
+
+        predictions = self.model.infer_chunk(chunk_image_paths)
+        for key in predictions.keys():
+            if isinstance(predictions[key], torch.Tensor):
+                predictions[key] = predictions[key].cpu().numpy().squeeze(0)
+
         if not is_loop and range_2 is None:
             extrinsics = predictions['extrinsic']
             intrinsics = predictions['intrinsic']
@@ -222,7 +259,7 @@ class VGGT_Long:
         predictions['depth'] = np.squeeze(predictions['depth'])
 
         np.save(save_path, predictions)
-        
+
         return predictions if is_loop or range_2 is not None else None
     
     def process_long_sequence(self):
@@ -416,6 +453,16 @@ class VGGT_Long:
         print('Apply alignment')
         self.sim3_list = accumulate_sim3_transforms(self.sim3_list)
         for chunk_idx in range(len(self.chunk_indices) - 1):
+            # STAC patch (resume): skip this chunk's apply if its aligned .npy + pcd .ply
+            # already exist (from a prior run). chunk_0 is written inside the idx==0 branch.
+            _done = (os.path.exists(os.path.join(self.result_aligned_dir, f"chunk_{chunk_idx + 1}.npy"))
+                     and os.path.exists(os.path.join(self.pcd_dir, f"{chunk_idx + 1}_pcd.ply")))
+            if chunk_idx == 0:
+                _done = _done and os.path.exists(os.path.join(self.result_aligned_dir, "chunk_0.npy")) \
+                        and os.path.exists(os.path.join(self.pcd_dir, "0_pcd.ply"))
+            if _done:
+                print(f'[STAC resume] chunk {chunk_idx + 1} aligned+pcd exist — apply skipped')
+                continue
             print(f'Applying {chunk_idx + 1} -> {chunk_idx} (Total {len(self.chunk_indices) - 1})')
             s, R, t = self.sim3_list[chunk_idx]
 
@@ -476,10 +523,45 @@ class VGGT_Long:
         print(f"Loading images from {self.img_dir}...")
         self.img_list = sorted(glob.glob(os.path.join(self.img_dir, "*.jpg")) +
                                glob.glob(os.path.join(self.img_dir, "*.png")))
+        # STAC patch: restrict to selected keyframes (selected_frames.json -> "selected_files")
+        if self.selected_frames:
+            import json as _json
+            with open(self.selected_frames, 'r') as _f:
+                _sel = set(_json.load(_f).get("selected_files", []))
+            if _sel:
+                _filtered = [p for p in self.img_list if os.path.basename(p) in _sel]
+                print(f"[STAC] keyframe filter: {len(self.img_list)} -> {len(_filtered)} "
+                      f"frames (from {self.selected_frames})")
+                self.img_list = _filtered
+        # STAC patch: uniform temporal stride (1-of-N). SAME value the loop detector
+        # (LoopModel.get_image_paths) reads, so loop indices stay aligned with chunks.
+        _stride = int(self.config.get('Model', {}).get('frame_stride', 1) or 1)
+        if _stride > 1:
+            _before = len(self.img_list)
+            self.img_list = self.img_list[::_stride]
+            print(f"[STAC] frame stride {_stride}: {_before} -> {len(self.img_list)} frames")
         # print(self.img_list)
         if len(self.img_list) == 0:
             raise ValueError(f"[DIR EMPTY] No images found in {self.img_dir}!")
         print(f"Found {len(self.img_list)} images")
+
+        # STAC patch: dump the EXACT ordered list of frames processed (after any
+        # keyframe filter + stride). This is the single source of truth that lets
+        # the downstream origins map frame_global (index) -> real frame number,
+        # so per-point traceability survives stride/keyframe subsetting.
+        try:
+            import json as _json
+            with open(os.path.join(self.output_dir, "frame_list.json"), "w") as _fl:
+                _json.dump([os.path.basename(p) for p in self.img_list], _fl)
+            print(f"[STAC] wrote frame_list.json ({len(self.img_list)} frames)")
+        except Exception as _e:
+            print(f"[STAC] WARN: could not write frame_list.json: {_e}")
+
+        # STAC patch (resume): if camera_poses.txt already exists, VGGT-Long fully
+        # completed on a prior run — nothing to recompute, skip the whole pipeline.
+        if os.path.exists(os.path.join(self.output_dir, "camera_poses.txt")):
+            print("[STAC resume] camera_poses.txt exists — VGGT-Long already complete, skipping")
+            return
 
         if self.loop_enable:
             self.get_loop_pairs()
@@ -658,6 +740,11 @@ if __name__ == '__main__':
                         help='Image path')
     parser.add_argument('--config', type=str, required=False, default='./configs/base_config.yaml',
                         help='config path')
+    # STAC patch: explicit output dir + optional keyframe subset (restores STAC fork CLI)
+    parser.add_argument('--save_dir', type=str, required=False, default=None,
+                        help='explicit output dir (default: auto timestamped under ./exps)')
+    parser.add_argument('--selected_frames', type=str, required=False, default=None,
+                        help='path to selected_frames.json (uses its "selected_files" list)')
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -667,23 +754,28 @@ if __name__ == '__main__':
     current_datetime = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
     exp_dir = './exps'
 
-    save_dir = os.path.join(
-            exp_dir, image_dir.replace("/", "_"), current_datetime
-        )
-    
+    if args.save_dir:                       # STAC patch: honor explicit save_dir
+        save_dir = args.save_dir
+    else:
+        save_dir = os.path.join(
+                exp_dir, image_dir.replace("/", "_"), current_datetime
+            )
+
     # save_dir = os.path.join(
     #     exp_dir, path[-3] + "_" + path[-2] + "_" + path[-1], current_datetime
     # )
 
-    if not os.path.exists(save_dir): 
+    if not os.path.exists(save_dir):
         os.makedirs(save_dir)
         print(f'The exp will be saved under dir: {save_dir}')
         copy_file(args.config, save_dir)
+    else:
+        copy_file(args.config, save_dir)    # STAC patch: save_dir may pre-exist
 
     if config['Model']['align_method'] == 'numba':
         warmup_numba()
 
-    vggt_long = VGGT_Long(image_dir, save_dir, config)
+    vggt_long = VGGT_Long(image_dir, save_dir, config, selected_frames=args.selected_frames)
     vggt_long.run()
     vggt_long.close()
 

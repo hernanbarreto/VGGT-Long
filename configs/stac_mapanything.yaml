@@ -1,0 +1,30 @@
+inherit_from: "configs/base_config.yaml"
+
+Weights:
+  model: 'Mapanything'  # Use MapAnything foundation model
+  # Map overridden by config.yaml mapanything.model_weights (facebook/map-anything-apache)
+  Map: 'facebook/map-anything-apache'
+  # Loop-closure weights — absolute paths to the files already present on the pod
+  # (the relative ./weights/ dir was lost in migration). Same DINOv2/SALAD the DA3
+  # loop closure + keyframe selector already use.
+  DNIO: '/workspace/torch_cache/hub/checkpoints/dinov2_vitb14_pretrain.pth'
+  SALAD: '/workspace/stac-build/weights/da3/dino_salad.ckpt'
+
+Model:
+  chunk_size: 120        # overridden by config.yaml mapanything.chunk_size
+  overlap: 60            # overridden by config.yaml mapanything.chunk_overlap
+  loop_chunk_size: 20    # imgs of loop chunk = 2 * loop_chunk_size
+  loop_enable: True      # overridden by config.yaml mapanything.loop_closure
+  useDBoW: False
+  delete_temp_files: True   # forced False in code (keep .npy for origin traceability)
+  align_method: 'numba'  # 'numba' or 'numpy'
+  using_sim3: False      # MapAnything REQUIRES SE(3) alignment (sim3 would break it)
+  reference_frame_mid: False
+  calib: False           # get K from input; no fixed kitti intrinsics
+  h: 720                 # input h
+  w: 1280                # input w
+
+  Pointcloud_Save:
+    sample_ratio: 1.0         # overridden by config.yaml mapanything.sample_ratio
+    conf_threshold_coef: 0.75 # overridden by config.yaml mapanything.conf_threshold_coef
+    use_conf_filter: True

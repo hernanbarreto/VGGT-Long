@@ -97,6 +97,10 @@ class LoopDetector:
             image_paths.extend(list(Path(self.image_dir).glob(f"*{ext.upper()}")))
         
         image_paths = sorted(image_paths)
+        # STAC patch: SAME uniform stride as VGGT_Long.run() so loop indices align with chunks
+        _stride = int(self.config.get('Model', {}).get('frame_stride', 1) or 1)
+        if _stride > 1:
+            image_paths = image_paths[::_stride]
         self.image_paths = image_paths
         return image_paths
     
