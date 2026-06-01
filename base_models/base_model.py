@@ -290,7 +290,9 @@ class MapAnythingAdapter(Base3DModel):
                     z = np.load(npz)
                     if "depth" in z and "intrinsics" in z:
                         depth = np.asarray(z["depth"], dtype=np.float32)
-                        K = np.asarray(z["intrinsics"], dtype=np.float64).reshape(3, 3)
+                        # float32 (NOT float64): MapAnything derives ray_dirs from K and
+                        # index_puts into a float32 buffer — float64 K → dtype mismatch crash.
+                        K = np.asarray(z["intrinsics"], dtype=np.float32).reshape(3, 3)
                         dh, dw = depth.shape
                         if (img.shape[0], img.shape[1]) != (dh, dw):
                             img = cv2.resize(img, (dw, dh), interpolation=cv2.INTER_AREA)
