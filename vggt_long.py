@@ -826,9 +826,8 @@ if __name__ == '__main__':
     torch.cuda.empty_cache()
     gc.collect()
 
-    all_ply_path = os.path.join(save_dir, f'pcd/combined_pcd.ply')
-    input_dir = os.path.join(save_dir, f'pcd')
-    print("Saving all the point clouds")
-    merge_ply_files(input_dir, all_ply_path)
+    # STAC patch: do NOT build pcd/combined_pcd.ply — the STAC pipeline never uses it
+    # (_postprocess_reconstruction merges the per-chunk pcd/{K}_pcd.ply, and skips any
+    # "combined" file). It was tens of GB of wasted disk + merge time.
     print('All done.')
     sys.exit()
