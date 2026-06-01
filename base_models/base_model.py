@@ -269,6 +269,46 @@ class MapAnythingAdapter(Base3DModel):
         self.model = MapAnything.from_pretrained(url)
         self.model.eval().to(self.device)
 
+    def _stac_load_views_with_da3_priors(self, image_paths, priors_dir):
+        """STAC: build MapAnything multi-modal views = img + DA3 metric depth + intrinsics
+        per frame (from da3 results_output/frame_<n>.npz, keyed by real frame number).
+        Returns preprocess_inputs() output, or None if unusable (caller → image-only).
+        Poses are intentionally NOT included (MapAnything estimates them)."""
+        import os, re, numpy as np, cv2, torch as _torch
+        from mapanything.utils.image import preprocess_inputs
+        priors_dir = str(priors_dir)
+        raw_views = []
+        n_with = 0
+        for p in image_paths:
+            img = cv2.cvtColor(cv2.imread(p), cv2.COLOR_BGR2RGB)  # (H,W,3) uint8 [0,255]
+            view = {"img": img}
+            m = re.search(r'(\d+)', os.path.basename(p))
+            fn = int(m.group(1)) if m else None
+            npz = os.path.join(priors_dir, f"frame_{fn}.npz") if fn is not None else None
+            if npz and os.path.exists(npz):
+                try:
+                    z = np.load(npz)
+                    if "depth" in z and "intrinsics" in z:
+                        depth = np.asarray(z["depth"], dtype=np.float32)
+                        K = np.asarray(z["intrinsics"], dtype=np.float64).reshape(3, 3)
+                        dh, dw = depth.shape
+                        if (img.shape[0], img.shape[1]) != (dh, dw):
+                            img = cv2.resize(img, (dw, dh), interpolation=cv2.INTER_AREA)
+                        view = {"img": img, "intrinsics": K, "depth_z": depth,
+                                "is_metric_scale": _torch.tensor([True])}
+                        n_with += 1
+                except Exception as _e:
+                    print(f"[STAC] DA3 prior load failed for {os.path.basename(p)}: {_e}")
+            raw_views.append(view)
+        print(f"[STAC] MapAnything DA3-priors: {n_with}/{len(image_paths)} views with depth+K")
+        if n_with == 0:
+            return None
+        try:
+            return preprocess_inputs(raw_views)
+        except Exception as _e:
+            print(f"[STAC] preprocess_inputs failed ({_e}) — image-only fallback")
+            return None
+
     def infer_chunk(self, image_paths: list) -> dict:
         """
         Run inference on a chunk of images using MapAnything.
@@ -312,6 +352,15 @@ class MapAnythingAdapter(Base3DModel):
             for view in images:
                 if "intrinsics" not in view:
                     view["intrinsics"] = self.k
+
+        # STAC: DA3 priors (multi-modal) — rebuild the views with DA3 metric depth +
+        # intrinsics so MapAnything anchors to a metric, consistent scale. Overrides the
+        # image-only views above. Poses are still estimated by MapAnything (ignore_pose).
+        da3_priors_dir = self.config['Model'].get('da3_priors_dir')
+        if da3_priors_dir:
+            mm = self._stac_load_views_with_da3_priors(image_paths, da3_priors_dir)
+            if mm is not None:
+                images = mm
 
         # 3. Run Inference
         torch.cuda.empty_cache()
