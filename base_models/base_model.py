@@ -293,6 +293,17 @@ class MapAnythingAdapter(Base3DModel):
                         # float32 (NOT float64): MapAnything derives ray_dirs from K and
                         # index_puts into a float32 buffer — float64 K → dtype mismatch crash.
                         K = np.asarray(z["intrinsics"], dtype=np.float32).reshape(3, 3)
+                        # STAC: per-frame confidence floor on the prior depth. Drop the bottom
+                        # `da3_prior_conf_percentile`% least-confident pixels -> depth=0, which
+                        # MapAnything treats as "no prior" (valid mask is depth>0) and infers.
+                        # Stops low-conf DA3 depth from anchoring metric scale on floors/ceilings.
+                        pct = self.config['Model'].get('da3_prior_conf_percentile', 0)
+                        if pct and pct > 0 and "conf" in z:
+                            conf = np.asarray(z["conf"], dtype=np.float32)
+                            if conf.shape == depth.shape:
+                                thr = float(np.percentile(conf, pct))
+                                depth = depth.copy()
+                                depth[conf < thr] = 0.0
                         dh, dw = depth.shape
                         if (img.shape[0], img.shape[1]) != (dh, dw):
                             img = cv2.resize(img, (dw, dh), interpolation=cv2.INTER_AREA)
@@ -376,7 +387,8 @@ class MapAnythingAdapter(Base3DModel):
                 apply_mask=True,  # Generate masks for valid geometry
                 mask_edges=True,  # Remove edge artifacts using normals/depth
                 apply_confidence_mask=True,  # Filter low-confidence regions
-                confidence_percentile=10,  # Percentile threshold for confidence
+                # Configurable from config.yaml (mapanything.map_conf_percentile) — no hardcode.
+                confidence_percentile=self.config['Model'].get('map_conf_percentile', 10),
                 ignore_calibration_inputs=False,
                 ignore_depth_inputs=False,
                 ignore_pose_inputs=True,  # We want the model to estimate poses
