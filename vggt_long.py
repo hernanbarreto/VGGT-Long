@@ -493,6 +493,29 @@ class VGGT_Long:
 
         print('Apply alignment')
         self.sim3_list = accumulate_sim3_transforms(self.sim3_list)
+
+        # STAC patch: single-chunk case (frames <= chunk_size → exactly 1 chunk). The
+        # pairwise apply loop below is range(0) and saves NOTHING (chunk_0 is normally
+        # written inside the idx==0 branch of that loop), so short scans produced zero
+        # PLYs. Write chunk_0 here directly (identity transform — nothing to align).
+        if len(self.chunk_indices) == 1:
+            if not (os.path.exists(os.path.join(self.result_aligned_dir, "chunk_0.npy"))
+                    and os.path.exists(os.path.join(self.pcd_dir, "0_pcd.ply"))):
+                cd0 = np.load(os.path.join(self.result_unaligned_dir, "chunk_0.npy"),
+                              allow_pickle=True).item()
+                np.save(os.path.join(self.result_aligned_dir, "chunk_0.npy"), cd0)
+                pts0 = cd0['world_points'].reshape(-1, 3)
+                col0 = (cd0['images'].transpose(0, 2, 3, 1).reshape(-1, 3) * 255).astype(np.uint8)
+                cf0 = cd0['world_points_conf'].reshape(-1)
+                save_confident_pointcloud_batch(
+                    points=pts0, colors=col0, confs=cf0,
+                    output_path=os.path.join(self.pcd_dir, "0_pcd.ply"),
+                    conf_threshold=(np.mean(cf0) * self.config['Model']['Pointcloud_Save']['conf_threshold_coef']
+                        if self.config['Model']['Pointcloud_Save'].get('use_conf_filter', True) else -1.0),
+                    sample_ratio=self.config['Model']['Pointcloud_Save']['sample_ratio'])
+                self._stac_write_origins(cd0, 0)
+                print(f'[STAC] single chunk: saved 0_pcd.ply ({len(pts0)} pts)')
+
         for chunk_idx in range(len(self.chunk_indices) - 1):
             # STAC patch (resume): skip this chunk's apply if its aligned .npy + pcd .ply
             # already exist (from a prior run). chunk_0 is written inside the idx==0 branch.
@@ -600,10 +623,12 @@ class VGGT_Long:
         except Exception as _e:
             print(f"[STAC] WARN: could not write frame_list.json: {_e}")
 
-        # STAC patch (resume): if camera_poses.txt already exists, VGGT-Long fully
-        # completed on a prior run — nothing to recompute, skip the whole pipeline.
-        if os.path.exists(os.path.join(self.output_dir, "camera_poses.txt")):
-            print("[STAC resume] camera_poses.txt exists — VGGT-Long already complete, skipping")
+        # STAC patch (resume): only skip if VGGT-Long FULLY completed — camera_poses.txt
+        # AND at least one pcd/*_pcd.ply. A run that saved poses but no PLY (e.g. the old
+        # single-chunk bug) is NOT complete and must re-run (it'll reuse the cached chunks).
+        if (os.path.exists(os.path.join(self.output_dir, "camera_poses.txt"))
+                and glob.glob(os.path.join(self.pcd_dir, "*_pcd.ply"))):
+            print("[STAC resume] camera_poses.txt + pcd exist — VGGT-Long already complete, skipping")
             return
 
         if self.loop_enable:
