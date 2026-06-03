@@ -623,6 +623,27 @@ class VGGT_Long:
         except Exception as _e:
             print(f"[STAC] WARN: could not write frame_list.json: {_e}")
 
+        # STAC patch: pin the loop detector to the EXACT same frame set as the chunks.
+        # LoopDetector.run() re-globs the full image_dir and applies only frame_stride
+        # (which is 1 here — the stride is baked into selected_frames.json), so without
+        # this it processes ALL frames → loop pairs index full-dir space that does NOT
+        # match the filtered/strided chunks (self.img_list) → misaligned loop closures
+        # → corrupted global Sim3 alignment. Override get_image_paths so the loop detector
+        # uses self.img_list, keeping loop indices 1:1 with the chunks. (Same fix the da3
+        # backend applies in stray_da3_streaming.py.)
+        _ld = getattr(self, "loop_detector", None)
+        if _ld is not None:
+            from pathlib import Path as _Path
+            _kf = [_Path(p) for p in self.img_list]
+
+            def _stac_fixed_image_paths(_ld=_ld, _kf=_kf):
+                _ld.image_paths = _kf
+                return _kf
+
+            _ld.get_image_paths = _stac_fixed_image_paths
+            _ld.image_paths = _kf
+            print(f"[STAC] Loop detector pinned to {len(_kf)} frames (aligned with chunks)")
+
         # STAC patch (resume): only skip if VGGT-Long FULLY completed — camera_poses.txt
         # AND at least one pcd/*_pcd.ply. A run that saved poses but no PLY (e.g. the old
         # single-chunk bug) is NOT complete and must re-run (it'll reuse the cached chunks).
