@@ -5,7 +5,10 @@
 # LICENSE file in the root directory of this source tree.
 
 import trimesh
-import gradio as gr
+try:
+    import gradio as gr  # unused in this module; make it optional so importing
+except ImportError:      # segment_sky/download_file_from_url here doesn't require gradio
+    gr = None             # (the mapanything env has no gradio → broke the skyseg import)
 import numpy as np
 import matplotlib
 from scipy.spatial.transform import Rotation
