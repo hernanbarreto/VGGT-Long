@@ -103,7 +103,9 @@ class VGGT_Long:
         self.seed = 42
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
-        self.sky_mask = False
+        self.sky_mask = self.config['Model'].get('mask_sky', True)  # STAC: remove sky from
+                                                                    # the reconstruction with
+                                                                    # skyseg.onnx. Default ON.
         self.useDBoW = self.config['Model']['useDBoW']
 
         self.img_dir = image_dir
@@ -211,6 +213,60 @@ class VGGT_Long:
             self.loop_detector.run()
             self.loop_list = self.loop_detector.get_loop_list()
 
+    def _stac_mask_sky(self, predictions, chunk_image_paths):
+        """STAC: zero per-pixel confidence at sky regions so the cloud builder's
+        confidence filter (keeps world_points_conf >= thr) drops sky points. Uses
+        VGGT-Long's OWN skyseg.onnx — the same mechanism loop_utils.visual_util applies
+        for visualization (`world_points_conf *= non_sky`), wired into the
+        reconstruction here. Per-frame masks are cached under <save_dir>/sky_masks/;
+        skyseg.onnx is fetched once next to this file. No-op (and harmless) indoors,
+        where the segmenter finds no sky. Failures degrade to 'no masking', never crash."""
+        if not self.sky_mask:
+            return
+        wpc = predictions.get('world_points_conf', None)
+        if wpc is None or getattr(wpc, 'ndim', 0) != 3:
+            return
+        try:
+            import onnxruntime
+            from loop_utils.visual_util import segment_sky, download_file_from_url
+        except Exception as _e:
+            print(f"[STAC sky] skyseg unavailable ({_e}) — skipping sky mask")
+            return
+        S, H, W = wpc.shape
+        onnx_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skyseg.onnx")
+        if not os.path.exists(onnx_path):
+            print("[STAC sky] downloading skyseg.onnx ...")
+            try:
+                download_file_from_url(
+                    "https://huggingface.co/JianyuanWang/skyseg/resolve/main/skyseg.onnx",
+                    onnx_path)
+            except Exception as _e:
+                print(f"[STAC sky] skyseg.onnx download failed ({_e}) — skipping sky mask")
+                return
+        sky_dir = os.path.join(os.path.dirname(self.result_unaligned_dir), "sky_masks")
+        os.makedirs(sky_dir, exist_ok=True)
+        n = 0
+        for i, p in enumerate(chunk_image_paths[:S]):
+            mask_fp = os.path.join(sky_dir, os.path.splitext(os.path.basename(p))[0] + ".png")
+            try:
+                if os.path.exists(mask_fp):
+                    sky = cv2.imread(mask_fp, cv2.IMREAD_GRAYSCALE)  # 255=non-sky, 0=sky
+                else:
+                    if self.skyseg_session is None:
+                        self.skyseg_session = onnxruntime.InferenceSession(onnx_path)
+                    sky = segment_sky(p, self.skyseg_session, mask_fp)
+                if sky is None:
+                    continue
+                if sky.shape[0] != H or sky.shape[1] != W:
+                    sky = cv2.resize(sky, (W, H), interpolation=cv2.INTER_NEAREST)
+                nonsky = (sky > 0.1).astype(wpc.dtype)  # 1=keep (non-sky), 0=drop (sky)
+                wpc[i] *= nonsky
+                n += 1
+            except Exception as _e:
+                print(f"[STAC sky] frame {os.path.basename(p)} skip ({_e})")
+        predictions['world_points_conf'] = wpc
+        print(f"[STAC sky] masked sky on {n}/{S} chunk frames")
+
     def process_single_chunk(self, range_1, chunk_idx=None, range_2=None, is_loop=False):
         start_idx, end_idx = range_1
         chunk_image_paths = self.img_list[start_idx:end_idx]
@@ -257,6 +313,11 @@ class VGGT_Long:
             self.all_camera_intrinsics.append((chunk_range, intrinsics))
 
         predictions['depth'] = np.squeeze(predictions['depth'])
+
+        # STAC: drop sky points (zero their confidence) before saving, so the cloud
+        # builder's confidence filter removes them. Sky detection is MapAnything-side
+        # (skyseg.onnx) — DA3 priors are NOT relied on for this.
+        self._stac_mask_sky(predictions, chunk_image_paths)
 
         np.save(save_path, predictions)
 
