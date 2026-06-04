@@ -276,9 +276,11 @@ class MapAnythingAdapter(Base3DModel):
         Poses are intentionally NOT included (MapAnything estimates them)."""
         import os, re, numpy as np, cv2, torch as _torch
         from mapanything.utils.image import preprocess_inputs
+        use_poses = bool(self.config['Model'].get('da3_prior_use_poses', False))
         priors_dir = str(priors_dir)
         raw_views = []
         n_with = 0
+        n_pose = 0
         for p in image_paths:
             img = cv2.cvtColor(cv2.imread(p), cv2.COLOR_BGR2RGB)  # (H,W,3) uint8 [0,255]
             view = {"img": img}
@@ -310,12 +312,32 @@ class MapAnythingAdapter(Base3DModel):
                         view = {"img": img, "intrinsics": K, "depth_z": depth,
                                 "is_metric_scale": _torch.tensor([True])}
                         n_with += 1
+                        # STAC: optional pose prior (the "full prior" path). DA3 stores
+                        # w2c; MapAnything wants c2w (OpenCV RDF, 4x4). All-or-nothing is
+                        # enforced after the loop (view 0 must carry poses if any does).
+                        # NOTE: the ARKit/DA3 -> OpenCV-RDF axis convention must be
+                        # verified against real Stray data before trusting this.
+                        if use_poses and "extrinsics" in z:
+                            _ext = np.asarray(z["extrinsics"], dtype=np.float64)
+                            _w2c = np.eye(4, dtype=np.float64)
+                            _w2c[:_ext.shape[0], :_ext.shape[1]] = _ext
+                            view["camera_poses"] = np.linalg.inv(_w2c).astype(np.float32)
+                            n_pose += 1
                 except Exception as _e:
                     print(f"[STAC] DA3 prior load failed for {os.path.basename(p)}: {_e}")
             raw_views.append(view)
-        print(f"[STAC] MapAnything DA3-priors: {n_with}/{len(image_paths)} views with depth+K")
+        print(f"[STAC] MapAnything DA3-priors: {n_with}/{len(image_paths)} views with depth+K"
+              + (f", {n_pose} with pose" if use_poses else ""))
         if n_with == 0:
             return None
+        # All-or-nothing poses: MapAnything requires view 0 to carry camera_poses if any
+        # view does. If not every view got one, drop them all (depth+K prior still stands).
+        if use_poses and n_pose != len(raw_views):
+            for _v in raw_views:
+                _v.pop("camera_poses", None)
+            if n_pose:
+                print(f"[STAC] pose prior incomplete ({n_pose}/{len(raw_views)}) — "
+                      f"dropped camera_poses, kept depth+K")
         try:
             return preprocess_inputs(raw_views)
         except Exception as _e:
