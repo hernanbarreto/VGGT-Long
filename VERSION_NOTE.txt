@@ -1,0 +1,6 @@
+NOTA DE VERSION — VGGT-Long
+El proyecto stac-build fijaba el commit 7ba8efc188364ead205e21e54b37471323930a88,
+que YA NO EXISTE en el fork hernanbarreto/VGGT-Long.
+Se clonó la rama main actual en su lugar (29-05-2026).
+Si VGGT-Long se comporta distinto a lo esperado, esta diferencia de version
+es el primer lugar a revisar.
