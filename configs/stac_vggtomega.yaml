@@ -1,0 +1,31 @@
+inherit_from: "configs/base_config.yaml"
+
+Weights:
+  model: 'VGGTOmega'   # VGGT-Omega backbone (CVPR 2026) — SOTA camera/pose, dynamic-scene robust.
+  # Checkpoint downloaded into vendor/vggt-omega-weights (gated HF: facebook/VGGT-Omega).
+  VGGTOmega: '/workspace/stac-build/vendor/vggt-omega-weights/vggt_omega_1b_512.pt'
+  # Loop-closure weights — same DINOv2/SALAD the other backends use.
+  DNIO: '/workspace/torch_cache/hub/checkpoints/dinov2_vitb14_pretrain.pth'
+  SALAD: '/workspace/stac-build/weights/da3/dino_salad.ckpt'
+
+Model:
+  chunk_size: 120        # VGGT-Omega uses ~30% of VGGT memory → large chunks OK
+  overlap: 60
+  loop_chunk_size: 20
+  loop_enable: True
+  useDBoW: False
+  delete_temp_files: True   # forced False in code (keep .npy for origin traceability)
+  align_method: 'numba'
+  using_sim3: True       # VGGT-Omega is UP-TO-SCALE → Sim3 chunk alignment (scale per chunk).
+                         # Metric scale is recovered downstream by aligning to DA3 metric depth.
+  reference_frame_mid: False
+  calib: False
+  h: 720
+  w: 1280
+  omega_resolution: 512  # VGGTOmegaAdapter: load_and_preprocess_images(image_resolution=…)
+  omega_mode: 'balanced' # 'balanced' (≈res² tokens) or 'max_size' (longest side → res, less VRAM)
+
+  Pointcloud_Save:
+    sample_ratio: 1.0
+    conf_threshold_coef: 0.75
+    use_conf_filter: True
