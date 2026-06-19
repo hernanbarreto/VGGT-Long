@@ -92,10 +92,13 @@ def refine_track(
     topleft = track_int - pradius
     topleft_BSN = topleft.clone()
 
-    # clamp the values so that we will not go out of indexes
-    # NOTE: (VERY IMPORTANT: This operation ASSUMES H=W).
-    # You need to seperately clamp x and y if H!=W
-    topleft = topleft.clamp(0, H - psize)
+    # clamp the values so that we will not go out of indexes.
+    # H != W SAFE: clamp x (width index → W) and y (height index → H) SEPARATELY. The
+    # original clamped both to (H - psize) assuming H=W; on non-square inputs (e.g. 280x504)
+    # the x index then exceeds W and triggers a device-side "index out of bounds" assert.
+    # topleft[...,0]=x → width, topleft[...,1]=y → height.
+    topleft = torch.stack([topleft[..., 0].clamp(0, W - psize),
+                           topleft[..., 1].clamp(0, H - psize)], dim=-1)
 
     # Reshape from BxSxNx2 -> (B*S)xNx2
     topleft = topleft.reshape(B * S, N, 2)
@@ -235,10 +238,13 @@ def refine_track_v0(
     topleft = track_int - pradius
     topleft_BSN = topleft.clone()
 
-    # clamp the values so that we will not go out of indexes
-    # NOTE: (VERY IMPORTANT: This operation ASSUMES H=W).
-    # You need to seperately clamp x and y if H!=W
-    topleft = topleft.clamp(0, H - psize)
+    # clamp the values so that we will not go out of indexes.
+    # H != W SAFE: clamp x (width index → W) and y (height index → H) SEPARATELY. The
+    # original clamped both to (H - psize) assuming H=W; on non-square inputs (e.g. 280x504)
+    # the x index then exceeds W and triggers a device-side "index out of bounds" assert.
+    # topleft[...,0]=x → width, topleft[...,1]=y → height.
+    topleft = torch.stack([topleft[..., 0].clamp(0, W - psize),
+                           topleft[..., 1].clamp(0, H - psize)], dim=-1)
 
     # Reshape from BxSxNx2 -> (B*S)xNx2
     topleft = topleft.reshape(B * S, N, 2)
