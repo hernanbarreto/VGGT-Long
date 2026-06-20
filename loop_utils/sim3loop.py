@@ -5,11 +5,12 @@ from scipy.spatial.transform import Rotation as R
 from typing import List, Tuple
 
 cpp_version = False
+_sim3solve_import_error = None
 try:
-    import sim3solve
+    import sim3solve              # torch (imported above) must load first → libc10.so
     cpp_version = True
 except Exception as e:
-    print(f"Sim3solve of C++ Version failed, Will using Python Version.")
+    _sim3solve_import_error = e   # captured; raised in __init__ if config requests 'cpp' (no silent fallback)
 
 from fastloop.solve_python import solve_system_py
 
@@ -34,8 +35,14 @@ class Sim3LoopOptimizer:
         self.config = config
         self.solve_system_version = self.config['Loop']['SIM3_Optimizer']['lang_version'] # choose between 'python' and 'cpp'
 
-        if not cpp_version:
-            self.solve_system_version = 'python'
+        # NO silent fallback: if the C++ solver is requested but didn't import, abort loudly
+        # (the prior code quietly downgraded 'cpp' → 'python', running the slow solver forever).
+        if self.solve_system_version == 'cpp' and not cpp_version:
+            raise RuntimeError(
+                "Sim3 loop optimizer configured for C++ (lang_version: cpp) but the 'sim3solve' "
+                "extension failed to import — no fallback. Build it with "
+                "`pip install --no-build-isolation -e vendor/VGGT-Long`. "
+                f"Original import error: {_sim3solve_import_error!r}")
     
     def numpy_to_pypose_sim3(self, s: float, R_mat: np.ndarray, t_vec: np.ndarray) -> pp.Sim3:
         """Convert numpy s,R,t to pypose Sim3"""
