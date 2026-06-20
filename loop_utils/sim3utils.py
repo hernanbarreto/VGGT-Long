@@ -917,71 +917,111 @@ def warmup_numba():
 
 
 
+def _frame_resid_med(pts1, pts2, s, R, t):
+    """Median point distance of one overlap frame under (s,R,t): pts2 -> pts1 (metres)."""
+    transformed = (s * (R @ pts2.T)).T + t
+    return float(np.median(np.linalg.norm(transformed - pts1, axis=1)))
+
+
 def weighted_align_point_maps(point_map1, conf1, point_map2, conf2, mask, conf_threshold, config):
-    """ point_map2 -> point_map1"""
-    b1, _, _, _ = point_map1.shape
-    b2, _, _, _ = point_map2.shape
-    b = min(b1, b2)
-    
-    aligned_points1 = []
-    aligned_points2 = []
-    confidence_weights = []
+    """ point_map2 -> point_map1.
 
+    ROBUST per-frame gated Sim3 (STAC). The per-chunk MapAnything point maps can be
+    geometrically inconsistent by METRES within their overlap: some overlap frames align
+    to <1cm while others are several metres off (a backbone reconstruction-quality issue).
+    A single global Umeyama/Huber fit then welds a multi-metre-wrong transform with no
+    warning. Instead we: (1) build per-frame correspondences, (2) RANSAC over frames —
+    each frame proposes a Sim3, scored by how many frames are inliers under it, (3) IRLS-
+    refine on the consensus set, (4) FAIL-FAST: abort if too few frames are mutually
+    consistent or the final residual is too high (an irreconcilable chunk pair must not be
+    welded — no fallback)."""
+    b = min(point_map1.shape[0], point_map2.shape[0])
+    using_sim3 = config['Model']['using_sim3']
+    numba = config['Model']['align_method'] == 'numba'
+    delta = config['Model']['IRLS']['delta']
+    max_iters = config['Model']['IRLS']['max_iters']
+    tol = eval(config['Model']['IRLS']['tol'])
+    # gating thresholds (metres / frame counts) — config-overridable
+    frame_thr = float(config['Model'].get('align_frame_inlier_m', 0.30))
+    max_resid = float(config['Model'].get('align_max_residual_m', 0.25))
+    min_frames = int(config['Model'].get('align_min_inlier_frames', 8))
+
+    # ── per-frame correspondences (subsampled per frame: thousands of points give a fully
+    #    stable Sim3, and it bounds the O(frames²) RANSAC scoring cost) ──
+    cap = int(config['Model'].get('align_points_per_frame', 4000))
+    rng = np.random.RandomState(0)
+    per_frame = []   # (frame_idx, pts1, pts2, weights)
     for i in range(b):
-        mask1 = conf1[i] > conf_threshold
-        mask2 = conf2[i] > conf_threshold
-        valid_mask = mask1 & mask2
+        valid_mask = (conf1[i] > conf_threshold) & (conf2[i] > conf_threshold)
         if mask is not None:
-            valid_mask =valid_mask & mask[i].squeeze()
-
+            valid_mask = valid_mask & mask[i].squeeze()
         idx = np.where(valid_mask)
         if len(idx[0]) == 0:
             continue
-
-        pts1 = point_map1[i][idx]
-        pts2 = point_map2[i][idx]
-
-        combined_conf = np.sqrt(conf1[i][idx] * conf2[i][idx])
-        
-        aligned_points1.append(pts1)
-        aligned_points2.append(pts2)
-        confidence_weights.append(combined_conf)
-
-    if len(aligned_points1) == 0:
+        p1, p2 = point_map1[i][idx], point_map2[i][idx]
+        w = np.sqrt(conf1[i][idx] * conf2[i][idx])
+        if len(p1) > cap:
+            sel = rng.choice(len(p1), cap, replace=False)
+            p1, p2, w = p1[sel], p2[sel], w[sel]
+        per_frame.append((i, p1, p2, w))
+    if len(per_frame) == 0:
         raise ValueError("No matching point pairs were found!")
 
-    all_pts1 = np.concatenate(aligned_points1, axis=0)
-    all_pts2 = np.concatenate(aligned_points2, axis=0)
-    all_weights = np.concatenate(confidence_weights, axis=0)
+    def _fit(frames, robust):
+        p1 = np.concatenate([f[1] for f in frames], axis=0)
+        p2 = np.concatenate([f[2] for f in frames], axis=0)
+        w = np.concatenate([f[3] for f in frames], axis=0)
+        if robust:
+            est = robust_weighted_estimate_sim3_numba if numba else robust_weighted_estimate_sim3
+            return est(p2, p1, w, delta=delta, max_iters=max_iters, tol=tol, using_sim3=using_sim3)
+        return weighted_estimate_sim3_numba(p2, p1, w, using_sim3=using_sim3)  # fast single SVD, no IRLS spam
 
-    print(f"The number of corresponding points matched: {all_pts1.shape[0]}")
-    
-    if config['Model']['align_method'] == 'numba':
-        s, R, t = robust_weighted_estimate_sim3_numba(all_pts2, 
-                                                all_pts1, 
-                                                all_weights,
-                                                delta=config['Model']['IRLS']['delta'],
-                                                max_iters=config['Model']['IRLS']['max_iters'],
-                                                tol=eval(config['Model']['IRLS']['tol']),
-                                                using_sim3=config['Model']['using_sim3']
-                                                )
-    else: # numpy
-        s, R, t = robust_weighted_estimate_sim3(all_pts2, 
-                                                all_pts1, 
-                                                all_weights,
-                                                delta=config['Model']['IRLS']['delta'],
-                                                max_iters=config['Model']['IRLS']['max_iters'],
-                                                tol=eval(config['Model']['IRLS']['tol']),
-                                                using_sim3=config['Model']['using_sim3']
-                                                )
+    npf = len(per_frame)
+    print(f"[STAC align] {npf} overlap frames; RANSAC-over-frames gating "
+          f"(inlier<{frame_thr}m, need≥{min_frames} frames, final≤{max_resid}m)")
 
-    mean_error = compute_alignment_error(
-        point_map1, conf1, 
-        point_map2, conf2, 
-        conf_threshold, 
-        s, R, t
-    )
-    print(f'Mean error: {mean_error}')
+    # ── 1) RANSAC: each frame is a hypothesis, scored by inlier-frame consensus ──
+    best_inliers, best_srt = [], None
+    for f in per_frame:
+        try:
+            srt = _fit([f], robust=False)
+        except Exception:
+            continue
+        if not np.all(np.isfinite(srt[0])) or not np.all(np.isfinite(srt[2])):
+            continue
+        inl = [g for g in per_frame if _frame_resid_med(g[1], g[2], *srt) < frame_thr]
+        if len(inl) > len(best_inliers):
+            best_inliers, best_srt = inl, srt
+    if best_srt is None or len(best_inliers) < min_frames:
+        raise RuntimeError(
+            f"Chunk Sim3 alignment FAILED: only {len(best_inliers)}/{npf} overlap frames are "
+            f"mutually consistent (<{frame_thr}m), need ≥{min_frames}. The chunk point maps are "
+            f"geometrically irreconcilable — aborting (no fallback). Lower theta_parallax / improve "
+            f"capture overlap, or the backbone produced inconsistent per-chunk geometry.")
 
+    # ── 2) IRLS refine on the consensus frame set ──
+    active = best_inliers
+    for _ in range(4):
+        srt = _fit(active, robust=True)
+        new_active = [g for g in per_frame if _frame_resid_med(g[1], g[2], *srt) < frame_thr]
+        if len(new_active) < min_frames:
+            break
+        if {g[0] for g in new_active} == {g[0] for g in active}:
+            active = new_active
+            break
+        active = new_active
+    s, R, t = _fit(active, robust=True)
+
+    # ── 3) final fail-fast gate ──
+    resids = np.array([_frame_resid_med(g[1], g[2], s, R, t) for g in active])
+    med_resid = float(np.median(resids))
+    if len(active) < min_frames or med_resid > max_resid:
+        raise RuntimeError(
+            f"Chunk Sim3 alignment FAILED: {len(active)}/{npf} inlier frames, median residual "
+            f"{med_resid:.3f}m > {max_resid}m — irreconcilable chunk pair, aborting (no fallback).")
+    print(f"[STAC align] OK: {len(active)}/{npf} inlier frames, median residual {med_resid:.4f}m, scale {s:.4f}")
+
+    # full-overlap error for visibility (logged, not gated)
+    compute_alignment_error(point_map1, conf1, point_map2, conf2, conf_threshold, s, R, t)
     return s, R, t
 
