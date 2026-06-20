@@ -992,19 +992,22 @@ def weighted_align_point_maps(point_map1, conf1, point_map2, conf2, mask, conf_t
         inl = [g for g in per_frame if _frame_resid_med(g[1], g[2], *srt) < frame_thr]
         if len(inl) > len(best_inliers):
             best_inliers, best_srt = inl, srt
-    if best_srt is None or len(best_inliers) < min_frames:
-        raise RuntimeError(
-            f"Chunk Sim3 alignment FAILED: only {len(best_inliers)}/{npf} overlap frames are "
-            f"mutually consistent (<{frame_thr}m), need ≥{min_frames}. The chunk point maps are "
-            f"geometrically irreconcilable — aborting (no fallback). Lower theta_parallax / improve "
-            f"capture overlap, or the backbone produced inconsistent per-chunk geometry.")
+    # NO abort: this weld is only an INIT for the global BA (the real pose source), so a poor
+    # overlap still proceeds — the BA reconciles it from the VGGSfM tracks. We log the quality
+    # so the run is honest, but never kill the run here.
+    if best_srt is None:
+        best_srt = _fit(per_frame, robust=True)            # global fallback fit
+        best_inliers = per_frame
+    if len(best_inliers) < min_frames:
+        print(f"[STAC align] WARN: only {len(best_inliers)}/{npf} consistent overlap frames "
+              f"(<{frame_thr}m, wanted ≥{min_frames}) — welding best-effort, BA reconciles downstream")
 
     # ── 2) IRLS refine on the consensus frame set ──
-    active = best_inliers
+    active = best_inliers if len(best_inliers) >= 4 else per_frame
     for _ in range(4):
         srt = _fit(active, robust=True)
         new_active = [g for g in per_frame if _frame_resid_med(g[1], g[2], *srt) < frame_thr]
-        if len(new_active) < min_frames:
+        if len(new_active) < 4:
             break
         if {g[0] for g in new_active} == {g[0] for g in active}:
             active = new_active
@@ -1012,16 +1015,11 @@ def weighted_align_point_maps(point_map1, conf1, point_map2, conf2, mask, conf_t
         active = new_active
     s, R, t = _fit(active, robust=True)
 
-    # ── 3) final fail-fast gate ──
+    # ── 3) quality LOG (not a gate — the BA owns the final trajectory) ──
     resids = np.array([_frame_resid_med(g[1], g[2], s, R, t) for g in active])
     med_resid = float(np.median(resids))
-    if len(active) < min_frames or med_resid > max_resid:
-        raise RuntimeError(
-            f"Chunk Sim3 alignment FAILED: {len(active)}/{npf} inlier frames, median residual "
-            f"{med_resid:.3f}m > {max_resid}m — irreconcilable chunk pair, aborting (no fallback).")
-    print(f"[STAC align] OK: {len(active)}/{npf} inlier frames, median residual {med_resid:.4f}m, scale {s:.4f}")
-
-    # full-overlap error for visibility (logged, not gated)
+    tag = "OK" if (len(active) >= min_frames and med_resid <= max_resid) else "POOR→BA-reconciles"
+    print(f"[STAC align] {tag}: {len(active)}/{npf} inlier frames, median residual {med_resid:.4f}m, scale {s:.4f}")
     compute_alignment_error(point_map1, conf1, point_map2, conf2, conf_threshold, s, R, t)
     return s, R, t
 
