@@ -627,8 +627,14 @@ class VGGT_Long:
                 self._stac_write_origins(chunk_data_first, 0)
 
 
+            # STAC fix: ALWAYS load the freshly-aligned chunk_{chunk_idx+1} (saved at the
+            # aligned_path np.save above for every chunk_idx, including 0). The previous
+            # `... if chunk_idx > 0 else chunk_data_first` wrote chunk_0's geometry into
+            # chunk_1's PLY + origins on the first iteration → chunk_001.ply duplicated
+            # chunk_000's points (identical counts) while chunk_001_origins held the real
+            # chunk_1 count → reproject_chunks aborted on the points!=origins mismatch.
             aligned_chunk_data = np.load(os.path.join(self.result_aligned_dir, f"chunk_{chunk_idx+1}.npy"),
-                                             allow_pickle=True).item() if chunk_idx > 0 else chunk_data_first
+                                             allow_pickle=True).item()
 
             points = aligned_chunk_data['world_points'].reshape(-1, 3)
             colors = (aligned_chunk_data['images'].transpose(0, 2, 3, 1).reshape(-1, 3) * 255).astype(np.uint8)
