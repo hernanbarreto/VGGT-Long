@@ -625,6 +625,14 @@ class VGGT_Long:
                     sample_ratio=self.config['Model']['Pointcloud_Save']['sample_ratio']
                 )
                 self._stac_write_origins(chunk_data_first, 0)
+                # STAC: free unaligned chunk_0 NOW — its aligned .npy + pcd + origins are
+                # written and nothing downstream reads unaligned (the TSDF reads
+                # _tmp_results_aligned). Incremental cleanup so the apply phase never holds
+                # ALL unaligned + ALL aligned at once (the ~2× peak that overflowed the disk).
+                try:
+                    os.remove(os.path.join(self.result_unaligned_dir, "chunk_0.npy"))
+                except OSError:
+                    pass
 
 
             # STAC fix: ALWAYS load the freshly-aligned chunk_{chunk_idx+1} (saved at the
@@ -650,6 +658,12 @@ class VGGT_Long:
                 sample_ratio=self.config['Model']['Pointcloud_Save']['sample_ratio']
             )
             self._stac_write_origins(aligned_chunk_data, chunk_idx + 1)
+            # STAC: free this chunk's unaligned .npy immediately (see chunk_0 note above) —
+            # incremental cleanup keeps the apply phase ~flat on disk instead of doubling.
+            try:
+                os.remove(os.path.join(self.result_unaligned_dir, f"chunk_{chunk_idx + 1}.npy"))
+            except OSError:
+                pass
 
         self.save_camera_poses()
         
