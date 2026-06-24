@@ -599,6 +599,13 @@ class VGGT_Long:
                                      allow_pickle=True).item()
 
             chunk_data['world_points'] = apply_sim3_direct(chunk_data['world_points'], s, R, t)
+            # STAC: the per-chunk Sim3 scales world_points by s, but the raw per-camera `depth`
+            # was left unscaled → the cloud (built from world_points) and the TSDF (which
+            # integrates `depth`) diverge, growing with chunk drift (measured chunk0 1.00 →
+            # chunk10 1.19) → far walls/ceilings displaced. Scale depth by the same s so the
+            # integrated depth stays consistent with the aligned world_points / cloud.
+            if chunk_data.get('depth') is not None:
+                chunk_data['depth'] = chunk_data['depth'] * s
 
 
             aligned_path = os.path.join(self.result_aligned_dir, f"chunk_{chunk_idx + 1}.npy")
