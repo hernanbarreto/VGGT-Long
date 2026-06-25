@@ -440,6 +440,19 @@ class VGGT_Long:
             print("Estimated Rotation:\n", R)
             print("Estimated Translation:", t)
 
+            # STAC: adjacent chunks share `overlap` (60) IDENTICAL frames → their relative
+            # Sim3 scale MUST be ~1. weighted_align_point_maps can return a degenerate scale
+            # (e.g. 0.19 or 1.75) on low-parallax / near-planar overlap that still passes the
+            # inlier check but is geometrically wrong; compounded over many chunks it shatters
+            # the whole reconstruction (same object metres apart — exactly the scatter seen on
+            # long scans). Reject out-of-range scales → 1.0 (rigid SE3 for that seam), like the
+            # SE3 backbones (mapanything/da3) that never scattered.
+            _S_LO, _S_HI = 0.9, 1.1
+            if not (_S_LO <= float(s) <= _S_HI):
+                print(f"[STAC] chunk {chunk_idx}->{chunk_idx+1}: REJECTING degenerate Sim3 "
+                      f"scale {float(s):.4f} (outside [{_S_LO},{_S_HI}]) → 1.0 (rigid)")
+                s = 1.0
+
             self.sim3_list.append((s, R, t))
 
 
