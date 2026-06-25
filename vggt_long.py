@@ -447,7 +447,11 @@ class VGGT_Long:
             # the whole reconstruction (same object metres apart — exactly the scatter seen on
             # long scans). Reject out-of-range scales → 1.0 (rigid SE3 for that seam), like the
             # SE3 backbones (mapanything/da3) that never scattered.
-            _S_LO, _S_HI = 0.9, 1.1
+            # Range tuned to reject ONLY geometrically-impossible degeneracies (measured 0.19
+            # and 1.75) while KEEPING legitimate per-chunk scale variation (measured 0.84-1.24
+            # with mm residuals + 60/60 inliers — those produced GOOD clouds). [0.9,1.1] was
+            # too tight: it rejected legit 0.84/1.16 and wrecked a previously-good reconstruction.
+            _S_LO, _S_HI = 0.6, 1.6
             if not (_S_LO <= float(s) <= _S_HI):
                 print(f"[STAC] chunk {chunk_idx}->{chunk_idx+1}: REJECTING degenerate Sim3 "
                       f"scale {float(s):.4f} (outside [{_S_LO},{_S_HI}]) → 1.0 (rigid)")
