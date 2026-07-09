@@ -326,6 +326,104 @@ class VGGT_Long:
 
         return predictions if is_loop or range_2 is not None else None
     
+    def _stac_metric_lock(self):
+        """STAC patch: lock every unaligned chunk (and loop-bridge prediction) to METRIC
+        scale from isolated DA3 anchor depths, before alignment. No-op unless the config
+        enables it (Model.metric_lock.enable). Chunks without any anchor inherit the
+        median scale of the anchored ones (logged loudly). Writes metric_lock.json."""
+        ml = (self.config['Model'].get('metric_lock') or {})
+        if not ml.get('enable'):
+            return
+        from loop_utils.metric_lock import chunk_scale, apply_scale, real_frame_number
+        anchor_dir = ml['anchor_dir']
+        near_frac = float(ml.get('near_frac', 0.25))
+        import json as _json
+
+        # Resume guard: locking multiplies the npys IN PLACE — a resumed run must not
+        # scale an already-locked chunk twice. metric_lock.json records what was locked.
+        already = set()
+        _prev_path = os.path.join(self.output_dir, "metric_lock.json")
+        if os.path.exists(_prev_path):
+            try:
+                already = {int(k) for k, v in _json.load(open(_prev_path))
+                           .get("chunks", {}).items() if v.get("s") is not None
+                           or v.get("s_applied") is not None}
+                print(f"[metric-lock] resume: {len(already)} chunk(s) already locked "
+                      f"in a previous run — skipping those")
+            except Exception:
+                already = set()
+
+        report = {"chunks": {}, "loops": {}}
+        scales = {}
+        # 1) main chunks (unaligned npys on disk)
+        for k, (start, end) in enumerate(self.chunk_indices):
+            if k in already:
+                continue
+            path = os.path.join(self.result_unaligned_dir, f"chunk_{k}.npy")
+            if not os.path.exists(path):
+                print(f"[metric-lock] chunk {k}: missing {path} — skipped")
+                continue
+            data = np.load(path, allow_pickle=True).item()
+            nums = [real_frame_number(self.img_list[i]) for i in range(start, end)]
+            s, n, ratios = chunk_scale(data, nums, anchor_dir, near_frac=near_frac)
+            if s is not None:
+                scales[k] = s
+                spread = (f" spread {min(ratios):.3f}-{max(ratios):.3f}"
+                          if len(ratios) > 1 else "")
+                print(f"[metric-lock] chunk {k}: s={s:.4f} from {n} anchor(s){spread}")
+            report["chunks"][str(k)] = {"s": s, "n_anchors": n, "ratios": ratios}
+        # merge previously locked chunks into the scale table (report continuity + the
+        # fallback median), but NEVER re-apply them.
+        if already and os.path.exists(_prev_path):
+            try:
+                for k_str, v in _json.load(open(_prev_path)).get("chunks", {}).items():
+                    s_prev = v.get("s_applied", v.get("s"))
+                    if int(k_str) in already and s_prev is not None:
+                        scales.setdefault(int(k_str), float(s_prev))
+                        report["chunks"].setdefault(k_str, v)
+            except Exception:
+                pass
+        if not scales:
+            raise RuntimeError(
+                "[metric-lock] NO chunk found any DA3 anchor — cannot lock metric scale. "
+                f"anchor_dir={anchor_dir}. The anchors must cover every chunk's frame range.")
+        fallback = float(np.median(list(scales.values())))
+        for k in range(len(self.chunk_indices)):
+            if k in already:
+                continue
+            path = os.path.join(self.result_unaligned_dir, f"chunk_{k}.npy")
+            if not os.path.exists(path):
+                continue
+            s = scales.get(k)
+            if s is None:
+                s = fallback
+                print(f"[metric-lock] chunk {k}: NO anchors in range — inheriting the "
+                      f"median scale of the anchored chunks (s={s:.4f})")
+                report["chunks"][str(k)]["s_applied"] = s
+            data = np.load(path, allow_pickle=True).item()
+            apply_scale(data, s)
+            np.save(path, data)
+        # 2) loop-bridge predictions (in memory) — they are Omega passes with their own
+        # arbitrary scale; the SE(3) loop legs need them metric too. Anchors inside the
+        # bridge's two ranges when available, else the mean of the two parent chunks.
+        for li, (item, pred) in enumerate(getattr(self, 'loop_predict_list', []) or []):
+            ka, (a0, a1), kb, (b0, b1) = item[0], item[1], item[2], item[3]
+            nums = ([real_frame_number(self.img_list[i]) for i in range(a0, a1)]
+                    + [real_frame_number(self.img_list[i]) for i in range(b0, b1)])
+            s, n, _ = chunk_scale(pred, nums, anchor_dir, near_frac=near_frac)
+            if s is None:
+                s = float(np.mean([scales.get(ka, fallback), scales.get(kb, fallback)]))
+                n = 0
+            apply_scale(pred, s)
+            print(f"[metric-lock] loop bridge {ka}<->{kb}: s={s:.4f} "
+                  f"({n} anchor(s)" + (")" if n else " — parents' mean)"))
+            report["loops"][str(li)] = {"a": ka, "b": kb, "s": s, "n_anchors": n}
+        _sv = np.array(list(scales.values()))
+        print(f"[metric-lock] ✅ {len(scales)}/{len(self.chunk_indices)} chunks anchored; "
+              f"scale spread {_sv.min():.3f}-{_sv.max():.3f} (x{_sv.max()/_sv.min():.2f})")
+        with open(os.path.join(self.output_dir, "metric_lock.json"), "w") as f:
+            _json.dump(report, f, indent=1)
+
     def _stac_conf_threshold(self, confs):
         """STAC patch: the ONE confidence threshold for a chunk's PLY + origins.
 
@@ -431,6 +529,13 @@ class VGGT_Long:
 
         del self.model # Save GPU Memory
         torch.cuda.empty_cache()
+
+        # STAC patch: per-chunk METRIC LOCK (see loop_utils/metric_lock.py). Every chunk
+        # (and every loop-bridge prediction) is scaled to metric via its DA3 anchors
+        # BEFORE any alignment, so the overlap alignment can run as SE(3)
+        # (Model.using_sim3: false) — relative scale stops being a negotiable degree of
+        # freedom, which is what chained the ±18-50% per-chunk scale errors ("onion").
+        self._stac_metric_lock()
 
         print("Aligning all the chunks...")
         for chunk_idx in range(len(self.chunk_indices)-1):
