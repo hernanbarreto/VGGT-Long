@@ -326,24 +326,35 @@ class VGGT_Long:
 
         return predictions if is_loop or range_2 is not None else None
     
-    def _stac_write_origins(self, chunk_data, K):
+    def _stac_conf_threshold(self, confs):
+        """STAC patch: the ONE confidence threshold for a chunk's PLY + origins.
+
+        np.mean() over ~50M float32 accumulates in float32, so its last ULPs depend on
+        how numpy vectorises the reduction — recomputing it in two places shifted the
+        threshold at the 7th significant digit and flipped ~5 boundary points, leaving
+        the PLY and {K}_origins.npz off by 5 (CloudComPy then aborts: it cannot inject
+        traceability into a size-mismatched cloud). Accumulate in float64 and compute
+        it ONCE, then pass the same value to both writers."""
+        ps = self.config['Model']['Pointcloud_Save']
+        if not ps.get('use_conf_filter', True):
+            return -1.0
+        return float(np.mean(np.asarray(confs), dtype=np.float64)) * ps['conf_threshold_coef']
+
+    def _stac_write_origins(self, chunk_data, K, conf_threshold=None):
         """STAC patch: write per-point origins (frame_global = REAL frame number,
         pixel_row/col, confidence) for chunk K using the SAME confidence mask that
-        save_confident_pointcloud_batch uses for the PLY. Computed in THIS process →
-        guaranteed 1:1 with the PLY points (no cross-process float-boundary drift that
-        made CloudComPy drop the origins). Saved next to the PLY as {K}_origins.npz."""
+        save_confident_pointcloud_batch uses for the PLY. `conf_threshold` MUST be the
+        exact value handed to that writer (see _stac_conf_threshold) → guaranteed 1:1
+        with the PLY points. Saved next to the PLY as {K}_origins.npz."""
         import re as _re
         try:
-            ps = self.config['Model']['Pointcloud_Save']
-            coef = ps['conf_threshold_coef']
-            use_filter = ps.get('use_conf_filter', True)
             wp = chunk_data['world_points']
             if wp.ndim == 5:
                 wp = wp[0]
             S, H, W = wp.shape[:3]
             confs = chunk_data['world_points_conf'].reshape(-1)
             cfs32 = confs.astype(np.float32)
-            thr = (float(np.mean(confs)) * coef) if use_filter else -1.0
+            thr = self._stac_conf_threshold(confs) if conf_threshold is None else conf_threshold
             mask = (cfs32 >= thr) & (cfs32 > 1e-5)           # identical to save_confident
             surviving = np.flatnonzero(mask)
             HW = H * W
@@ -588,13 +599,13 @@ class VGGT_Long:
                 pts0 = cd0['world_points'].reshape(-1, 3)
                 col0 = (cd0['images'].transpose(0, 2, 3, 1).reshape(-1, 3) * 255).astype(np.uint8)
                 cf0 = cd0['world_points_conf'].reshape(-1)
+                thr0 = self._stac_conf_threshold(cf0)
                 save_confident_pointcloud_batch(
                     points=pts0, colors=col0, confs=cf0,
                     output_path=os.path.join(self.pcd_dir, "0_pcd.ply"),
-                    conf_threshold=(np.mean(cf0) * self.config['Model']['Pointcloud_Save']['conf_threshold_coef']
-                        if self.config['Model']['Pointcloud_Save'].get('use_conf_filter', True) else -1.0),
+                    conf_threshold=thr0,
                     sample_ratio=self.config['Model']['Pointcloud_Save']['sample_ratio'])
-                self._stac_write_origins(cd0, 0)
+                self._stac_write_origins(cd0, 0, conf_threshold=thr0)
                 print(f'[STAC] single chunk: saved 0_pcd.ply ({len(pts0)} pts)')
 
         for chunk_idx in range(len(self.chunk_indices) - 1):
@@ -639,16 +650,16 @@ class VGGT_Long:
                 colors_first = (chunk_data_first['images'].transpose(0, 2, 3, 1).reshape(-1, 3) * 255).astype(np.uint8)
                 confs_first = chunk_data_first['world_points_conf'].reshape(-1)
                 ply_path_first = os.path.join(self.pcd_dir, f'0_pcd.ply')
+                thr_first = self._stac_conf_threshold(confs_first)
                 save_confident_pointcloud_batch(
                     points=points_first,  # shape: (H, W, 3)
                     colors=colors_first,  # shape: (H, W, 3)
                     confs=confs_first,  # shape: (H, W)
                     output_path=ply_path_first,
-                    conf_threshold=(np.mean(confs_first) * self.config['Model']['Pointcloud_Save']['conf_threshold_coef']
-                        if self.config['Model']['Pointcloud_Save'].get('use_conf_filter', True) else -1.0),
+                    conf_threshold=thr_first,
                     sample_ratio=self.config['Model']['Pointcloud_Save']['sample_ratio']
                 )
-                self._stac_write_origins(chunk_data_first, 0)
+                self._stac_write_origins(chunk_data_first, 0, conf_threshold=thr_first)
                 # STAC: free unaligned chunk_0 NOW — its aligned .npy + pcd + origins are
                 # written and nothing downstream reads unaligned (the TSDF reads
                 # _tmp_results_aligned). Incremental cleanup so the apply phase never holds
@@ -672,16 +683,16 @@ class VGGT_Long:
             colors = (aligned_chunk_data['images'].transpose(0, 2, 3, 1).reshape(-1, 3) * 255).astype(np.uint8)
             confs = aligned_chunk_data['world_points_conf'].reshape(-1)
             ply_path = os.path.join(self.pcd_dir, f'{chunk_idx + 1}_pcd.ply')
+            thr_k = self._stac_conf_threshold(confs)
             save_confident_pointcloud_batch(
                 points=points,  # shape: (H, W, 3)
                 colors=colors,  # shape: (H, W, 3)
                 confs=confs,  # shape: (H, W)
                 output_path=ply_path,
-                conf_threshold=(np.mean(confs) * self.config['Model']['Pointcloud_Save']['conf_threshold_coef']
-                    if self.config['Model']['Pointcloud_Save'].get('use_conf_filter', True) else -1.0),
+                conf_threshold=thr_k,
                 sample_ratio=self.config['Model']['Pointcloud_Save']['sample_ratio']
             )
-            self._stac_write_origins(aligned_chunk_data, chunk_idx + 1)
+            self._stac_write_origins(aligned_chunk_data, chunk_idx + 1, conf_threshold=thr_k)
             # STAC: free this chunk's unaligned .npy immediately (see chunk_0 note above) —
             # incremental cleanup keeps the apply phase ~flat on disk instead of doubling.
             try:
