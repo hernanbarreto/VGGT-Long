@@ -334,11 +334,25 @@ class VGGT_Long:
         threshold at the 7th significant digit and flipped ~5 boundary points, leaving
         the PLY and {K}_origins.npz off by 5 (CloudComPy then aborts: it cannot inject
         traceability into a size-mismatched cloud). Accumulate in float64 and compute
-        it ONCE, then pass the same value to both writers."""
+        it ONCE, then pass the same value to both writers.
+
+        `conf_percentile` (when set) is the web demo's semantics and the default here:
+        drop the bottom P% of the VALID points by confidence, keep the rest. A
+        mean-relative coef cannot do that — how much it keeps depends on the shape of
+        each scene's confidence histogram (measured: mean*0.6 kept 53% of one scan and
+        89% of another). Points with conf<=1e-5 are the sky mask, excluded from the
+        percentile so P refers to real geometry."""
         ps = self.config['Model']['Pointcloud_Save']
         if not ps.get('use_conf_filter', True):
             return -1.0
-        return float(np.mean(np.asarray(confs), dtype=np.float64)) * ps['conf_threshold_coef']
+        confs = np.asarray(confs).reshape(-1)
+        pct = ps.get('conf_percentile')
+        if pct is not None:
+            valid = confs[confs > 1e-5]
+            if valid.size == 0:
+                return -1.0
+            return float(np.percentile(valid.astype(np.float64), float(pct)))
+        return float(np.mean(confs, dtype=np.float64)) * ps['conf_threshold_coef']
 
     def _stac_write_origins(self, chunk_data, K, conf_threshold=None):
         """STAC patch: write per-point origins (frame_global = REAL frame number,
