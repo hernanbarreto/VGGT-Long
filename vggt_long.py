@@ -335,7 +335,8 @@ class VGGT_Long:
         if not ml.get('enable'):
             return
         from loop_utils.metric_lock import (chunk_scale, apply_scale, real_frame_number,
-                                            seam_relative_scale, solve_scale_graph)
+                                            seam_relative_scale, solve_scale_graph,
+                                            chunk_tri_angle, flag_sick_chunks)
         anchor_dir = ml['anchor_dir']
         near_frac = float(ml.get('near_frac', 0.25))
         import json as _json
@@ -358,6 +359,7 @@ class VGGT_Long:
         scales = {}
         n_anchor_map = {}
         seam_rel = {}
+        tri_map = {}         # chunk -> triangulation angle (health gate signal 1)
         prev_shared = None   # (chunk_idx, {global_frame: depth}) for the seam ratio
         # 1) main chunks: DA3 absolute scale per chunk + RELATIVE scale per seam
         # (same frame, same pixels, in both neighbours — the precise sensor)
@@ -377,6 +379,11 @@ class VGGT_Long:
                           if len(ratios) > 1 else "")
                 print(f"[metric-lock] chunk {k}: DA3 s={s:.4f} from {n} anchor(s){spread}")
             report["chunks"][str(k)] = {"s": s, "n_anchors": n, "ratios": ratios}
+            # health gate signal: parallax the chunk actually holds (scale-invariant,
+            # so valid for fresh AND resumed/already-locked chunks alike)
+            tri_map[k] = chunk_tri_angle(data.get("depth"),
+                                         data.get("world_points_conf"),
+                                         data.get("extrinsic"))
             # seam with the previous chunk: ratio over ALL shared frames
             depth_k = np.asarray(data["depth"])
             if prev_shared is not None and prev_shared[0] == k - 1:
@@ -467,6 +474,48 @@ class VGGT_Long:
         with open(os.path.join(self.output_dir, "metric_lock.json"), "w") as f:
             _json.dump(report, f, indent=1)
 
+        # ── CHUNK HEALTH GATE (see flag_sick_chunks) ──
+        # A chunk whose own numbers say "no 3D information" (rotation-only/far-field
+        # parallax) or "no single internal scale" (DA3 anchors disagreeing within it)
+        # must not WRITE points — garbage dies at its source. It still participates
+        # in the alignment and the scale graph: with 50% overlap it is the only
+        # bridge between its neighbours.
+        anchor_iqr = {}
+        for k_str, v in report["chunks"].items():
+            r = np.asarray(v.get("ratios") or [], np.float64)
+            if len(r) > 1 and np.median(r) > 0:
+                anchor_iqr[int(k_str)] = float(
+                    (np.percentile(r, 75) - np.percentile(r, 25)) / np.median(r))
+            else:
+                anchor_iqr[int(k_str)] = None
+        sick = flag_sick_chunks(tri_map, anchor_iqr)
+        # resume: chunks whose unaligned npy is already consumed cannot be re-evaluated
+        # — inherit their previous verdict so a resumed run never un-flags them.
+        _health_path = os.path.join(self.output_dir, "chunk_health.json")
+        if os.path.exists(_health_path):
+            try:
+                for k_str, rs in (_json.load(open(_health_path)).get("sick") or {}).items():
+                    if int(k_str) not in tri_map:
+                        sick.setdefault(int(k_str), rs)
+            except Exception:
+                pass
+        self._stac_sick_chunks = set(sick)
+        with open(_health_path, "w") as f:
+            _json.dump({"tri_angle": {str(k): tri_map.get(k)
+                                      for k in range(len(self.chunk_indices))},
+                        "anchor_iqr_over_median": {str(k): anchor_iqr.get(k)
+                                                   for k in range(len(self.chunk_indices))},
+                        "sick": {str(k): rs for k, rs in sorted(sick.items())}}, f, indent=1)
+        if sick:
+            for k in sorted(sick):
+                for r in sick[k]:
+                    print(f"[health] chunk {k} SICK: {r}")
+            print(f"[health] ⛔ {len(sick)} chunk(s) EXCLUDED from the cloud "
+                  f"({sorted(sick)}) — kept as alignment bridges, see chunk_health.json")
+        else:
+            print(f"[health] ✅ all {len(self.chunk_indices)} chunks healthy "
+                  f"(parallax + anchor coherence)")
+
     def _stac_conf_threshold(self, confs):
         """STAC patch: the ONE confidence threshold for a chunk's PLY + origins.
 
@@ -501,6 +550,13 @@ class VGGT_Long:
         Every overlap frame used to be written by BOTH chunks — two displaced copies
         of the same pixels in the cloud (the mechanical half of the duplicated
         objects). One frame → one writer (the chunk whose centre is nearest)."""
+        # HEALTH GATE: a sick chunk (see _stac_metric_lock) writes NOTHING — its
+        # owned frames become a declared hole instead of garbage in the cloud.
+        if chunk_idx in getattr(self, '_stac_sick_chunks', ()):
+            cf = np.asarray(confs, np.float32).reshape(-1).copy()
+            cf[:] = 0.0
+            print(f"[health] chunk {chunk_idx}: sick — all frames dropped from the cloud")
+            return cf
         if (not self.config['Model'].get('frame_ownership')
                 or self.chunk_indices is None or len(self.chunk_indices) <= 1):
             return confs
@@ -561,7 +617,13 @@ class VGGT_Long:
     def _stac_write_chunk_outputs(self, chunk_data, K):
         """PLY + origins for chunk K from its (aligned, possibly elastic-corrected)
         data — ONE ownership mask and ONE conf threshold shared by both writers, so
-        the PLY and {K}_origins.npz stay 1:1 by construction."""
+        the PLY and {K}_origins.npz stay 1:1 by construction. Sick chunks (health
+        gate) write NO files at all: an absent chunk is a declared hole, while an
+        empty PLY would trip every downstream reader."""
+        if K in getattr(self, '_stac_sick_chunks', ()):
+            print(f"[health] chunk {K}: sick — PLY/origins NOT written "
+                  f"(declared hole, see chunk_health.json)")
+            return
         points = chunk_data['world_points'].reshape(-1, 3)
         colors = (chunk_data['images'].transpose(0, 2, 3, 1).reshape(-1, 3) * 255).astype(np.uint8)
         confs = self._stac_owned_confs(chunk_data['world_points_conf'].reshape(-1), K)
@@ -689,13 +751,19 @@ class VGGT_Long:
         # on the SAME consensus, so the fused cloud (one writer per frame) is
         # continuous through the ownership switch in the middle of each overlap.
         self._stac_elastic_corr = {}
+        _sick = getattr(self, '_stac_sick_chunks', set())
         for k in range(len(self.chunk_indices)):
-            corr = elastic_corrections(self.chunk_indices, k, fits)
+            # sick chunks: healthy neighbours never bend toward them (alpha pinned
+            # inside elastic_corrections); their own npy still gets corrected —
+            # harmless, and it keeps every seam's two copies coincident — but they
+            # write no outputs (declared hole).
+            corr = elastic_corrections(self.chunk_indices, k, fits, sick=_sick)
             self._stac_elastic_corr[k] = corr
             path = os.path.join(self.result_aligned_dir, f"chunk_{k}.npy")
             data = np.load(path, allow_pickle=True).item()
-            outputs_ok = (os.path.exists(os.path.join(self.pcd_dir, f"{k}_pcd.ply"))
-                          and os.path.exists(os.path.join(self.pcd_dir, f"{k}_origins.npz")))
+            outputs_ok = k in _sick or (
+                os.path.exists(os.path.join(self.pcd_dir, f"{k}_pcd.ply"))
+                and os.path.exists(os.path.join(self.pcd_dir, f"{k}_origins.npz")))
             if data.get('_stac_elastic_applied'):
                 if outputs_ok:
                     print(f"[elastic] chunk {k}: already corrected + written — skipped")

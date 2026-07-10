@@ -215,7 +215,7 @@ def rigid_mat(R, t):
     return M
 
 
-def elastic_corrections(chunk_indices, k, seam_fits):
+def elastic_corrections(chunk_indices, k, seam_fits, sick=None):
     """Per-frame ELASTIC seam corrections for chunk k: [S, 4, 4] world-space rigid
     moves, one per local frame (identity where nothing constrains the frame).
 
@@ -246,10 +246,16 @@ def elastic_corrections(chunk_indices, k, seam_fits):
     A shared frame whose fit starved inherits the nearest fitted frame of the same
     seam (the seam is already rigid-glued, so per-frame residuals are small and
     smooth); a seam with no fits at all contributes identity.
+
+    `sick`: chunk indices flagged by the health gate (flag_sick_chunks). A healthy
+    chunk must NEVER bend toward a sick neighbour's garbage, so on a mixed seam
+    alpha is pinned to keep the consensus entirely at the healthy side's copy (the
+    sick side adopts it fully — harmless, its frames don't write points anyway).
     """
     start, end = chunk_indices[k]
     S = end - start
     corr = np.tile(np.eye(4), (S, 1, 1))
+    sick = frozenset(sick or ())
 
     def _fit_for(j, g, shared):
         d = seam_fits.get(j) or {}
@@ -260,6 +266,12 @@ def elastic_corrections(chunk_indices, k, seam_fits):
             return None
         return d[min(fitted, key=lambda gg: abs(gg - g))]
 
+    def _alpha(j, i, L):
+        # weight of chunk j's (dst-side) opinion; pinned on mixed-health seams
+        if (j in sick) != (j + 1 in sick):
+            return 0.0 if j in sick else 1.0
+        return 1.0 - (i / (L - 1.0)) if L > 1 else 0.5
+
     # left seam (j = k-1): this chunk is the SRC side of the fit -> B_g
     if k > 0:
         _, e_prev = chunk_indices[k - 1]
@@ -269,8 +281,7 @@ def elastic_corrections(chunk_indices, k, seam_fits):
             f = _fit_for(k - 1, g, shared)
             if f is None:
                 continue
-            alpha = 1.0 - (i / (L - 1.0)) if L > 1 else 0.5
-            corr[g - start] = rigid_fraction(f[0], f[1], alpha)
+            corr[g - start] = rigid_fraction(f[0], f[1], _alpha(k - 1, i, L))
     # right seam (j = k): this chunk is the DST side -> A_g = B_g @ T_g^-1
     if k < len(chunk_indices) - 1:
         s_next, _ = chunk_indices[k + 1]
@@ -280,10 +291,75 @@ def elastic_corrections(chunk_indices, k, seam_fits):
             f = _fit_for(k, g, shared)
             if f is None:
                 continue
-            alpha = 1.0 - (i / (L - 1.0)) if L > 1 else 0.5
             T = rigid_mat(f[0], f[1])
-            corr[g - start] = rigid_fraction(f[0], f[1], alpha) @ np.linalg.inv(T)
+            corr[g - start] = rigid_fraction(f[0], f[1], _alpha(k, i, L)) @ np.linalg.inv(T)
     return corr
+
+
+def chunk_tri_angle(depth, conf, extrinsic):
+    """Per-chunk triangulation angle (rad): median keyframe camera step over the
+    median valid depth — the amount of PARALLAX the chunk actually holds. Depth
+    error of any multi-view geometry scales as pixel_error / tri_angle, so a chunk
+    an order of magnitude below its session's walking pace carries no usable 3D
+    information (rotation-only / far-field — measured on test4: body 0.08-0.11 rad,
+    rotten tail 0.005/0.0008). SCALE-INVARIANT: steps and depth share the chunk's
+    scale, so it can be computed before or after the metric lock. None if starved."""
+    ext = np.asarray(extrinsic, np.float64)
+    if ext.ndim != 3 or ext.shape[0] < 2:
+        return None
+    steps = np.linalg.norm(np.diff(ext[:, :3, 3], axis=0), axis=1)
+    d = np.asarray(depth, np.float32).reshape(-1)
+    c = np.asarray(conf, np.float32).reshape(-1)
+    m = np.isfinite(d) & (d > 1e-6) & (c > 1e-5)
+    if not m.any() or not np.isfinite(steps).all():
+        return None
+    med_depth = float(np.median(d[m]))
+    if med_depth <= 0:
+        return None
+    return float(np.median(steps)) / med_depth
+
+
+def flag_sick_chunks(tri_angle, anchor_iqr, parallax_floor_ratio=10.0, anchor_z_cut=3.5):
+    """Health gate over a session's own chunks. Returns {k: [reasons]} for the
+    chunks whose numbers say their geometry cannot be trusted. Two independent
+    signals, thresholds derived from the SESSION itself (no external truth):
+
+    1. Parallax: tri_angle[k] < median(tri_angle) / parallax_floor_ratio — an
+       order of magnitude below the session's own walking pace. Physical basis:
+       relative depth error ~ pixel_error / tri_angle; the measured gap on test4
+       is 18-107x (body 0.081-0.112 rad vs rotten 0.0051/0.00084), so the decade
+       cut sits far from both sides.
+    2. DA3 anchor incoherence: robust z-score (Iglewicz-Hoaglin, MAD-based,
+       standard 3.5 cut) of the chunk's anchor-ratio IQR/median across chunks —
+       DA3 and Omega disagreeing WITHIN one chunk means its internal scale is not
+       a single number (test4 chunk 10: 0.374 vs session median 0.100, z=4.4).
+
+    Sick chunks stay in the alignment + scale graph (with 50% overlap they are the
+    only bridge between their neighbours) — the caller must only stop them from
+    WRITING points."""
+    sick = {}
+    tri = {k: v for k, v in (tri_angle or {}).items() if v is not None and np.isfinite(v)}
+    if len(tri) >= 2:
+        med = float(np.median(list(tri.values())))
+        for k, v in tri.items():
+            if med > 0 and v < med / float(parallax_floor_ratio):
+                sick.setdefault(k, []).append(
+                    f"triangulation angle {v:.5f} rad is {med / max(v, 1e-12):.0f}x below "
+                    f"the session median {med:.4f} — rotation-only/far-field, no 3D information")
+    aiq = {k: v for k, v in (anchor_iqr or {}).items() if v is not None and np.isfinite(v)}
+    if len(aiq) >= 3:
+        vals = np.array(list(aiq.values()), np.float64)
+        med = float(np.median(vals))
+        mad = float(np.median(np.abs(vals - med)))
+        if mad > 0:
+            for k, v in aiq.items():
+                z = (v - med) / (1.4826 * mad)
+                if z > float(anchor_z_cut):
+                    sick.setdefault(k, []).append(
+                        f"DA3 anchors disagree within the chunk: ratio IQR/median {v:.3f} "
+                        f"(session median {med:.3f}, robust z={z:.1f}) — internal scale "
+                        f"is not one number")
+    return sick
 
 
 def frame_owner(chunk_indices, n_frames):
