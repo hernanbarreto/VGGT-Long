@@ -1005,50 +1005,51 @@ class VGGT_Long:
                 print(f"[depth-graph] too thin ({len(meas)} fit / {len(held)} held-out "
                       f"pairs for {N} frames) — SKIPPING (nothing modified)")
                 return
-            a, b = solve_depth_graph(meas, N, sick_frames=sick_frames)
-
-            # ── SELF-VALIDATION GATE — the stage must EARN the right to touch the
-            # geometry. Measured on test4: a per-frame scalar/affine model did NOT
-            # explain the depth disagreement (held-out median 0.99%→1.11% while
-            # corrections came out 10-16x larger than the pairwise signal — a
-            # low-frequency warp waiting to happen). Two conditions, both derived
-            # from the data itself:
-            #   1. held-out pairwise disagreement (at 5 m) improves by >=20%;
-            #   2. corrections stay within 5x the measured pairwise signal
-            #      (a correction an order of magnitude beyond what pairs show is
-            #      noise integration along the chain, not signal).
-            zref = 5.0
-            rb = [abs(al * zref + be - zref) / zref for _, _, al, be in held]
-            ra = [abs((a[f] * zref + b[f]) - (a[g] * (al * zref + be) + b[g])) / zref
-                  for f, g, al, be in held]
-            med_b, med_a = float(np.median(rb)), float(np.median(ra))
-            las = np.abs(np.log([al for _, _, al, _ in meas]))
-            bes = np.abs([be for _, _, _, be in meas])
-            sig_a = max(float(np.median(las)), 1e-4)
-            sig_b = max(float(np.median(bes)), 1e-3)
-            bounded = (float(np.percentile(np.abs(np.log(a)), 99)) <= 5 * sig_a
-                       and float(np.percentile(np.abs(b), 99)) <= 5 * sig_b)
-            improves = med_a <= 0.8 * med_b
-            verdict = "APPLY" if (bounded and improves) else "SKIP"
+            # ── SELF-VALIDATION GATE + MODEL LADDER — the stage must EARN the
+            # right to touch the geometry (held-out pairs judge; corrections must
+            # stay within 5x the pairwise signal). Two rungs, most expressive
+            # first:
+            #   1. AFFINE (a_f, b_f): full model. test4 2026-07-10: after the
+            #      scale drift it finally IMPROVED held-out (1.22%→0.34%) but the
+            #      free offset ran to ±112 cm — b is where an unbounded
+            #      low-frequency warp hides, so the rung failed bounded.
+            #   2. SCALE-ONLY (a_f, b=0): the physically-motivated fallback —
+            #      after metric lock + scale drift the residual disagreement is
+            #      mostly multiplicative. Scaling depth about the camera with a
+            #      bounded a_f cannot produce the offset warp.
+            # A rung applies only if it is BOTH bounded and improving; otherwise
+            # try the next; no rung → geometry untouched.
+            from loop_utils.metric_lock import depth_graph_verdict
             print(f"[depth-graph] {len(meas)} fit + {len(held)} held-out pairs — "
                   f"disagreement before {np.median(before_all) * 100:.2f}% median")
-            print(f"[depth-graph] held-out: {med_b * 100:.2f}% -> {med_a * 100:.2f}% | "
-                  f"corrections a[{a.min():.4f},{a.max():.4f}] "
-                  f"b[{b.min() * 100:.1f},{b.max() * 100:.1f}]cm | "
-                  f"bounded={bounded} improves={improves} -> {verdict}")
-            if verdict == "SKIP":
-                print(f"[depth-graph] ⛔ per-frame model does NOT explain this scan's "
-                      f"depth disagreement — geometry left UNTOUCHED (an unearned "
-                      f"correction is a warp, not a fix). See depth_graph.json.")
-                a = np.ones(N)
-                b = np.zeros(N)
+            ladder = []
+            a = np.ones(N)
+            b = np.zeros(N)
+            verdict, model = "SKIP", None
+            for rung, kw in (("affine", {}), ("scale-only", {"scale_only": True})):
+                a_r, b_r = solve_depth_graph(meas, N, sick_frames=sick_frames, **kw)
+                v = depth_graph_verdict(a_r, b_r, meas, held)
+                ladder.append(dict(v, model=rung))
+                print(f"[depth-graph] {rung}: held-out {v['med_before'] * 100:.2f}% -> "
+                      f"{v['med_after'] * 100:.2f}% | a[{a_r.min():.4f},{a_r.max():.4f}] "
+                      f"b[{b_r.min() * 100:.1f},{b_r.max() * 100:.1f}]cm | "
+                      f"bounded={v['bounded']} improves={v['improves']}")
+                if v["bounded"] and v["improves"]:
+                    a, b = a_r, b_r
+                    verdict, model = "APPLY", rung
+                    break
+            if verdict == "APPLY":
+                print(f"[depth-graph] ✅ {model} model earned the correction")
+            else:
+                print(f"[depth-graph] ⛔ no rung of the model ladder explains this "
+                      f"scan's depth disagreement — geometry left UNTOUCHED (an "
+                      f"unearned correction is a warp, not a fix). See depth_graph.json.")
             with open(dg_path, "w") as f_:
                 _json.dump({"chunk_indices": [list(ci) for ci in self.chunk_indices],
-                            "verdict": verdict,
+                            "verdict": verdict, "model": model,
+                            "ladder": ladder,
                             "a": a.tolist(), "b": b.tolist(),
                             "n_pairs_fit": len(meas), "n_pairs_holdout": len(held),
-                            "holdout_before_pct": med_b * 100,
-                            "holdout_after_pct": med_a * 100,
                             "pair_disagreement_before_pct": float(np.median(before_all) * 100)},
                            f_, indent=1)
             sol = (a, b)

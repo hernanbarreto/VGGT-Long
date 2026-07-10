@@ -545,7 +545,7 @@ def pair_depth_relation(z_src, z_dst, iters=6):
     return float(a), float(b), before, int(len(zs))
 
 
-def solve_depth_graph(measurements, n_frames, sick_frames=()):
+def solve_depth_graph(measurements, n_frames, sick_frames=(), scale_only=False):
     """Per-frame depth corrections z' = a_f*z + b_f from pairwise affine relations,
     the frame-level analogue of solve_scale_graph. For a pair (f, g) with measured
     z_g = alpha*z_f + beta, corrected consistency (a_f z + b_f == a_g(alpha z +
@@ -557,7 +557,13 @@ def solve_depth_graph(measurements, n_frames, sick_frames=()):
     The gauges preserve the session's global metre (set by the metric lock +
     scale_align) — the graph only REDISTRIBUTES depth so every frame agrees on
     every shared surface. Sick frames get identity (a=1, b=0) and their
-    measurements must not be fed in. Returns (a[n], b[n])."""
+    measurements must not be fed in. Returns (a[n], b[n]).
+
+    ``scale_only``: skip the offset system entirely (b stays 0) — the fallback
+    rung of the model ladder. After the metric lock + scale drift the residual
+    inter-frame depth disagreement is mostly MULTIPLICATIVE (leftover scale
+    error); the free offset is where an unbounded low-frequency warp hides
+    (measured on test4: b ran to ±112 cm while the scale stayed near 1)."""
     meas = [(f, g, al, be) for f, g, al, be in measurements
             if f not in sick_frames and g not in sick_frames
             and np.isfinite(al) and al > 0 and np.isfinite(be)]
@@ -580,6 +586,8 @@ def solve_depth_graph(measurements, n_frames, sick_frames=()):
     x, *_ = np.linalg.lstsq(np.asarray(rows), np.asarray(rhs), rcond=None)
     for f, i in col.items():
         a[f] = float(np.exp(x[i]))
+    if scale_only:
+        return a, b
     rows, rhs = [], []
     for f, g, _, be in meas:
         r = np.zeros(n)
@@ -592,6 +600,31 @@ def solve_depth_graph(measurements, n_frames, sick_frames=()):
     for f, i in col.items():
         b[f] = float(y[i])
     return a, b
+
+
+def depth_graph_verdict(a, b, meas, held, zref=5.0, improve=0.8, bound=5.0):
+    """Self-validation shared by every rung of the depth-graph model ladder.
+    Judged ONLY on held-out pairs (never fitted): the corrected disagreement at
+    ``zref`` must improve by ≥(1-improve), and the corrections must stay within
+    ``bound``× the pairwise signal (an order of magnitude beyond what the pairs
+    show is noise integration along the chain, not signal). Returns a dict with
+    bounded / improves / med_before / med_after / sig_a / sig_b."""
+    a = np.asarray(a, np.float64)
+    b = np.asarray(b, np.float64)
+    rb = [abs(al * zref + be - zref) / zref for _, _, al, be in held]
+    ra = [abs((a[f] * zref + b[f]) - (a[g] * (al * zref + be) + b[g])) / zref
+          for f, g, al, be in held]
+    med_b, med_a = float(np.median(rb)), float(np.median(ra))
+    las = np.abs(np.log([al for _, _, al, _ in meas]))
+    bes = np.abs([be for _, _, _, be in meas])
+    sig_a = max(float(np.median(las)), 1e-4)
+    sig_b = max(float(np.median(bes)), 1e-3)
+    bounded = (float(np.percentile(np.abs(np.log(a)), 99)) <= bound * sig_a
+               and float(np.percentile(np.abs(b), 99)) <= bound * sig_b)
+    improves = med_a <= improve * med_b
+    return {"bounded": bounded, "improves": improves,
+            "med_before": med_b, "med_after": med_a,
+            "sig_a": sig_a, "sig_b": sig_b}
 
 
 def apply_depth_correction(world_points, depth, cam_center, a, b):
