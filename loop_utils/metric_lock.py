@@ -296,6 +296,141 @@ def elastic_corrections(chunk_indices, k, seam_fits, sick=None):
     return corr
 
 
+def depth_pair_samples(wp_src, conf_src, wp_dst, conf_dst, w2c_dst, K_dst,
+                       max_samples=8000, seed=0):
+    """EXACT-surface depth samples between two frames: project src's valid points
+    into dst's camera, read dst's OWN depth at the hit pixel. Returns (z_src, z_dst)
+    — the depth src's geometry implies in dst's frame vs the depth dst itself
+    predicts for that surface — or None when starved. Purely geometric: the same
+    association the seam work uses, generalized to any nearby frame pair."""
+    H, W = wp_dst.shape[:2]
+    p = np.asarray(wp_src, np.float64).reshape(-1, 3)
+    c = np.asarray(conf_src, np.float32).reshape(-1)
+    idx = np.flatnonzero(c > 1e-5)
+    if len(idx) < 500:
+        return None
+    if len(idx) > max_samples:
+        idx = np.random.default_rng(seed).choice(idx, max_samples, replace=False)
+    p = p[idx]
+    w2c = np.asarray(w2c_dst, np.float64)
+    X = p @ w2c[:3, :3].T + w2c[:3, 3]
+    z = X[:, 2]
+    m = z > 0.3
+    if m.sum() < 300:
+        return None
+    fx, fy, cx, cy = float(K_dst[0, 0]), float(K_dst[1, 1]), float(K_dst[0, 2]), float(K_dst[1, 2])
+    u = np.round(X[m, 0] / z[m] * fx + cx).astype(int)
+    v = np.round(X[m, 1] / z[m] * fy + cy).astype(int)
+    inb = (u >= 0) & (u < W) & (v >= 0) & (v < H)
+    if inb.sum() < 300:
+        return None
+    u, v, z_src = u[inb], v[inb], z[m][inb]
+    q = np.asarray(wp_dst, np.float64)[v, u]
+    cq = np.asarray(conf_dst, np.float32).reshape(H, W)[v, u]
+    good = cq > 1e-5
+    if good.sum() < 300:
+        return None
+    Xq = q[good] @ w2c[:3, :3].T + w2c[:3, 3]
+    return z_src[good], Xq[:, 2]
+
+
+def pair_depth_relation(z_src, z_dst, iters=6):
+    """Robust affine relation z_dst ~= alpha*z_src + beta between two frames'
+    depths of the SAME surfaces (IRLS, Cauchy weights — occlusion mismatches land
+    in the tail and get killed). Returns (alpha, beta, median_rel_mismatch, n)
+    or None. rel mismatch = |z_src - z_dst| / z_dst BEFORE the fit (diagnostic)."""
+    zs = np.asarray(z_src, np.float64)
+    zd = np.asarray(z_dst, np.float64)
+    m = np.isfinite(zs) & np.isfinite(zd) & (zs > 1e-3) & (zd > 1e-3)
+    zs, zd = zs[m], zd[m]
+    if len(zs) < 300:
+        return None
+    before = float(np.median(np.abs(zs - zd) / zd))
+    w = np.ones(len(zs))
+    a, b = float(np.median(zd / zs)), 0.0
+    for _ in range(int(iters)):
+        sw = w.sum()
+        mx = (zs * w).sum() / sw
+        my = (zd * w).sum() / sw
+        vx = (w * (zs - mx) ** 2).sum()
+        if vx < 1e-12:
+            return None
+        a = (w * (zs - mx) * (zd - my)).sum() / vx
+        b = my - a * mx
+        r = zd - (a * zs + b)
+        cch = max(3.0 * 1.4826 * np.median(np.abs(r - np.median(r))), 1e-4)
+        w = 1.0 / (1.0 + (r / cch) ** 2)
+    if not (0.8 < a < 1.25):      # a pair this broken is occlusion/garbage, not a
+        return None               # depth-field measurement (measured pairs: <=5%)
+    return float(a), float(b), before, int(len(zs))
+
+
+def solve_depth_graph(measurements, n_frames, sick_frames=()):
+    """Per-frame depth corrections z' = a_f*z + b_f from pairwise affine relations,
+    the frame-level analogue of solve_scale_graph. For a pair (f, g) with measured
+    z_g = alpha*z_f + beta, corrected consistency (a_f z + b_f == a_g(alpha z +
+    beta) + b_g for all z) splits into two LINEAR systems solved in sequence:
+
+        log a_f - log a_g = log alpha        (scale graph, gauge: mean log a = 0)
+        b_f - b_g         = a_g * beta       (offset graph, gauge: mean b = 0)
+
+    The gauges preserve the session's global metre (set by the metric lock +
+    scale_align) — the graph only REDISTRIBUTES depth so every frame agrees on
+    every shared surface. Sick frames get identity (a=1, b=0) and their
+    measurements must not be fed in. Returns (a[n], b[n])."""
+    meas = [(f, g, al, be) for f, g, al, be in measurements
+            if f not in sick_frames and g not in sick_frames
+            and np.isfinite(al) and al > 0 and np.isfinite(be)]
+    a = np.ones(n_frames)
+    b = np.zeros(n_frames)
+    if not meas:
+        return a, b
+    frames = sorted({f for f, g, _, _ in meas} | {g for _, g, _, _ in meas})
+    col = {f: i for i, f in enumerate(frames)}
+    n = len(frames)
+    rows, rhs = [], []
+    for f, g, al, _ in meas:
+        r = np.zeros(n)
+        r[col[f]], r[col[g]] = 1.0, -1.0
+        rows.append(r)
+        rhs.append(np.log(al))
+    gauge = np.full(n, float(len(rows)) / n)      # strong: pins the mean exactly
+    rows.append(gauge)
+    rhs.append(0.0)
+    x, *_ = np.linalg.lstsq(np.asarray(rows), np.asarray(rhs), rcond=None)
+    for f, i in col.items():
+        a[f] = float(np.exp(x[i]))
+    rows, rhs = [], []
+    for f, g, _, be in meas:
+        r = np.zeros(n)
+        r[col[f]], r[col[g]] = 1.0, -1.0
+        rows.append(r)
+        rhs.append(a[g] * be)
+    rows.append(gauge)
+    rhs.append(0.0)
+    y, *_ = np.linalg.lstsq(np.asarray(rows), np.asarray(rhs), rcond=None)
+    for f, i in col.items():
+        b[f] = float(y[i])
+    return a, b
+
+
+def apply_depth_correction(world_points, depth, cam_center, a, b):
+    """Move ONE frame's points along their camera rays so its depth becomes
+    a*z + b: p' = c + (p - c) * (a*z + b)/z (angles fixed, pixels unchanged —
+    cameras do NOT move). Returns (world_points', depth'). Pixels with no valid
+    depth are left untouched."""
+    wp = np.asarray(world_points)
+    d = np.asarray(depth, np.float32).reshape(wp.shape[0], wp.shape[1])
+    t = np.ones_like(d, np.float64)
+    m = np.isfinite(d) & (d > 1e-6)
+    t[m] = (float(a) * d[m].astype(np.float64) + float(b)) / d[m]
+    c = np.asarray(cam_center, np.float64).reshape(3)
+    wp2 = (c + (wp.astype(np.float64) - c) * t[..., None]).astype(wp.dtype)
+    d2 = d.copy()
+    d2[m] = (float(a) * d[m] + float(b)).astype(d.dtype)
+    return wp2, d2
+
+
 def chunk_tri_angle(depth, conf, extrinsic):
     """Per-chunk triangulation angle (rad): median keyframe camera step over the
     median valid depth — the amount of PARALLAX the chunk actually holds. Depth
@@ -319,7 +454,8 @@ def chunk_tri_angle(depth, conf, extrinsic):
     return float(np.median(steps)) / med_depth
 
 
-def flag_sick_chunks(tri_angle, anchor_iqr, parallax_floor_ratio=10.0, anchor_z_cut=3.5):
+def flag_sick_chunks(tri_angle, anchor_iqr, fx_median=None,
+                     parallax_floor_ratio=10.0, anchor_z_cut=3.5, zoom_z_cut=3.5):
     """Health gate over a session's own chunks. Returns {k: [reasons]} for the
     chunks whose numbers say their geometry cannot be trusted. Two independent
     signals, thresholds derived from the SESSION itself (no external truth):
@@ -359,6 +495,24 @@ def flag_sick_chunks(tri_angle, anchor_iqr, parallax_floor_ratio=10.0, anchor_z_
                         f"DA3 anchors disagree within the chunk: ratio IQR/median {v:.3f} "
                         f"(session median {med:.3f}, robust z={z:.1f}) — internal scale "
                         f"is not one number")
+    # 3. Optical ZOOM: the per-frame focal the model itself estimates. A zoom
+    #    segment magnifies without adding baseline — no parallax, no 3D — and it
+    #    also breaks DA3's metric depth (assumed focal). Robust z (same 3.5 cut)
+    #    of the chunk-median fx across chunks: the body is stable to ~2% while a
+    #    real zoom is +25..140% (measured on test4: fx 550 body vs 704-1334 tail).
+    fxm = {k: v for k, v in (fx_median or {}).items() if v is not None and np.isfinite(v)}
+    if len(fxm) >= 3:
+        vals = np.array(list(fxm.values()), np.float64)
+        med = float(np.median(vals))
+        mad = float(np.median(np.abs(vals - med)))
+        if mad > 0:
+            for k, v in fxm.items():
+                z = abs(v - med) / (1.4826 * mad)
+                if z > float(zoom_z_cut):
+                    sick.setdefault(k, []).append(
+                        f"optical ZOOM: chunk-median focal {v:.0f} vs session {med:.0f} "
+                        f"(robust z={z:.1f}) — magnification adds no baseline: no "
+                        f"parallax, no 3D information, and DA3 metric depth breaks")
     return sick
 
 

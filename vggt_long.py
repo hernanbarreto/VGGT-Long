@@ -360,6 +360,7 @@ class VGGT_Long:
         n_anchor_map = {}
         seam_rel = {}
         tri_map = {}         # chunk -> triangulation angle (health gate signal 1)
+        fx_map = {}          # chunk -> median estimated focal (zoom detector)
         prev_shared = None   # (chunk_idx, {global_frame: depth}) for the seam ratio
         # 1) main chunks: DA3 absolute scale per chunk + RELATIVE scale per seam
         # (same frame, same pixels, in both neighbours — the precise sensor)
@@ -384,6 +385,8 @@ class VGGT_Long:
             tri_map[k] = chunk_tri_angle(data.get("depth"),
                                          data.get("world_points_conf"),
                                          data.get("extrinsic"))
+            if data.get("intrinsic") is not None:
+                fx_map[k] = float(np.median(np.asarray(data["intrinsic"])[:, 0, 0]))
             # seam with the previous chunk: ratio over ALL shared frames
             depth_k = np.asarray(data["depth"])
             if prev_shared is not None and prev_shared[0] == k - 1:
@@ -488,7 +491,7 @@ class VGGT_Long:
                     (np.percentile(r, 75) - np.percentile(r, 25)) / np.median(r))
             else:
                 anchor_iqr[int(k_str)] = None
-        sick = flag_sick_chunks(tri_map, anchor_iqr)
+        sick = flag_sick_chunks(tri_map, anchor_iqr, fx_median=fx_map)
         # resume: chunks whose unaligned npy is already consumed cannot be re-evaluated
         # — inherit their previous verdict so a resumed run never un-flags them.
         _health_path = os.path.join(self.output_dir, "chunk_health.json")
@@ -505,6 +508,8 @@ class VGGT_Long:
                                       for k in range(len(self.chunk_indices))},
                         "anchor_iqr_over_median": {str(k): anchor_iqr.get(k)
                                                    for k in range(len(self.chunk_indices))},
+                        "fx_median": {str(k): fx_map.get(k)
+                                      for k in range(len(self.chunk_indices))},
                         "sick": {str(k): rs for k, rs in sorted(sick.items())}}, f, indent=1)
         if sick:
             for k in sorted(sick):
@@ -756,41 +761,238 @@ class VGGT_Long:
             # sick chunks: healthy neighbours never bend toward them (alpha pinned
             # inside elastic_corrections); their own npy still gets corrected —
             # harmless, and it keeps every seam's two copies coincident — but they
-            # write no outputs (declared hole).
+            # write no outputs later (declared hole).
             corr = elastic_corrections(self.chunk_indices, k, fits, sick=_sick)
             self._stac_elastic_corr[k] = corr
             path = os.path.join(self.result_aligned_dir, f"chunk_{k}.npy")
             data = np.load(path, allow_pickle=True).item()
-            outputs_ok = k in _sick or (
-                os.path.exists(os.path.join(self.pcd_dir, f"{k}_pcd.ply"))
-                and os.path.exists(os.path.join(self.pcd_dir, f"{k}_origins.npz")))
             if data.get('_stac_elastic_applied'):
-                if outputs_ok:
-                    print(f"[elastic] chunk {k}: already corrected + written — skipped")
+                print(f"[elastic] chunk {k}: already corrected — skipped")
+                continue
+            wp = np.asarray(data['world_points'])
+            lead = wp.ndim == 5               # (1,S,H,W,3) — same guard as the origins writer
+            if lead:
+                wp = wp[0]
+            moved = 0
+            for local in range(wp.shape[0]):
+                M = corr[local]
+                if np.allclose(M, np.eye(4), atol=1e-12):
                     continue
-                print(f"[elastic] chunk {k}: already corrected — rewriting outputs")
-            else:
-                wp = np.asarray(data['world_points'])
-                lead = wp.ndim == 5           # (1,S,H,W,3) — same guard as the origins writer
-                if lead:
-                    wp = wp[0]
-                moved = 0
-                for local in range(wp.shape[0]):
-                    M = corr[local]
-                    if np.allclose(M, np.eye(4), atol=1e-12):
-                        continue
-                    p = wp[local].reshape(-1, 3).astype(np.float64)
-                    wp[local] = (p @ M[:3, :3].T + M[:3, 3]).reshape(wp[local].shape).astype(wp.dtype)
-                    moved += 1
-                data['world_points'] = wp[None] if lead else wp
-                data['_stac_elastic_applied'] = True
-                np.save(path, data)
-                dmax = float(np.max(np.linalg.norm(corr[:, :3, 3], axis=1)))
-                print(f"[elastic] chunk {k}: {moved}/{wp.shape[0]} frames moved "
-                      f"(max frame translation {dmax * 100:.1f} cm)")
-            self._stac_write_chunk_outputs(data, k)
+                p = wp[local].reshape(-1, 3).astype(np.float64)
+                wp[local] = (p @ M[:3, :3].T + M[:3, 3]).reshape(wp[local].shape).astype(wp.dtype)
+                moved += 1
+            data['world_points'] = wp[None] if lead else wp
+            data['_stac_elastic_applied'] = True
+            np.save(path, data)
+            dmax = float(np.max(np.linalg.norm(corr[:, :3, 3], axis=1)))
+            print(f"[elastic] chunk {k}: {moved}/{wp.shape[0]} frames moved "
+                  f"(max frame translation {dmax * 100:.1f} cm)")
         print(f"[elastic] ✅ all {len(self.chunk_indices)} chunks on the per-frame "
               f"seam consensus — shared pixels now share ONE 3D position")
+
+    def _stac_aligned_pose(self, k, local, ext_c2w):
+        """World-space c2w of chunk k's local frame as the CLOUD sees it: the
+        metric-locked npy extrinsic composed with the chunk's accumulated Sim3 and
+        the per-frame elastic correction — the same composition save_camera_poses
+        writes. `ext_c2w` is the 4x4 from the ALIGNED npy."""
+        M = np.asarray(ext_c2w, np.float64)
+        if k > 0:
+            s, R, t = self.sim3_list[k - 1]
+            S = np.eye(4)
+            S[:3, :3] = float(s) * np.asarray(R)
+            S[:3, 3] = np.asarray(t)
+            M = S @ M
+            M[:3, :3] /= float(s)
+        ecorr = getattr(self, '_stac_elastic_corr', None)
+        if ecorr is not None:
+            M = ecorr[k][local] @ M
+        return M
+
+    def _stac_depth_graph(self):
+        """STAC patch: per-frame DEPTH GRAPH — kills the depth duplication.
+
+        Measured on test4 after the elastic stage: two frames of the SAME chunk
+        10 apart disagree ~1.5% on the depth of the same surface (Omega's internal
+        multi-view consistency floor), and crossing a chunk boundary doubles it
+        (2.6-4.5%) — 9 cm at 3 m, 18-35 cm at 8-15 m: the objects duplicated IN
+        DEPTH the user sees, invisible in height where everything is near. The
+        elastic stage cannot touch this: it glues two copies of the SAME frame,
+        while this is DIFFERENT frames looking at the same surface.
+
+        Fix, purely geometric (loop_utils.metric_lock): for nearby frame pairs,
+        project one frame's points into the other and robustly fit the affine
+        relation between the two depth readings of the same surface; solve one
+        global least squares for per-frame corrections z' = a_f z + b_f (gauge:
+        mean 0 — the global metre stays where the metric lock + scale_align put
+        it); move every frame's points ALONG THEIR RAYS (pixels and cameras do
+        not move, so poses, origins traceability and the TSDF depth all stay
+        valid by construction). Sick chunks are excluded from both measurement
+        and correction. Resume-safe via depth_graph.json + per-npy stamp."""
+        if not self.config['Model'].get('depth_graph') or len(self.chunk_indices) < 2:
+            return
+        import json as _json
+        from loop_utils.metric_lock import (depth_pair_samples, pair_depth_relation,
+                                            solve_depth_graph, apply_depth_correction,
+                                            frame_owner)
+        _sick = getattr(self, '_stac_sick_chunks', set())
+        N = len(self.img_list)
+        owner = frame_owner(self.chunk_indices, N)
+        sick_frames = {g for g in range(N) if owner[g] in _sick}
+
+        dg_path = os.path.join(self.output_dir, "depth_graph.json")
+        sol = None
+        if os.path.exists(dg_path):
+            try:
+                prev = _json.load(open(dg_path))
+                if prev.get("chunk_indices") == [list(ci) for ci in self.chunk_indices]:
+                    sol = (np.asarray(prev["a"], np.float64), np.asarray(prev["b"], np.float64))
+                    print(f"[depth-graph] resume: solution loaded from depth_graph.json")
+            except Exception as _e:
+                print(f"[depth-graph] depth_graph.json unreadable ({_e}) — remeasuring")
+
+        if sol is None:
+            # per-frame owned view: points+conf+pose+K of each frame's canonical copy
+            cache = {}
+            for k, (start, end) in enumerate(self.chunk_indices):
+                data = np.load(os.path.join(self.result_aligned_dir, f"chunk_{k}.npy"),
+                               allow_pickle=True).item()
+                if data.get('_stac_depth_graph_applied'):
+                    raise RuntimeError(
+                        f"[depth-graph] chunk {k} already depth-corrected but "
+                        f"depth_graph.json is missing/stale — remeasuring on corrected "
+                        f"data would be wrong. Delete _tmp_results_aligned + pcd and re-run.")
+                wp = np.asarray(data['world_points'])
+                if wp.ndim == 5:
+                    wp = wp[0]
+                cf = np.asarray(data['world_points_conf']).reshape(wp.shape[:3])
+                ext = np.asarray(data['extrinsic'])
+                K = np.asarray(data['intrinsic'])
+                for local, g in enumerate(range(start, end)):
+                    if owner[g] == k and g not in sick_frames:
+                        c2w = self._stac_aligned_pose(k, local, ext[local])
+                        cache[g] = (wp[local].astype(np.float32), cf[local].astype(np.float32),
+                                    np.linalg.inv(c2w), K[local])
+                del data
+            # pairs up to one chunk length apart — the measured range where two
+            # frames still share enough surface (beyond it samples starve anyway).
+            # HELD-OUT offsets are measured but NEVER fitted: they are the honest
+            # judge of whether the per-frame model actually explains the data.
+            fit_offsets = (1, 2, 3, 5, 8, 12)
+            holdout_offsets = (4, 10)
+            meas, held, before_all = [], [], []
+            for f in sorted(cache):
+                for d in fit_offsets + holdout_offsets:
+                    g = f + d
+                    if g not in cache:
+                        continue
+                    zs = depth_pair_samples(cache[f][0], cache[f][1],
+                                            cache[g][0], cache[g][1],
+                                            cache[g][2], cache[g][3])
+                    if zs is None:
+                        continue
+                    rel = pair_depth_relation(zs[0], zs[1])
+                    if rel is None:
+                        continue
+                    al, be, before, n = rel
+                    (meas if d in fit_offsets else held).append((f, g, al, be))
+                    if d in fit_offsets:
+                        before_all.append(before)
+            del cache
+            if len(meas) < N // 4 or len(held) < N // 8:
+                print(f"[depth-graph] too thin ({len(meas)} fit / {len(held)} held-out "
+                      f"pairs for {N} frames) — SKIPPING (nothing modified)")
+                return
+            a, b = solve_depth_graph(meas, N, sick_frames=sick_frames)
+
+            # ── SELF-VALIDATION GATE — the stage must EARN the right to touch the
+            # geometry. Measured on test4: a per-frame scalar/affine model did NOT
+            # explain the depth disagreement (held-out median 0.99%→1.11% while
+            # corrections came out 10-16x larger than the pairwise signal — a
+            # low-frequency warp waiting to happen). Two conditions, both derived
+            # from the data itself:
+            #   1. held-out pairwise disagreement (at 5 m) improves by >=20%;
+            #   2. corrections stay within 5x the measured pairwise signal
+            #      (a correction an order of magnitude beyond what pairs show is
+            #      noise integration along the chain, not signal).
+            zref = 5.0
+            rb = [abs(al * zref + be - zref) / zref for _, _, al, be in held]
+            ra = [abs((a[f] * zref + b[f]) - (a[g] * (al * zref + be) + b[g])) / zref
+                  for f, g, al, be in held]
+            med_b, med_a = float(np.median(rb)), float(np.median(ra))
+            las = np.abs(np.log([al for _, _, al, _ in meas]))
+            bes = np.abs([be for _, _, _, be in meas])
+            sig_a = max(float(np.median(las)), 1e-4)
+            sig_b = max(float(np.median(bes)), 1e-3)
+            bounded = (float(np.percentile(np.abs(np.log(a)), 99)) <= 5 * sig_a
+                       and float(np.percentile(np.abs(b), 99)) <= 5 * sig_b)
+            improves = med_a <= 0.8 * med_b
+            verdict = "APPLY" if (bounded and improves) else "SKIP"
+            print(f"[depth-graph] {len(meas)} fit + {len(held)} held-out pairs — "
+                  f"disagreement before {np.median(before_all) * 100:.2f}% median")
+            print(f"[depth-graph] held-out: {med_b * 100:.2f}% -> {med_a * 100:.2f}% | "
+                  f"corrections a[{a.min():.4f},{a.max():.4f}] "
+                  f"b[{b.min() * 100:.1f},{b.max() * 100:.1f}]cm | "
+                  f"bounded={bounded} improves={improves} -> {verdict}")
+            if verdict == "SKIP":
+                print(f"[depth-graph] ⛔ per-frame model does NOT explain this scan's "
+                      f"depth disagreement — geometry left UNTOUCHED (an unearned "
+                      f"correction is a warp, not a fix). See depth_graph.json.")
+                a = np.ones(N)
+                b = np.zeros(N)
+            with open(dg_path, "w") as f_:
+                _json.dump({"chunk_indices": [list(ci) for ci in self.chunk_indices],
+                            "verdict": verdict,
+                            "a": a.tolist(), "b": b.tolist(),
+                            "n_pairs_fit": len(meas), "n_pairs_holdout": len(held),
+                            "holdout_before_pct": med_b * 100,
+                            "holdout_after_pct": med_a * 100,
+                            "pair_disagreement_before_pct": float(np.median(before_all) * 100)},
+                           f_, indent=1)
+            sol = (a, b)
+
+        a, b = sol
+        for k, (start, end) in enumerate(self.chunk_indices):
+            path = os.path.join(self.result_aligned_dir, f"chunk_{k}.npy")
+            data = np.load(path, allow_pickle=True).item()
+            if data.get('_stac_depth_graph_applied'):
+                print(f"[depth-graph] chunk {k}: already applied — skipped")
+                continue
+            wp = np.asarray(data['world_points'])
+            lead = wp.ndim == 5
+            if lead:
+                wp = wp[0]
+            dep = np.asarray(data['depth'])
+            ext = np.asarray(data['extrinsic'])
+            moved = 0
+            for local, g in enumerate(range(start, end)):
+                if g in sick_frames or (abs(a[g] - 1.0) < 1e-9 and abs(b[g]) < 1e-12):
+                    continue
+                c2w = self._stac_aligned_pose(k, local, ext[local])
+                wp[local], dep[local] = apply_depth_correction(
+                    wp[local], dep[local], c2w[:3, 3], a[g], b[g])
+                moved += 1
+            data['world_points'] = wp[None] if lead else wp
+            data['depth'] = dep
+            data['_stac_depth_graph_applied'] = True
+            np.save(path, data)
+            print(f"[depth-graph] chunk {k}: {moved}/{end - start} frames re-depthed")
+        print(f"[depth-graph] ✅ every frame now agrees with its neighbours on the "
+              f"depth of shared surfaces (per-frame z' = a*z + b along rays)")
+
+    def _stac_write_deferred_outputs(self):
+        """PLY + origins for every chunk, AFTER all geometric stages (elastic seam
+        consensus, depth graph) have finished mutating the aligned npys. Sick
+        chunks write nothing (declared hole). Resume: existing outputs are kept."""
+        for k in range(len(self.chunk_indices)):
+            if (os.path.exists(os.path.join(self.pcd_dir, f"{k}_pcd.ply"))
+                    and os.path.exists(os.path.join(self.pcd_dir, f"{k}_origins.npz"))):
+                print(f"[outputs] chunk {k}: PLY + origins already written — skipped")
+                continue
+            path = os.path.join(self.result_aligned_dir, f"chunk_{k}.npy")
+            if not os.path.exists(path):
+                continue
+            data = np.load(path, allow_pickle=True).item()
+            self._stac_write_chunk_outputs(data, k)
 
     def process_long_sequence(self):
         if self.overlap >= self.chunk_size:
@@ -1059,13 +1261,15 @@ class VGGT_Long:
                 self._stac_write_chunk_outputs(cd0, 0)
                 print(f'[STAC] single chunk: saved 0_pcd.ply')
 
-        # STAC: with the per-frame ELASTIC seam consensus enabled, each chunk's PLY +
-        # origins must be written AFTER the elastic correction — the apply loop only
-        # produces the aligned .npys and _stac_elastic_seams() writes the outputs.
-        _elastic = (bool(self.config['Model'].get('elastic_seam'))
+        # STAC: with the ELASTIC seam consensus and/or the DEPTH GRAPH enabled, each
+        # chunk's PLY + origins must be written AFTER those stages finish mutating
+        # the aligned npys — the apply loop only produces the aligned .npys and
+        # _stac_write_deferred_outputs() writes the outputs at the end.
+        _elastic = ((self.config['Model'].get('elastic_seam')
+                     or self.config['Model'].get('depth_graph'))
                     and len(self.chunk_indices) > 1)
         if _elastic:
-            print("[elastic] enabled — per-chunk PLY/origins deferred to the elastic stage")
+            print("[STAC] per-chunk PLY/origins deferred until after the elastic/depth stages")
 
         for chunk_idx in range(len(self.chunk_indices) - 1):
             # STAC patch (resume): skip this chunk's apply if its aligned .npy + pcd .ply
@@ -1137,10 +1341,14 @@ class VGGT_Long:
             except OSError:
                 pass
 
-        # STAC patch: per-frame ELASTIC seam consensus (see _stac_elastic_seams) —
-        # runs on the aligned chunks, writes every chunk's PLY + origins, and leaves
-        # per-frame pose corrections for save_camera_poses to apply.
+        # STAC patches, in order: per-frame ELASTIC seam consensus (the two copies
+        # of every shared frame coincide), per-frame DEPTH GRAPH (different frames
+        # agree on the depth of shared surfaces), then the deferred PLY/origins
+        # from the FINAL geometry. save_camera_poses applies the elastic pose moves.
         self._stac_elastic_seams()
+        self._stac_depth_graph()
+        if _elastic:
+            self._stac_write_deferred_outputs()
 
         self.save_camera_poses()
 
