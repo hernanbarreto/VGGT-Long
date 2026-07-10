@@ -939,6 +939,8 @@ class VGGT_Long:
         import json as _json
         from loop_utils.metric_lock import (surface_pair_correspondences,
                                             robust_rigid, solve_frame_graph,
+                                            solve_coarse_layer, revisit_candidates,
+                                            filter_pair_fits,
                                             frame_graph_verdict, se3_matrices,
                                             frame_owner)
         _sick = getattr(self, '_stac_sick_chunks', set())
@@ -980,58 +982,144 @@ class VGGT_Long:
                         cache[g] = (wp[local].astype(np.float32), cf[local].astype(np.float32),
                                     np.linalg.inv(c2w), K[local])
                 del data
+
+            # ── per-frame geometry summaries for revisit discovery ──
+            centroids = np.full((N, 3), np.nan)
+            radii = np.full(N, np.nan)
+            rng_ = np.random.default_rng(0)
+            for g, (wp_g, cf_g, _w2c, _K) in cache.items():
+                pts = wp_g.reshape(-1, 3)
+                okm = np.flatnonzero(cf_g.reshape(-1) > 1e-5)
+                if len(okm) < 300:
+                    continue
+                if len(okm) > 3000:
+                    okm = rng_.choice(okm, 3000, replace=False)
+                p = pts[okm].astype(np.float64)
+                cme = np.median(p, axis=0)
+                centroids[g] = cme
+                radii[g] = float(np.percentile(np.linalg.norm(p - cme, axis=1), 80))
+
             fit_offsets = (1, 2, 3, 5, 8, 12)
             holdout_offsets = (4, 10)
-            taus, held = [], []
+            node_step = max(fit_offsets)
+
+            def _pair(f, g):
+                return surface_pair_correspondences(cache[f][0], cache[f][1],
+                                                    cache[g][0], cache[g][1],
+                                                    cache[g][2], cache[g][3])
+
+            # SHORT band: dense nearby pairs (the fine layer's evidence)
+            short_fits, held_short = [], []
             for f in sorted(cache):
                 for d in fit_offsets + holdout_offsets:
                     g = f + d
                     if g not in cache:
                         continue
-                    pq = surface_pair_correspondences(cache[f][0], cache[f][1],
-                                                      cache[g][0], cache[g][1],
-                                                      cache[g][2], cache[g][3])
+                    pq = _pair(f, g)
                     if pq is None:
                         continue
                     if d in holdout_offsets:
-                        held.append((f, g, pq[0][:2000], pq[1][:2000]))
+                        held_short.append((f, g, pq[0][:2000], pq[1][:2000]))
                         continue
                     fit = robust_rigid(pq[0], pq[1], sample=8000)
-                    if fit is None:
-                        continue
-                    R_, t_, _res, _n = fit
-                    rvec, _ = cv2.Rodrigues(np.asarray(R_, np.float64))
-                    taus.append((f, g, np.concatenate([rvec.ravel(), t_]), 1.0))
+                    if fit is not None:
+                        short_fits.append((f, g, fit[0], fit[1], fit[2], fit[3]))
+            short_taus = filter_pair_fits(short_fits)
+
+            # LONG band: geometric revisit pairs (the coarse layer's evidence —
+            # the ONLY honest source for wavelengths beyond the short span)
+            long_fits, held_long = [], []
+            cand = revisit_candidates(centroids, radii, min_gap=2 * node_step)
+            n_conf = 0
+            for i, (f, g) in enumerate(cand):
+                if f not in cache or g not in cache:
+                    continue
+                pq = _pair(f, g)
+                if pq is None:
+                    continue
+                n_conf += 1
+                if n_conf % 3 == 0:
+                    held_long.append((f, g, pq[0][:2000], pq[1][:2000]))
+                    continue
+                fit = robust_rigid(pq[0], pq[1], sample=8000)
+                if fit is not None:
+                    long_fits.append((f, g, fit[0], fit[1], fit[2], fit[3]))
+            long_taus = filter_pair_fits(long_fits)
             del cache
-            if len(taus) < N // 4 or len(held) < N // 8:
-                print(f"[frame-graph] too thin ({len(taus)} fit / {len(held)} held-out "
-                      f"pairs for {N} frames) — SKIPPING (nothing modified)")
+            print(f"[frame-graph] short band: {len(short_taus)} fit + "
+                  f"{len(held_short)} held-out | long band (revisits): "
+                  f"{len(cand)} candidates -> {len(long_taus)} fit + "
+                  f"{len(held_long)} held-out")
+            if len(short_taus) < N // 4 or len(held_short) < N // 8:
+                print(f"[frame-graph] short band too thin — SKIPPING (nothing modified)")
                 return
-            xi_r = solve_frame_graph(taus, N, sick_frames=sick_frames)
-            v = frame_graph_verdict(xi_r, taus, held)
-            verdict = "APPLY" if (v["bounded"] and v["improves"]) else "SKIP"
-            tmax = float(np.max(np.linalg.norm(xi_r[:, 3:], axis=1)))
-            print(f"[frame-graph] {len(taus)} fit + {len(held)} held-out pairs — "
-                  f"held-out surface disagreement {v['med_before'] * 100:.2f} cm -> "
-                  f"{v['med_after'] * 100:.2f} cm | max correction {tmax * 100:.1f} cm | "
-                  f"bounded={v['bounded']} improves={v['improves']} -> {verdict}")
-            if verdict == "SKIP":
-                print(f"[frame-graph] ⛔ the per-frame rigid model does NOT explain "
-                      f"this scan's warp — geometry left UNTOUCHED (an unearned "
-                      f"correction is a warp, not a fix). See frame_graph.json.")
-                xi = np.zeros((N, 6))
+
+            # ── LADDER: hierarchical (coarse+fine) → fine-only → SKIP.
+            # Wavelength-matched evidence: the coarse layer exists ONLY when
+            # enough long-baseline pairs exist AND its own held-out stratum
+            # confirms it; otherwise those wavelengths stay identity.
+            have_long = len(long_taus) >= 8 and len(held_long) >= 4
+            ladder, xi, verdict, model = [], np.zeros((N, 6)), "SKIP", None
+            rungs = (["hierarchical"] if have_long else []) + ["fine-only"]
+            if not have_long and (long_taus or held_long):
+                print(f"[frame-graph] long-baseline evidence too thin "
+                      f"({len(long_taus)} fit / {len(held_long)} held) — coarse "
+                      f"layer stays IDENTITY (unobserved wavelengths untouched)")
+            for rung in rungs:
+                if rung == "hierarchical":
+                    xi_c = solve_coarse_layer(long_taus, N, node_step)
+                    resid = [(f, g, t - (xi_c[f] - xi_c[g]), w)
+                             for f, g, t, w in short_taus]
+                    xi_f = solve_frame_graph(resid, N, sick_frames=sick_frames)
+                    xi_r = xi_c + xi_f
+                else:
+                    xi_c = np.zeros((N, 6))
+                    xi_f = solve_frame_graph(short_taus, N, sick_frames=sick_frames)
+                    xi_r = xi_f
+                v_s = frame_graph_verdict(xi_r, short_taus, held_short)
+                v_s["bounded"] = frame_graph_verdict(xi_f, short_taus,
+                                                     held_short)["bounded"]
+                entry = {"model": rung, "short": v_s}
+                ok = v_s["bounded"] and v_s["improves"]
+                msg = (f"[frame-graph] {rung}: short held-out "
+                       f"{v_s['med_before'] * 100:.2f} -> {v_s['med_after'] * 100:.2f} cm "
+                       f"bounded={v_s['bounded']} improves={v_s['improves']}")
+                if rung == "hierarchical":
+                    v_l = frame_graph_verdict(xi_r, long_taus, held_long)
+                    v_l["bounded"] = frame_graph_verdict(xi_c, long_taus,
+                                                         held_long)["bounded"]
+                    entry["long"] = v_l
+                    ok = ok and v_l["bounded"] and v_l["improves"]
+                    msg += (f" | long held-out {v_l['med_before'] * 100:.2f} -> "
+                            f"{v_l['med_after'] * 100:.2f} cm bounded={v_l['bounded']} "
+                            f"improves={v_l['improves']}")
+                tmax = float(np.max(np.linalg.norm(xi_r[:, 3:], axis=1)))
+                msg += f" | max correction {tmax * 100:.1f} cm"
+                print(msg)
+                ladder.append(entry)
+                if ok:
+                    xi, verdict, model = xi_r, "APPLY", rung
+                    break
+            if verdict == "APPLY":
+                print(f"[frame-graph] ✅ {model} model earned the correction — "
+                      f"pose moves with points: depth/TSDF invariant")
             else:
-                xi = xi_r
-                print(f"[frame-graph] ✅ per-frame rigid consensus earned — every "
-                      f"frame now agrees with its neighbours on WHERE the shared "
-                      f"surface is (pose moves with points: depth/TSDF invariant)")
+                print(f"[frame-graph] ⛔ no rung earned the correction — geometry "
+                      f"left UNTOUCHED (an unearned correction is a warp, not a "
+                      f"fix). See frame_graph.json.")
             with open(fg_path, "w") as f_:
+                def _clean(d):
+                    return {k2: (bool(v2) if isinstance(v2, np.bool_) else v2)
+                            for k2, v2 in d.items()} if isinstance(d, dict) else d
                 _json.dump({"chunk_indices": [list(ci) for ci in self.chunk_indices],
-                            "verdict": verdict, "xi": xi.tolist(),
-                            "n_pairs_fit": len(taus), "n_pairs_holdout": len(held),
-                            "holdout_before_cm": v["med_before"] * 100,
-                            "holdout_after_cm": v["med_after"] * 100,
-                            "bounded": v["bounded"], "improves": v["improves"]},
+                            "verdict": verdict, "model": model, "xi": xi.tolist(),
+                            "ladder": [{k2: _clean(v2) for k2, v2 in e.items()}
+                                       for e in ladder],
+                            "n_short_fit": len(short_taus),
+                            "n_short_holdout": len(held_short),
+                            "n_revisit_candidates": len(cand),
+                            "n_long_fit": len(long_taus),
+                            "n_long_holdout": len(held_long)},
                            f_, indent=1)
 
         X = se3_matrices(xi)

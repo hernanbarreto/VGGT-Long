@@ -629,6 +629,108 @@ def solve_frame_graph(pair_taus, n_frames, sick_frames=(), smooth_w=0.25,
     return xi
 
 
+def revisit_candidates(centroids, radii, min_gap, stride=3, max_pairs=400):
+    """Long-baseline candidate pairs by GEOMETRIC overlap — scan-agnostic.
+
+    A correction of wavelength λ needs evidence spanning ≥ λ (run-4 lesson:
+    filling unobserved wavelengths from short-span noise bent the scan). The
+    only universal source of long-baseline evidence is RE-OBSERVATION, and the
+    data itself declares it: frame f (centroid c_f, points radius r_f) and a
+    much later frame g overlap when |c_f − c_g| < r_f + r_g. An orbit yields
+    many such pairs, a multi-room walk yields doorway revisits, a one-way
+    corridor yields none — and then the coarse layer correctly stays identity.
+
+    centroids: (N,3) per-frame point centroids (NaN row = frame absent).
+    radii:     (N,) per-frame p80 point radius around the centroid.
+    min_gap:   minimum index distance (≈ 2× the short-pair span).
+    Returns [(f, g), ...] capped at max_pairs, widest gaps first (the widest
+    baselines pin the longest wavelengths)."""
+    c = np.asarray(centroids, np.float64)
+    r = np.asarray(radii, np.float64).reshape(-1)
+    ok = np.isfinite(c).all(1) & np.isfinite(r)
+    frames = [i for i in range(len(c)) if ok[i]][::max(int(stride), 1)]
+    cand = []
+    for ia, f in enumerate(frames):
+        for g in frames[ia + 1:]:
+            if g - f < min_gap:
+                continue
+            if np.linalg.norm(c[f] - c[g]) < r[f] + r[g]:
+                cand.append((f, g))
+    cand.sort(key=lambda p: -(p[1] - p[0]))
+    return cand[:int(max_pairs)]
+
+
+def filter_pair_fits(fits, min_points=800, res_factor=3.0):
+    """Pair-fit hygiene: drop occlusion-contaminated fits — residual beyond
+    ``res_factor``× the SESSION's own median residual, or too few inliers —
+    and weight the survivors by inverse residual (session-derived, nothing
+    absolute). fits: [(f, g, R, t, res_m, n_used)]. Returns
+    [(f, g, tau[6], w)] ready for the graph."""
+    good = [(f, g, R, t, res, n) for f, g, R, t, res, n in fits
+            if n >= int(min_points) and np.isfinite(res)]
+    if not good:
+        return []
+    med = max(float(np.median([res for *_, res, _n in good])), 1e-4)
+    out = []
+    for f, g, R, t, res, n in good:
+        if res > res_factor * med:
+            continue
+        rvec, _ = cv2.Rodrigues(np.asarray(R, np.float64))
+        tau = np.concatenate([rvec.ravel(), np.asarray(t, np.float64).reshape(3)])
+        out.append((f, g, tau, med / max(res, 0.25 * med)))
+    return out
+
+
+def solve_coarse_layer(long_taus, n_frames, node_step,
+                       prior_unsupported=1.0, prior_supported=0.05):
+    """COARSE layer of the hierarchical frame graph: per-node se(3) corrections
+    (nodes every ``node_step`` frames, linear interpolation between) constrained
+    ONLY by long-baseline pairs — the layer that owns wavelengths beyond the
+    short-pair span. Nodes with no long-baseline support in reach get a STRONG
+    zero-prior: an unobserved stretch stays identity BY CONSTRUCTION, never
+    filled from noise (the run-4 failure mode). Returns per-frame xi (N,6)."""
+    n_nodes = max(int(np.ceil((n_frames - 1) / node_step)) + 1, 2)
+
+    def _interp_row(fr):
+        x = fr / node_step
+        j = min(int(np.floor(x)), n_nodes - 2)
+        a = x - j
+        return j, 1.0 - a, j + 1, a
+
+    xi = np.zeros((n_frames, 6))
+    taus = [(f, g, np.asarray(t, np.float64).reshape(6), float(w))
+            for f, g, t, w in (long_taus or []) if np.all(np.isfinite(t))]
+    if not taus:
+        return xi
+    support = np.zeros(n_nodes)
+    rows, rhs = [], []
+    for f, g, t, w in taus:
+        r = np.zeros(n_nodes)
+        jf, af, jf1, bf = _interp_row(f)
+        jg, ag, jg1, bg = _interp_row(g)
+        r[jf] += w * af
+        r[jf1] += w * bf
+        r[jg] -= w * ag
+        r[jg1] -= w * bg
+        rows.append(r)
+        rhs.append(w * t)
+        for j in (jf, jf1, jg, jg1):
+            support[j] += 1
+    for j in range(n_nodes):
+        r = np.zeros(n_nodes)
+        r[j] = prior_supported if support[j] > 0 else prior_unsupported
+        rows.append(r)
+        rhs.append(np.zeros(6))
+    gauge = np.full(n_nodes, float(len(taus)) / n_nodes)
+    rows.append(gauge)
+    rhs.append(np.zeros(6))
+    eta, *_ = np.linalg.lstsq(np.asarray(rows), np.asarray(rhs), rcond=None)
+    for fr in range(n_frames):
+        j, a, j1, b = _interp_row(fr)
+        xi[fr] = a * eta[j] + b * eta[j1]
+    return xi
+
+
 def frame_graph_verdict(xi, pair_taus, held, improve=0.8, bound=5.0):
     """Self-validation for the frame graph (the ladder discipline): judged on
     HELD-OUT pairs' actual 3D correspondences, corrections bounded by the
