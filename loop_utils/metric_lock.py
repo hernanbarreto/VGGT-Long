@@ -459,6 +459,57 @@ def blend_two_copies(wp1, cf1, wp2, cf2, d1=None, d2=None):
     return wp, cf, d.astype(np.asarray(d1).dtype)
 
 
+def classify_far_points(pts, conf_ok, cam_g, depth_g, conf_g, w2c_g, K_g,
+                        cap, floor_m, rate, k_sigma=3.0):
+    """One frame-pair step of the CONTRADICTION test for far-observed points.
+
+    A far observation may only be dropped when a NEARBY frame looked at the same
+    spot and saw something else (a displaced duplicate); if nobody saw it from
+    close, it is UNIQUE coverage and must stay (measured on test4: a blanket
+    distance cap destroyed 87% real coverage — narrow FOV, side/elevated
+    structures never get a near pass while in frame).
+
+    pts: [n,3] the far points to test. cam_g/depth_g/conf_g/w2c_g/K_g: the
+    candidate near frame. A point is TESTED only if it lies within `cap` of
+    frame g's camera (g could have observed it within the error budget).
+    Projecting it into g: |z_projected - z_g| <= k_sigma*max(floor, rate*z_g)
+    -> AGREE (corroborated, keep); beyond -> CONTRADICTED (displaced duplicate
+    or free-space violation). Returns (agree, contra) boolean masks over pts;
+    untested points are False in both (unseen -> caller keeps them)."""
+    n = len(pts)
+    agree = np.zeros(n, bool)
+    contra = np.zeros(n, bool)
+    sel = conf_ok & (np.linalg.norm(pts - np.asarray(cam_g).reshape(3), axis=1) <= cap)
+    if not sel.any():
+        return agree, contra
+    idx = np.flatnonzero(sel)
+    w2c = np.asarray(w2c_g, np.float64)
+    X = pts[idx] @ w2c[:3, :3].T + w2c[:3, 3]
+    z = X[:, 2]
+    m = z > 0.3
+    if not m.any():
+        return agree, contra
+    H, W = depth_g.shape[:2]
+    fx, fy, cx, cy = float(K_g[0, 0]), float(K_g[1, 1]), float(K_g[0, 2]), float(K_g[1, 2])
+    u = np.round(X[m, 0] / z[m] * fx + cx).astype(int)
+    v = np.round(X[m, 1] / z[m] * fy + cy).astype(int)
+    inb = (u >= 0) & (u < W) & (v >= 0) & (v < H)
+    if not inb.any():
+        return agree, contra
+    ii = idx[m][inb]
+    zg = np.asarray(depth_g)[v[inb], u[inb]].astype(np.float64)
+    cg = np.asarray(conf_g)[v[inb], u[inb]]
+    ok = (cg > 1e-5) & (zg > 0.3)
+    if not ok.any():
+        return agree, contra
+    ii = ii[ok]
+    diff = np.abs(z[m][inb][ok] - zg[ok])
+    tol = float(k_sigma) * np.maximum(float(floor_m), float(rate) * zg[ok])
+    agree[ii[diff <= tol]] = True
+    contra[ii[diff > tol]] = True
+    return agree, contra
+
+
 def chunk_tri_angle(depth, conf, extrinsic):
     """Per-chunk triangulation angle (rad): median keyframe camera step over the
     median valid depth — the amount of PARALLAX the chunk actually holds. Depth

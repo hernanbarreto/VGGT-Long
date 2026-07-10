@@ -632,16 +632,21 @@ class VGGT_Long:
         points = chunk_data['world_points'].reshape(-1, 3)
         colors = (chunk_data['images'].transpose(0, 2, 3, 1).reshape(-1, 3) * 255).astype(np.uint8)
         confs = self._stac_owned_confs(chunk_data['world_points_conf'].reshape(-1), K)
-        cap = getattr(self, '_stac_max_write_depth', None)
-        if cap and chunk_data.get('depth') is not None:
-            far = np.asarray(chunk_data['depth']).reshape(-1) > float(cap)
-            if far.any():
-                confs = np.asarray(confs).reshape(-1).copy()
-                kept_before = int((confs > 1e-5).sum())
-                confs[far] = 0.0
-                kept = int((confs > 1e-5).sum())
-                print(f"[depth-cap] chunk {K}: {kept_before - kept:,} far points dropped "
-                      f"({kept:,} kept) — observed beyond {float(cap):.1f} m")
+        drops = getattr(self, '_stac_far_drop', None)
+        if drops:
+            start, end = self.chunk_indices[K]
+            S = end - start
+            confs = np.asarray(confs).reshape(S, -1).copy()
+            n_drop = 0
+            for local in range(S):
+                m = drops.get(start + local)
+                if m is not None:
+                    confs[local][m.reshape(-1)] = 0.0
+                    n_drop += int(m.sum())
+            confs = confs.reshape(-1)
+            if n_drop:
+                print(f"[depth-cap] chunk {K}: {n_drop:,} contradicted far points "
+                      f"dropped (displaced duplicates of near-observed surfaces)")
         thr = self._stac_conf_threshold(confs)
         save_confident_pointcloud_batch(
             points=points,
@@ -1096,9 +1101,10 @@ class VGGT_Long:
             return None
         floor = float(np.median(floors))
         cap = floor / rate
+        self._stac_cap_stats = (floor, rate)
         print(f"[depth-cap] session floor {floor * 100:.1f} cm / error rate "
-              f"{rate * 100:.2f}%/m of depth → points beyond {cap:.1f} m of their "
-              f"camera are dropped (their expected error exceeds the floor)")
+              f"{rate * 100:.2f}%/m of depth → error budget at {cap:.1f} m; far "
+              f"points drop ONLY when a nearer frame CONTRADICTS them")
         with open(os.path.join(self.output_dir, "write_depth_cap.json"), "w") as f:
             _json.dump({"cap_m": cap, "seam_floor_m": floor,
                         "pair_error_rate_pct": rate * 100,
@@ -1106,13 +1112,87 @@ class VGGT_Long:
                                   "pairwise depth disagreement"}, f, indent=1)
         return cap
 
+    def _stac_far_contradictions(self):
+        """CONTRADICTION-based far-point policy (v2 of the observation-distance
+        cap). v1 dropped every point observed beyond the error budget — measured
+        on test4 it destroyed 87% REAL coverage (narrow ~38° FOV: side/elevated
+        structures never get a near pass while in frame; only 13% of the dropped
+        volume was actual duplication). v2 keeps unique coverage: a far point
+        drops ONLY if some frame that was close enough to it (within the budget)
+        looked at that spot and saw a different surface — the far observation is
+        then a displaced duplicate (the cone gallery: chunk 4's 15-25 m view sat
+        +0.5..+6 m off the surfaces chunks 5-6 nailed from up close) or a
+        free-space violation. Corroborated points (a near frame AGREES within the
+        session tolerance) and unseen points are kept.
+
+        Returns {global_frame: bool HxW drop-mask} for owner frames; {} when the
+        session error stats are unavailable."""
+        cap = getattr(self, '_stac_max_write_depth', None)
+        stats = getattr(self, '_stac_cap_stats', None)
+        if not cap or not stats or len(self.chunk_indices) < 2:
+            return {}
+        from loop_utils.metric_lock import frame_owner, classify_far_points
+        floor, rate = stats
+        owner = frame_owner(self.chunk_indices, len(self.img_list))
+        _sick = getattr(self, '_stac_sick_chunks', set())
+        cache = {}          # g -> (wp, conf, depth, w2c, K, cam)
+        for k, (start, end) in enumerate(self.chunk_indices):
+            if k in _sick:
+                continue
+            data = np.load(os.path.join(self.result_aligned_dir, f"chunk_{k}.npy"),
+                           allow_pickle=True).item()
+            wp = np.asarray(data['world_points']); wp = wp[0] if wp.ndim == 5 else wp
+            cf = np.asarray(data['world_points_conf']).reshape(wp.shape[:3])
+            dd = np.asarray(data['depth']).reshape(wp.shape[:3])
+            K = np.asarray(data['intrinsic'])
+            ext = np.asarray(data['extrinsic'])
+            for local, g in enumerate(range(start, end)):
+                if owner[g] == k:
+                    c2w = self._stac_aligned_pose(k, local, ext[local])
+                    cache[g] = (wp[local].astype(np.float32), cf[local].astype(np.float32),
+                                dd[local].astype(np.float32), np.linalg.inv(c2w),
+                                K[local], c2w[:3, 3])
+            del data
+        masks = {}
+        n_far_tot = n_drop_tot = 0
+        for f, (wp_f, cf_f, dd_f, _, _, _) in cache.items():
+            far = (cf_f > 1e-5) & (dd_f > cap)
+            if not far.any():
+                continue
+            pts = wp_f[far].reshape(-1, 3).astype(np.float64)
+            ok = np.ones(len(pts), bool)
+            agree = np.zeros(len(pts), bool)
+            contra = np.zeros(len(pts), bool)
+            lo, hi = pts.min(0) - cap, pts.max(0) + cap
+            for g, (_, cf_g, dd_g, w2c_g, K_g, cam_g) in cache.items():
+                if g == f or not ((cam_g >= lo).all() and (cam_g <= hi).all()):
+                    continue
+                a, c = classify_far_points(pts, ok, cam_g, dd_g, cf_g, w2c_g, K_g,
+                                           cap, floor, rate)
+                agree |= a
+                contra |= c
+            drop = contra & ~agree
+            n_far_tot += len(pts)
+            n_drop_tot += int(drop.sum())
+            if drop.any():
+                m = np.zeros(far.shape, bool)
+                m[far] = drop
+                masks[f] = m
+        if n_far_tot:
+            print(f"[depth-cap] contradiction test: {n_drop_tot:,}/{n_far_tot:,} far "
+                  f"points ({100 * n_drop_tot / max(n_far_tot, 1):.1f}%) are displaced "
+                  f"duplicates of near-observed surfaces → dropped; the rest is unique "
+                  f"far coverage → KEPT")
+        return masks
+
     def _stac_write_deferred_outputs(self):
         """PLY + origins for every chunk, AFTER all geometric stages (elastic seam
         consensus, depth graph, two-copy blend) have finished mutating the aligned
-        npys. Sick chunks write nothing (declared hole); the observation-distance
-        policy drops far points (see _stac_write_depth_cap). Resume: existing
-        outputs are kept."""
+        npys. Sick chunks write nothing (declared hole); far points contradicted
+        by near observations are dropped (see _stac_far_contradictions). Resume:
+        existing outputs are kept."""
         self._stac_max_write_depth = self._stac_write_depth_cap()
+        self._stac_far_drop = self._stac_far_contradictions()
         for k in range(len(self.chunk_indices)):
             if (os.path.exists(os.path.join(self.pcd_dir, f"{k}_pcd.ply"))
                     and os.path.exists(os.path.join(self.pcd_dir, f"{k}_origins.npz"))):
