@@ -632,6 +632,16 @@ class VGGT_Long:
         points = chunk_data['world_points'].reshape(-1, 3)
         colors = (chunk_data['images'].transpose(0, 2, 3, 1).reshape(-1, 3) * 255).astype(np.uint8)
         confs = self._stac_owned_confs(chunk_data['world_points_conf'].reshape(-1), K)
+        cap = getattr(self, '_stac_max_write_depth', None)
+        if cap and chunk_data.get('depth') is not None:
+            far = np.asarray(chunk_data['depth']).reshape(-1) > float(cap)
+            if far.any():
+                confs = np.asarray(confs).reshape(-1).copy()
+                kept_before = int((confs > 1e-5).sum())
+                confs[far] = 0.0
+                kept = int((confs > 1e-5).sum())
+                print(f"[depth-cap] chunk {K}: {kept_before - kept:,} far points dropped "
+                      f"({kept:,} kept) — observed beyond {float(cap):.1f} m")
         thr = self._stac_conf_threshold(confs)
         save_confident_pointcloud_batch(
             points=points,
@@ -1050,10 +1060,59 @@ class VGGT_Long:
         if prev is not None and prev[2]:
             np.save(os.path.join(self.result_aligned_dir, f"chunk_{prev[0]}.npy"), prev[1])
 
+    def _stac_write_depth_cap(self):
+        """OBSERVATION-DISTANCE write policy: a surface observed from afar carries
+        a depth error PROPORTIONAL to the distance (measured: ~0.7-1.5% per frame
+        pair), so far observations of a zone later seen up close write a displaced
+        DUPLICATE of it (measured on test4: the cone-gallery zone written by chunk
+        4 from 15-25 m sat +0.5..+6 m off the copies chunks 5-6 wrote from up
+        close — seams were fine, ownership/blend don't apply: different frames
+        legitimately see the same zone). Points whose expected error exceeds what
+        the cloud can hold add garbage, not coverage.
+
+        The cap is derived from THIS session's own numbers — no magic constants:
+            cap = (median elastic per-frame seam residual)  <- the cloud's floor
+                  / (median pairwise depth error rate)      <- error per metre
+        Both are already measured and persisted by the elastic and depth-graph
+        stages. Config Model.max_write_depth_m overrides explicitly. Returns the
+        cap in metres, or None (no policy) when the inputs are unavailable."""
+        import json as _json
+        explicit = self.config['Model'].get('max_write_depth_m')
+        if explicit:
+            print(f"[depth-cap] explicit Model.max_write_depth_m = {float(explicit):.1f} m")
+            return float(explicit)
+        try:
+            es = _json.load(open(os.path.join(self.output_dir, "elastic_seams.json")))
+            floors = [v["residual_m"] for d in (es.get("seams") or {}).values()
+                      for v in d.values() if "residual_m" in v]
+            dg = _json.load(open(os.path.join(self.output_dir, "depth_graph.json")))
+            rate = float(dg.get("pair_disagreement_before_pct", 0.0)) / 100.0
+        except Exception as _e:
+            print(f"[depth-cap] session error stats unavailable ({_e}) — "
+                  f"no observation-distance policy this run")
+            return None
+        if not floors or rate <= 0:
+            print("[depth-cap] no seam floor / error rate measured — policy off")
+            return None
+        floor = float(np.median(floors))
+        cap = floor / rate
+        print(f"[depth-cap] session floor {floor * 100:.1f} cm / error rate "
+              f"{rate * 100:.2f}%/m of depth → points beyond {cap:.1f} m of their "
+              f"camera are dropped (their expected error exceeds the floor)")
+        with open(os.path.join(self.output_dir, "write_depth_cap.json"), "w") as f:
+            _json.dump({"cap_m": cap, "seam_floor_m": floor,
+                        "pair_error_rate_pct": rate * 100,
+                        "source": "median elastic per-frame residual / median "
+                                  "pairwise depth disagreement"}, f, indent=1)
+        return cap
+
     def _stac_write_deferred_outputs(self):
         """PLY + origins for every chunk, AFTER all geometric stages (elastic seam
-        consensus, depth graph) have finished mutating the aligned npys. Sick
-        chunks write nothing (declared hole). Resume: existing outputs are kept."""
+        consensus, depth graph, two-copy blend) have finished mutating the aligned
+        npys. Sick chunks write nothing (declared hole); the observation-distance
+        policy drops far points (see _stac_write_depth_cap). Resume: existing
+        outputs are kept."""
+        self._stac_max_write_depth = self._stac_write_depth_cap()
         for k in range(len(self.chunk_indices)):
             if (os.path.exists(os.path.join(self.pcd_dir, f"{k}_pcd.ply"))
                     and os.path.exists(os.path.join(self.pcd_dir, f"{k}_origins.npz"))):
