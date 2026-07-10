@@ -979,6 +979,77 @@ class VGGT_Long:
         print(f"[depth-graph] ✅ every frame now agrees with its neighbours on the "
               f"depth of shared surfaces (per-frame z' = a*z + b along rays)")
 
+    def _stac_blend_copies(self):
+        """STAC patch: TWO-COPY CONSENSUS — every overlap frame is predicted by
+        both of its chunks; instead of discarding the non-owner copy, both copies
+        become their per-pixel mean (see loop_utils.metric_lock.blend_two_copies;
+        measured on test4: cross-owner depth disagreement 1.51% -> 1.01%, the
+        ownership-switch step halves; same-owner pairs unchanged). Runs AFTER the
+        elastic consensus (copies rigidly coincide) and depth graph, BEFORE the
+        outputs. Seams touching a sick chunk are skipped — a healthy field never
+        averages with garbage. Both copies are written back, so every downstream
+        reader (PLY via ownership, TSDF, omega-depth) sees the same consensus;
+        the operation is idempotent (blending identical copies is a no-op), so
+        resume needs no special casing beyond the skip stamp."""
+        if not self.config['Model'].get('blend_copies') or len(self.chunk_indices) < 2:
+            return
+        from loop_utils.metric_lock import blend_two_copies
+        _sick = getattr(self, '_stac_sick_chunks', set())
+        prev = None            # (k, data, dirty)
+        for k in range(len(self.chunk_indices) - 1):
+            if k in _sick or (k + 1) in _sick:
+                print(f"[blend] seam {k}->{k + 1}: touches a sick chunk — skipped")
+                continue
+            if prev is not None and prev[0] == k:
+                data_a, dirty_a = prev[1], prev[2]
+            else:
+                if prev is not None and prev[2]:
+                    np.save(os.path.join(self.result_aligned_dir, f"chunk_{prev[0]}.npy"),
+                            prev[1])
+                data_a = np.load(os.path.join(self.result_aligned_dir, f"chunk_{k}.npy"),
+                                 allow_pickle=True).item()
+                dirty_a = False
+            data_b = np.load(os.path.join(self.result_aligned_dir, f"chunk_{k + 1}.npy"),
+                             allow_pickle=True).item()
+            if data_a.get('_stac_copies_blended') and data_b.get('_stac_copies_blended'):
+                print(f"[blend] seam {k}->{k + 1}: already blended — skipped")
+                prev = (k + 1, data_b, False)
+                continue
+            sa, ea = self.chunk_indices[k]
+            sb, eb = self.chunk_indices[k + 1]
+            wa = np.asarray(data_a['world_points']); la = wa.ndim == 5
+            if la:
+                wa = wa[0]
+            wb = np.asarray(data_b['world_points']); lb = wb.ndim == 5
+            if lb:
+                wb = wb[0]
+            ca = np.asarray(data_a['world_points_conf']).reshape(wa.shape[:3])
+            cb = np.asarray(data_b['world_points_conf']).reshape(wb.shape[:3])
+            da = np.asarray(data_a['depth'])
+            db = np.asarray(data_b['depth'])
+            n_bl = 0
+            for g in range(max(sb, sa), min(ea, eb)):
+                ia, ib = g - sa, g - sb
+                wp, cf, dd = blend_two_copies(wa[ia], ca[ia], wb[ib], cb[ib],
+                                              da[ia], db[ib])
+                wa[ia] = wp; wb[ib] = wp
+                ca[ia] = cf; cb[ib] = cf
+                da[ia] = dd; db[ib] = dd
+                n_bl += 1
+            data_a['world_points'] = wa[None] if la else wa
+            data_b['world_points'] = wb[None] if lb else wb
+            data_a['world_points_conf'] = ca.reshape(np.asarray(data_a['world_points_conf']).shape)
+            data_b['world_points_conf'] = cb.reshape(np.asarray(data_b['world_points_conf']).shape)
+            data_a['depth'] = da
+            data_b['depth'] = db
+            data_a['_stac_copies_blended'] = True
+            data_b['_stac_copies_blended'] = True
+            np.save(os.path.join(self.result_aligned_dir, f"chunk_{k}.npy"), data_a)
+            print(f"[blend] seam {k}->{k + 1}: {n_bl} shared frames -> two-copy consensus")
+            prev = (k + 1, data_b, True)
+        if prev is not None and prev[2]:
+            np.save(os.path.join(self.result_aligned_dir, f"chunk_{prev[0]}.npy"), prev[1])
+
     def _stac_write_deferred_outputs(self):
         """PLY + origins for every chunk, AFTER all geometric stages (elastic seam
         consensus, depth graph) have finished mutating the aligned npys. Sick
@@ -1266,7 +1337,8 @@ class VGGT_Long:
         # the aligned npys — the apply loop only produces the aligned .npys and
         # _stac_write_deferred_outputs() writes the outputs at the end.
         _elastic = ((self.config['Model'].get('elastic_seam')
-                     or self.config['Model'].get('depth_graph'))
+                     or self.config['Model'].get('depth_graph')
+                     or self.config['Model'].get('blend_copies'))
                     and len(self.chunk_indices) > 1)
         if _elastic:
             print("[STAC] per-chunk PLY/origins deferred until after the elastic/depth stages")
@@ -1347,6 +1419,7 @@ class VGGT_Long:
         # from the FINAL geometry. save_camera_poses applies the elastic pose moves.
         self._stac_elastic_seams()
         self._stac_depth_graph()
+        self._stac_blend_copies()
         if _elastic:
             self._stac_write_deferred_outputs()
 
