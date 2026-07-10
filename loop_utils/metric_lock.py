@@ -159,3 +159,53 @@ def solve_scale_graph(s_da3, n_anchors, seam_rel, n_chunks,
     b = np.asarray(rhs) * np.asarray(w)
     x, *_ = np.linalg.lstsq(A, b, rcond=None)
     return np.exp(x)
+
+
+def robust_rigid(src, dst, iters=8, sample=200000, seed=0):
+    """Rigid fit dst ≈ R·src + t from EXACT correspondences (same pixel, same
+    frame, two chunks), IRLS with a Cauchy weight on the residuals so the
+    chunk-internal disagreement (non-rigid noise + far-field junk) does not
+    drag the fit. Returns (R, t, median_residual_m, n_used) or None."""
+    src = np.asarray(src, np.float64); dst = np.asarray(dst, np.float64)
+    m = np.isfinite(src).all(1) & np.isfinite(dst).all(1)
+    src, dst = src[m], dst[m]
+    if len(src) < 1000:
+        return None
+    if len(src) > sample:
+        idx = np.random.default_rng(seed).choice(len(src), sample, replace=False)
+        src, dst = src[idx], dst[idx]
+    w = np.ones(len(src))
+    R, t = np.eye(3), np.zeros(3)
+    for _ in range(int(iters)):
+        ws = w.sum()
+        cs_ = (src * w[:, None]).sum(0) / ws
+        cd_ = (dst * w[:, None]).sum(0) / ws
+        H = ((src - cs_) * w[:, None]).T @ (dst - cd_)
+        U, _, Vt = np.linalg.svd(H)
+        D = np.eye(3); D[2, 2] = np.sign(np.linalg.det(Vt.T @ U.T))
+        R = Vt.T @ D @ U.T
+        t = cd_ - R @ cs_
+        r = np.linalg.norm(dst - (src @ R.T + t), axis=1)
+        c = max(3.0 * 1.4826 * np.median(np.abs(r - np.median(r))), 1e-4)
+        w = 1.0 / (1.0 + (r / c) ** 2)
+    r = np.linalg.norm(dst - (src @ R.T + t), axis=1)
+    return R, t, float(np.median(r)), int(len(src))
+
+
+def frame_owner(chunk_indices, n_frames):
+    """owner[g] = index of the chunk that WRITES frame g's points to the cloud.
+    Every frame is written by exactly ONE chunk (the one whose centre is nearest)
+    — overlap frames used to be written by BOTH chunks, putting two displaced
+    copies of the same pixels into the cloud (the mechanical half of the
+    duplicated-objects problem)."""
+    owner = np.full(int(n_frames), -1, np.int32)
+    centers = [(s0 + e0) / 2.0 for s0, e0 in chunk_indices]
+    for g in range(int(n_frames)):
+        best, bd = -1, None
+        for k, (s0, e0) in enumerate(chunk_indices):
+            if s0 <= g < e0:
+                d = abs(g - centers[k])
+                if bd is None or d < bd:
+                    best, bd = k, d
+        owner[g] = best
+    return owner

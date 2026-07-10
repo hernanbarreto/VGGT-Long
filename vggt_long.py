@@ -495,7 +495,31 @@ class VGGT_Long:
             return float(np.percentile(valid.astype(np.float64), float(pct)))
         return float(np.mean(confs, dtype=np.float64)) * ps['conf_threshold_coef']
 
-    def _stac_write_origins(self, chunk_data, K, conf_threshold=None):
+    def _stac_owned_confs(self, confs, chunk_idx):
+        """FRAME OWNERSHIP: zero the confidence of frames this chunk does not OWN,
+        so both the PLY writer and the origins writer drop them with the same mask.
+        Every overlap frame used to be written by BOTH chunks — two displaced copies
+        of the same pixels in the cloud (the mechanical half of the duplicated
+        objects). One frame → one writer (the chunk whose centre is nearest)."""
+        if (not self.config['Model'].get('frame_ownership')
+                or self.chunk_indices is None or len(self.chunk_indices) <= 1):
+            return confs
+        from loop_utils.metric_lock import frame_owner
+        owner = frame_owner(self.chunk_indices, len(self.img_list))
+        start, end = self.chunk_indices[chunk_idx]
+        S = end - start
+        cf = np.asarray(confs).reshape(S, -1).copy()
+        kept = 0
+        for local in range(S):
+            if owner[start + local] != chunk_idx:
+                cf[local] = 0.0
+            else:
+                kept += 1
+        print(f"[frame-owner] chunk {chunk_idx}: writes {kept}/{S} frames "
+              f"(the rest belong to neighbours)")
+        return cf.reshape(-1)
+
+    def _stac_write_origins(self, chunk_data, K, conf_threshold=None, confs_override=None):
         """STAC patch: write per-point origins (frame_global = REAL frame number,
         pixel_row/col, confidence) for chunk K using the SAME confidence mask that
         save_confident_pointcloud_batch uses for the PLY. `conf_threshold` MUST be the
@@ -507,7 +531,8 @@ class VGGT_Long:
             if wp.ndim == 5:
                 wp = wp[0]
             S, H, W = wp.shape[:3]
-            confs = chunk_data['world_points_conf'].reshape(-1)
+            confs = (np.asarray(confs_override).reshape(-1) if confs_override is not None
+                     else chunk_data['world_points_conf'].reshape(-1))
             cfs32 = confs.astype(np.float32)
             thr = self._stac_conf_threshold(confs) if conf_threshold is None else conf_threshold
             mask = (cfs32 >= thr) & (cfs32 > 1e-5)           # identical to save_confident
@@ -598,17 +623,44 @@ class VGGT_Long:
                 mask2 = chunk_data2["mask"][:self.overlap]
                 mask = mask1.squeeze() & mask2.squeeze()
 
-            if self.config['Model']['Pointcloud_Save'].get('use_conf_filter', True):
-                conf_threshold = min(np.median(conf1), np.median(conf2)) * 0.1
-            else:
-                conf_threshold = -1.0
-            s, R, t = weighted_align_point_maps(point_map1, 
-                                                conf1, 
-                                                point_map2, 
-                                                conf2,
-                                                mask,
-                                                conf_threshold=conf_threshold,
-                                                config=self.config)
+            # STAC: EXACT seam alignment. The overlap maps are the SAME frames pixel
+            # for pixel — millions of exact correspondences. A robust rigid fit on
+            # them lands at millimetres, where the generic point-map fit tolerated
+            # 25-30 cm (measured: one seam glued 50 cm off in depth). Scale is
+            # already consistent chunk-to-chunk (metric lock scale graph), so the
+            # seam is rigid by construction. Falls back to the vendor fit if starved.
+            s = R = t = None
+            if self.config['Model'].get('exact_seam_align'):
+                from loop_utils.metric_lock import robust_rigid
+                _p1 = np.asarray(point_map1, np.float64).reshape(-1, 3)
+                _p2 = np.asarray(point_map2, np.float64).reshape(-1, 3)
+                _c1 = np.asarray(conf1).reshape(-1)
+                _c2 = np.asarray(conf2).reshape(-1)
+                _ok = (_c1 > 1e-5) & (_c2 > 1e-5)
+                if mask is not None:
+                    _ok &= np.asarray(mask).reshape(-1).astype(bool)
+                _fit = robust_rigid(_p2[_ok], _p1[_ok])
+                if _fit is not None:
+                    R, t, _res, _n = _fit[0], _fit[1], _fit[2], _fit[3]
+                    s = 1.0
+                    self._stac_exact_seams = getattr(self, '_stac_exact_seams', 0) + 1
+                    print(f"[exact-seam] {chunk_idx}->{chunk_idx+1}: rigid fit on "
+                          f"{_n:,} exact correspondences, median residual {_res*100:.1f} cm")
+                else:
+                    print(f"[exact-seam] {chunk_idx}->{chunk_idx+1}: starved — "
+                          f"falling back to the point-map fit")
+            if R is None:
+                if self.config['Model']['Pointcloud_Save'].get('use_conf_filter', True):
+                    conf_threshold = min(np.median(conf1), np.median(conf2)) * 0.1
+                else:
+                    conf_threshold = -1.0
+                s, R, t = weighted_align_point_maps(point_map1, 
+                                                    conf1, 
+                                                    point_map2, 
+                                                    conf2,
+                                                    mask,
+                                                    conf_threshold=conf_threshold,
+                                                    config=self.config)
             print("Estimated Scale:", s)
             print("Estimated Rotation:\n", R)
             print("Estimated Translation:", t)
@@ -715,7 +767,19 @@ class VGGT_Long:
                 self.loop_sim3_list.append((chunk_idx_a, chunk_idx_b, (s_ab, R_ab, t_ab)))
 
 
-        if self.loop_enable:
+        _n_seams = max(len(self.chunk_indices) - 1, 0)
+        if (self.config['Model'].get('exact_seam_align')
+                and getattr(self, '_stac_exact_seams', 0) == _n_seams and _n_seams > 0):
+            # every seam is an exact-correspondence rigid fit (mm-scale). The loop
+            # optimizer's constraints come from the COARSE point-map fits — letting
+            # them redistribute error would degrade the precise chain, not help it.
+            if self.loop_enable:
+                print(f"[exact-seam] all {_n_seams} seams exact — loop optimizer SKIPPED "
+                      f"(coarse loop constraints must not drag a mm-precise chain)")
+            self.loop_enable_opt = False
+        else:
+            self.loop_enable_opt = self.loop_enable
+        if self.loop_enable_opt:
             input_abs_poses = self.loop_optimizer.sequential_to_absolute_poses(self.sim3_list)
             self.sim3_list = self.loop_optimizer.optimize(self.sim3_list, self.loop_sim3_list)
             optimized_abs_poses = self.loop_optimizer.sequential_to_absolute_poses(self.sim3_list)
@@ -760,14 +824,14 @@ class VGGT_Long:
                 np.save(os.path.join(self.result_aligned_dir, "chunk_0.npy"), cd0)
                 pts0 = cd0['world_points'].reshape(-1, 3)
                 col0 = (cd0['images'].transpose(0, 2, 3, 1).reshape(-1, 3) * 255).astype(np.uint8)
-                cf0 = cd0['world_points_conf'].reshape(-1)
+                cf0 = self._stac_owned_confs(cd0['world_points_conf'].reshape(-1), 0)
                 thr0 = self._stac_conf_threshold(cf0)
                 save_confident_pointcloud_batch(
                     points=pts0, colors=col0, confs=cf0,
                     output_path=os.path.join(self.pcd_dir, "0_pcd.ply"),
                     conf_threshold=thr0,
                     sample_ratio=self.config['Model']['Pointcloud_Save']['sample_ratio'])
-                self._stac_write_origins(cd0, 0, conf_threshold=thr0)
+                self._stac_write_origins(cd0, 0, conf_threshold=thr0, confs_override=cf0)
                 print(f'[STAC] single chunk: saved 0_pcd.ply ({len(pts0)} pts)')
 
         for chunk_idx in range(len(self.chunk_indices) - 1):
@@ -812,6 +876,7 @@ class VGGT_Long:
                 colors_first = (chunk_data_first['images'].transpose(0, 2, 3, 1).reshape(-1, 3) * 255).astype(np.uint8)
                 confs_first = chunk_data_first['world_points_conf'].reshape(-1)
                 ply_path_first = os.path.join(self.pcd_dir, f'0_pcd.ply')
+                confs_first = self._stac_owned_confs(confs_first, 0)
                 thr_first = self._stac_conf_threshold(confs_first)
                 save_confident_pointcloud_batch(
                     points=points_first,  # shape: (H, W, 3)
@@ -821,7 +886,8 @@ class VGGT_Long:
                     conf_threshold=thr_first,
                     sample_ratio=self.config['Model']['Pointcloud_Save']['sample_ratio']
                 )
-                self._stac_write_origins(chunk_data_first, 0, conf_threshold=thr_first)
+                self._stac_write_origins(chunk_data_first, 0, conf_threshold=thr_first,
+                                         confs_override=confs_first)
                 # STAC: free unaligned chunk_0 NOW — its aligned .npy + pcd + origins are
                 # written and nothing downstream reads unaligned (the TSDF reads
                 # _tmp_results_aligned). Incremental cleanup so the apply phase never holds
@@ -845,6 +911,7 @@ class VGGT_Long:
             colors = (aligned_chunk_data['images'].transpose(0, 2, 3, 1).reshape(-1, 3) * 255).astype(np.uint8)
             confs = aligned_chunk_data['world_points_conf'].reshape(-1)
             ply_path = os.path.join(self.pcd_dir, f'{chunk_idx + 1}_pcd.ply')
+            confs = self._stac_owned_confs(confs, chunk_idx + 1)
             thr_k = self._stac_conf_threshold(confs)
             save_confident_pointcloud_batch(
                 points=points,  # shape: (H, W, 3)
@@ -854,7 +921,8 @@ class VGGT_Long:
                 conf_threshold=thr_k,
                 sample_ratio=self.config['Model']['Pointcloud_Save']['sample_ratio']
             )
-            self._stac_write_origins(aligned_chunk_data, chunk_idx + 1, conf_threshold=thr_k)
+            self._stac_write_origins(aligned_chunk_data, chunk_idx + 1, conf_threshold=thr_k,
+                                     confs_override=confs)
             # STAC: free this chunk's unaligned .npy immediately (see chunk_0 note above) —
             # incremental cleanup keeps the apply phase ~flat on disk instead of doubling.
             try:
