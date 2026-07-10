@@ -334,7 +334,8 @@ class VGGT_Long:
         ml = (self.config['Model'].get('metric_lock') or {})
         if not ml.get('enable'):
             return
-        from loop_utils.metric_lock import chunk_scale, apply_scale, real_frame_number
+        from loop_utils.metric_lock import (chunk_scale, apply_scale, real_frame_number,
+                                            seam_relative_scale, solve_scale_graph)
         anchor_dir = ml['anchor_dir']
         near_frac = float(ml.get('near_frac', 0.25))
         import json as _json
@@ -353,25 +354,67 @@ class VGGT_Long:
             except Exception:
                 already = set()
 
-        report = {"chunks": {}, "loops": {}}
+        report = {"chunks": {}, "loops": {}, "seams": {}}
         scales = {}
-        # 1) main chunks (unaligned npys on disk)
+        n_anchor_map = {}
+        seam_rel = {}
+        prev_shared = None   # (chunk_idx, {global_frame: depth}) for the seam ratio
+        # 1) main chunks: DA3 absolute scale per chunk + RELATIVE scale per seam
+        # (same frame, same pixels, in both neighbours — the precise sensor)
         for k, (start, end) in enumerate(self.chunk_indices):
-            if k in already:
-                continue
             path = os.path.join(self.result_unaligned_dir, f"chunk_{k}.npy")
             if not os.path.exists(path):
                 print(f"[metric-lock] chunk {k}: missing {path} — skipped")
+                prev_shared = None
                 continue
             data = np.load(path, allow_pickle=True).item()
             nums = [real_frame_number(self.img_list[i]) for i in range(start, end)]
             s, n, ratios = chunk_scale(data, nums, anchor_dir, near_frac=near_frac)
             if s is not None:
                 scales[k] = s
+                n_anchor_map[k] = n
                 spread = (f" spread {min(ratios):.3f}-{max(ratios):.3f}"
                           if len(ratios) > 1 else "")
-                print(f"[metric-lock] chunk {k}: s={s:.4f} from {n} anchor(s){spread}")
+                print(f"[metric-lock] chunk {k}: DA3 s={s:.4f} from {n} anchor(s){spread}")
             report["chunks"][str(k)] = {"s": s, "n_anchors": n, "ratios": ratios}
+            # seam with the previous chunk: ratio over ALL shared frames
+            depth_k = np.asarray(data["depth"])
+            if prev_shared is not None and prev_shared[0] == k - 1:
+                rs = []
+                for local, g in enumerate(range(start, end)):
+                    if g in prev_shared[1]:
+                        r = seam_relative_scale(prev_shared[1][g], depth_k[local])
+                        if r is not None:
+                            rs.append(r)
+                if rs:
+                    seam_rel[k - 1] = float(np.median(rs))
+                    report["seams"][str(k - 1)] = {"rel": seam_rel[k - 1],
+                                                   "n_frames": len(rs)}
+                    print(f"[metric-lock] seam {k-1}->{k}: relative scale "
+                          f"{seam_rel[k-1]:.4f} over {len(rs)} shared frames")
+            # stash THIS chunk's tail frames (the next chunk's overlap) for its seam
+            nxt = self.chunk_indices[k + 1] if k + 1 < len(self.chunk_indices) else None
+            if nxt is not None:
+                shared = {g: depth_k[g - start] for g in range(max(nxt[0], start), end)}
+                prev_shared = (k, shared)
+            else:
+                prev_shared = None
+
+        # 2) fuse both sensors: seams make neighbours CONSISTENT (0.1-1% noise),
+        # anchors pin the global metre (±8-15% each). Weighted LS in log space.
+        if scales and seam_rel:
+            s_opt = solve_scale_graph(scales, n_anchor_map, seam_rel,
+                                      len(self.chunk_indices),
+                                      sigma_seam=float(ml.get('sigma_seam', 0.003)),
+                                      sigma_anchor=float(ml.get('sigma_anchor', 0.08)))
+            for k in range(len(self.chunk_indices)):
+                if np.isfinite(s_opt[k]) and s_opt[k] > 0:
+                    old_s = scales.get(k)
+                    scales[k] = float(s_opt[k])
+                    report["chunks"].setdefault(str(k), {})["s_graph"] = float(s_opt[k])
+                    tag = (f" (DA3 alone said {old_s:.4f})" if old_s
+                           else " (no anchors — from seams)")
+                    print(f"[metric-lock] chunk {k}: OPTIMAL s={s_opt[k]:.4f}{tag}")
         # merge previously locked chunks into the scale table (report continuity + the
         # fallback median), but NEVER re-apply them.
         if already and os.path.exists(_prev_path):

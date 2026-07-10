@@ -103,3 +103,59 @@ def apply_scale(chunk_data, s):
         ext[..., :3, 3] *= s
         chunk_data["extrinsic"] = ext
     return chunk_data
+
+
+def seam_relative_scale(depth_a, depth_b, min_px=1000):
+    """Relative scale s_B/s_A that makes chunk B's depth agree with chunk A's on
+    the SAME frame (same pixels): if raw d_B = r * d_A, then s_B/s_A = 1/r.
+    Median over valid pixels; None when starved."""
+    da = np.asarray(depth_a, np.float32).squeeze()
+    db = np.asarray(depth_b, np.float32).squeeze()
+    if da.shape != db.shape:
+        return None
+    m = np.isfinite(da) & np.isfinite(db) & (da > 1e-6) & (db > 1e-6)
+    if m.sum() < min_px:
+        return None
+    return float(1.0 / np.median(db[m] / da[m]))
+
+
+def solve_scale_graph(s_da3, n_anchors, seam_rel, n_chunks,
+                      sigma_seam=0.003, sigma_anchor=0.08):
+    """Optimal per-chunk metric scales from BOTH sensors, weighted least squares
+    in log-scale space.
+
+    The overlap frames measure the RELATIVE scale between neighbours to ~0.1-1%
+    (same pixels, a ratio); the DA3 anchors measure each chunk's ABSOLUTE scale
+    with ±8-15% monocular noise. Locking chunks to their own noisy DA3 median
+    left neighbours disagreeing 5-27% — decimetres-to-metres of seam decoupling
+    an SE(3) glue can never fix (measured, test4). Fusing both:
+
+        minimize  Σ_seams   [(x_{k+1} - x_k) - log r_k]² / σ_seam²
+                + Σ_anchors [x_k - log s_k^DA3]²         / (σ_anchor/√n_k)²
+
+    x_k = log s_k. Linear, tiny (one variable per chunk). Seams make the scales
+    CONSISTENT; anchors pin the global metre without dragging neighbours apart.
+
+    s_da3: {k: s} absolute estimates; n_anchors: {k: count}; seam_rel: {k: r}
+    with r = s_{k+1}/s_k (from seam_relative_scale). Returns np.ndarray scales.
+    """
+    rows, rhs, w = [], [], []
+    for k, r in seam_rel.items():
+        if r is None or not np.isfinite(r) or r <= 0:
+            continue
+        row = np.zeros(n_chunks)
+        row[k], row[k + 1] = -1.0, 1.0
+        rows.append(row); rhs.append(np.log(r)); w.append(1.0 / sigma_seam)
+    for k, s in s_da3.items():
+        if s is None or not np.isfinite(s) or s <= 0:
+            continue
+        row = np.zeros(n_chunks)
+        row[k] = 1.0
+        sig = sigma_anchor / max(np.sqrt(float(n_anchors.get(k, 1))), 1.0)
+        rows.append(row); rhs.append(np.log(s)); w.append(1.0 / sig)
+    if not rows:
+        raise ValueError("scale graph has no constraints")
+    A = np.asarray(rows) * np.asarray(w)[:, None]
+    b = np.asarray(rhs) * np.asarray(w)
+    x, *_ = np.linalg.lstsq(A, b, rcond=None)
+    return np.exp(x)
