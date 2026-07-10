@@ -561,7 +561,8 @@ def se3_matrices(xi):
     return out
 
 
-def solve_frame_graph(pair_taus, n_frames, sick_frames=(), smooth_w=0.25):
+def solve_frame_graph(pair_taus, n_frames, sick_frames=(), smooth_w=0.25,
+                      prior_w=0.3):
     """Per-frame RIGID corrections from pairwise rigid residuals — the pose
     analogue of solve_depth_graph, and the stage the depth-graph ladder said
     was missing (test4: the inter-frame disagreement is an offset-like WARP,
@@ -576,6 +577,16 @@ def solve_frame_graph(pair_taus, n_frames, sick_frames=(), smooth_w=0.25):
         xi_{f+1} - xi_f = 0             (weak smoothness, weight smooth_w —
                                          the warp is low-frequency; d=1 pairs
                                          already measure the gradient)
+        xi_f = 0                        (ZERO-PRIOR per frame, weight prior_w —
+                                         wavelengths LONGER than the pair span
+                                         are nearly unobservable; without this
+                                         the lstsq fills them from noise. The
+                                         hallucination is not hypothetical:
+                                         test4 run 4, 2026-07-10, injected up
+                                         to 163 cm of low-frequency bend that
+                                         the short-span held-out could not see
+                                         — chimney offset 7→130 cm. The prior
+                                         keeps under-evidenced modes at 0.)
         mean(xi) = 0                    (gauge: the session's global frame,
                                          set by metric lock + orient, is
                                          preserved — the graph REDISTRIBUTES)
@@ -604,6 +615,11 @@ def solve_frame_graph(pair_taus, n_frames, sick_frames=(), smooth_w=0.25):
         r[i + 1], r[i] = smooth_w, -smooth_w
         rows.append(r)
         rhs.append(np.zeros(6))
+    for i in range(n):                         # zero-prior: under-evidenced
+        r = np.zeros(n)                        # (long-wavelength) modes stay 0
+        r[i] = prior_w
+        rows.append(r)
+        rhs.append(np.zeros(6))
     gauge = np.full(n, float(len(taus)) / n)   # strong: pins the mean exactly
     rows.append(gauge)
     rhs.append(np.zeros(6))
@@ -617,7 +633,16 @@ def frame_graph_verdict(xi, pair_taus, held, improve=0.8, bound=5.0):
     """Self-validation for the frame graph (the ladder discipline): judged on
     HELD-OUT pairs' actual 3D correspondences, corrections bounded by the
     pairwise signal. held: [(f, g, p[n,3], q[n,3])]. Returns a dict with
-    bounded / improves / med_before / med_after (metres)."""
+    bounded / improves / med_before / med_after (metres).
+
+    The bound compares against the MEDIAN pair magnitude, not a high
+    percentile: measured on test4 (run 4, 2026-07-10) the p99 of the pair
+    fits was inflated by occlusion-contaminated far pairs, which let 163 cm
+    corrections pass as "bounded" while they bent the reconstruction
+    (chimney 7→130 cm). 5× the median is the honest scale of the signal.
+    KNOWN LIMIT (why this gate alone is not enough and the stage ships
+    default-OFF): held-out pairs span the same ≤12 frames the fit pairs do —
+    a hallucinated wavelength LONGER than the span is invisible to both."""
     xi = np.asarray(xi, np.float64)
     X = se3_matrices(xi)
     before, after = [], []
@@ -633,8 +658,8 @@ def frame_graph_verdict(xi, pair_taus, held, improve=0.8, bound=5.0):
               for _, _, t, _ in pair_taus]
     r_pair = [float(np.linalg.norm(np.asarray(t, np.float64).reshape(6)[:3]))
               for _, _, t, _ in pair_taus]
-    t_sig = max(float(np.percentile(t_pair, 99)), 1e-3)
-    r_sig = max(float(np.percentile(r_pair, 99)), 1e-4)
+    t_sig = max(float(np.median(t_pair)), 1e-3)
+    r_sig = max(float(np.median(r_pair)), 1e-4)
     bounded = (float(np.percentile(np.linalg.norm(xi[:, 3:], axis=1), 99)) <= bound * t_sig
                and float(np.percentile(np.linalg.norm(xi[:, :3], axis=1), 99)) <= bound * r_sig)
     improves = med_a <= improve * med_b
