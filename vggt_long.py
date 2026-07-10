@@ -1187,6 +1187,30 @@ class VGGT_Long:
         all_poses = [None] * len(self.img_list)
         all_intrinsics = [None] * len(self.img_list)
 
+        # STAC fix: all_camera_poses holds the extrinsics captured at INFERENCE time —
+        # raw per-chunk Omega scale. The metric lock scales world_points/depth/extrinsic
+        # in the npys but never this in-memory list, so every pose block came out ~s_k×
+        # compressed (s_k 7-23 measured on test4) placed at metric offsets: pose blocks
+        # 2.3-8 m apart (165× the 2.4 cm within-block step) while the CLOUDS glued at cm
+        # — and camera_poses.txt feeds omega-depth/scale_align, orient, TSDF and the
+        # fine registration. Refresh every chunk's extrinsics from its ALIGNED npy (the
+        # metric-locked poses the rest of the pipeline actually uses; sim3 is applied
+        # below as before). Also immune to the resume path, where the in-memory list
+        # mixes raw (fresh inference) and already-locked (resumed-from-disk) chunks.
+        for _k in range(len(self.all_camera_poses)):
+            _rng = self.all_camera_poses[_k][0]
+            _p = os.path.join(self.result_aligned_dir, f"chunk_{_k}.npy")
+            try:
+                _cd = np.load(_p, allow_pickle=True).item()
+                if _cd.get('extrinsic') is not None:
+                    self.all_camera_poses[_k] = (_rng, np.asarray(_cd['extrinsic']))
+                else:
+                    print(f"[STAC] WARN: chunk {_k} npy has no extrinsic — keeping the "
+                          f"in-memory (raw-scale) poses for that block")
+            except Exception as _e:
+                print(f"[STAC] WARN: could not refresh chunk {_k} poses from {_p} ({_e}) "
+                      f"— keeping the in-memory (raw-scale) poses for that block")
+
         # STAC: when the elastic seam consensus ran, every frame's points were moved
         # by a per-frame rigid correction — the camera must move WITH its points
         # (depth maps and the TSDF stay valid by rigidity). _stac_elastic_corr[k][i]
