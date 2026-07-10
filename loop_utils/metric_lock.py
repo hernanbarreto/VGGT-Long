@@ -514,6 +514,135 @@ def depth_pair_samples(wp_src, conf_src, wp_dst, conf_dst, w2c_dst, K_dst,
     return z_src[good], Xq[:, 2]
 
 
+def surface_pair_correspondences(wp_src, conf_src, wp_dst, conf_dst, w2c_dst, K_dst,
+                                 max_samples=8000, seed=0):
+    """EXACT-surface 3D correspondences between two frames: project src's valid
+    points into dst's camera and pair them with dst's OWN 3D point at the hit
+    pixel. Returns (p_src[n,3], q_dst[n,3]) or None when starved — the rigid
+    analogue of depth_pair_samples (same association, full 3D instead of z)."""
+    H, W = wp_dst.shape[:2]
+    p = np.asarray(wp_src, np.float64).reshape(-1, 3)
+    c = np.asarray(conf_src, np.float32).reshape(-1)
+    idx = np.flatnonzero(c > 1e-5)
+    if len(idx) < 500:
+        return None
+    if len(idx) > max_samples:
+        idx = np.random.default_rng(seed).choice(idx, max_samples, replace=False)
+    p = p[idx]
+    w2c = np.asarray(w2c_dst, np.float64)
+    X = p @ w2c[:3, :3].T + w2c[:3, 3]
+    z = X[:, 2]
+    m = z > 0.3
+    if m.sum() < 300:
+        return None
+    fx, fy, cx, cy = float(K_dst[0, 0]), float(K_dst[1, 1]), float(K_dst[0, 2]), float(K_dst[1, 2])
+    u = np.round(X[m, 0] / z[m] * fx + cx).astype(int)
+    v = np.round(X[m, 1] / z[m] * fy + cy).astype(int)
+    inb = (u >= 0) & (u < W) & (v >= 0) & (v < H)
+    if inb.sum() < 300:
+        return None
+    u, v, p_in = u[inb], v[inb], p[m][inb]
+    q = np.asarray(wp_dst, np.float64)[v, u]
+    cq = np.asarray(conf_dst, np.float32).reshape(H, W)[v, u]
+    good = cq > 1e-5
+    if good.sum() < 300:
+        return None
+    return p_in[good], q[good]
+
+
+def se3_matrices(xi):
+    """(N,6) se(3) vectors (rotvec, t) → (N,4,4) rigid matrices."""
+    xi = np.asarray(xi, np.float64).reshape(-1, 6)
+    out = np.tile(np.eye(4), (len(xi), 1, 1))
+    for i, x in enumerate(xi):
+        R, _ = cv2.Rodrigues(x[:3].copy())
+        out[i, :3, :3] = R
+        out[i, :3, 3] = x[3:]
+    return out
+
+
+def solve_frame_graph(pair_taus, n_frames, sick_frames=(), smooth_w=0.25):
+    """Per-frame RIGID corrections from pairwise rigid residuals — the pose
+    analogue of solve_depth_graph, and the stage the depth-graph ladder said
+    was missing (test4: the inter-frame disagreement is an offset-like WARP,
+    not a depth-model error — no depth correction can be earned for it).
+
+    For nearby frames (f, g) the exact-surface rigid fit T_fg maps f's copy of
+    the shared surface onto g's copy (q = T_fg p). Coincidence after per-frame
+    corrections X_f, X_g requires X_f = X_g T_fg; for the small corrections
+    this stage exists for, in se(3) log coordinates that is LINEAR:
+
+        xi_f - xi_g = tau_fg            (tau = log T_fg, one row per pair)
+        xi_{f+1} - xi_f = 0             (weak smoothness, weight smooth_w —
+                                         the warp is low-frequency; d=1 pairs
+                                         already measure the gradient)
+        mean(xi) = 0                    (gauge: the session's global frame,
+                                         set by metric lock + orient, is
+                                         preserved — the graph REDISTRIBUTES)
+
+    Six independent scalar graph problems with one shared structure (solved as
+    one lstsq with 6 rhs columns). Sick frames are excluded by the caller and
+    forced to identity. pair_taus: [(f, g, tau[6], w)]. Returns xi (N,6)."""
+    taus = [(f, g, np.asarray(t, np.float64).reshape(6), float(w))
+            for f, g, t, w in pair_taus
+            if f not in sick_frames and g not in sick_frames
+            and np.all(np.isfinite(t))]
+    xi = np.zeros((n_frames, 6))
+    if not taus:
+        return xi
+    frames = sorted({f for f, g, _, _ in taus} | {g for _, g, _, _ in taus})
+    col = {f: i for i, f in enumerate(frames)}
+    n = len(frames)
+    rows, rhs = [], []
+    for f, g, t, w in taus:
+        r = np.zeros(n)
+        r[col[f]], r[col[g]] = w, -w
+        rows.append(r)
+        rhs.append(w * t)
+    for i in range(n - 1):                     # smoothness over PRESENT frames
+        r = np.zeros(n)
+        r[i + 1], r[i] = smooth_w, -smooth_w
+        rows.append(r)
+        rhs.append(np.zeros(6))
+    gauge = np.full(n, float(len(taus)) / n)   # strong: pins the mean exactly
+    rows.append(gauge)
+    rhs.append(np.zeros(6))
+    x, *_ = np.linalg.lstsq(np.asarray(rows), np.asarray(rhs), rcond=None)
+    for f, i in col.items():
+        xi[f] = x[i]
+    return xi
+
+
+def frame_graph_verdict(xi, pair_taus, held, improve=0.8, bound=5.0):
+    """Self-validation for the frame graph (the ladder discipline): judged on
+    HELD-OUT pairs' actual 3D correspondences, corrections bounded by the
+    pairwise signal. held: [(f, g, p[n,3], q[n,3])]. Returns a dict with
+    bounded / improves / med_before / med_after (metres)."""
+    xi = np.asarray(xi, np.float64)
+    X = se3_matrices(xi)
+    before, after = [], []
+    for f, g, p, q in held:
+        p = np.asarray(p, np.float64)
+        q = np.asarray(q, np.float64)
+        before.append(float(np.median(np.linalg.norm(p - q, axis=1))))
+        p2 = p @ X[f][:3, :3].T + X[f][:3, 3]
+        q2 = q @ X[g][:3, :3].T + X[g][:3, 3]
+        after.append(float(np.median(np.linalg.norm(p2 - q2, axis=1))))
+    med_b, med_a = float(np.median(before)), float(np.median(after))
+    t_pair = [float(np.linalg.norm(np.asarray(t, np.float64).reshape(6)[3:]))
+              for _, _, t, _ in pair_taus]
+    r_pair = [float(np.linalg.norm(np.asarray(t, np.float64).reshape(6)[:3]))
+              for _, _, t, _ in pair_taus]
+    t_sig = max(float(np.percentile(t_pair, 99)), 1e-3)
+    r_sig = max(float(np.percentile(r_pair, 99)), 1e-4)
+    bounded = (float(np.percentile(np.linalg.norm(xi[:, 3:], axis=1), 99)) <= bound * t_sig
+               and float(np.percentile(np.linalg.norm(xi[:, :3], axis=1), 99)) <= bound * r_sig)
+    improves = med_a <= improve * med_b
+    return {"bounded": bounded, "improves": improves,
+            "med_before": med_b, "med_after": med_a,
+            "t_sig": t_sig, "r_sig": r_sig}
+
+
 def pair_depth_relation(z_src, z_dst, iters=6):
     """Robust affine relation z_dst ~= alpha*z_src + beta between two frames'
     depths of the SAME surfaces (IRLS, Cauchy weights — occlusion mismatches land

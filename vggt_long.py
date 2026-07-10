@@ -911,6 +911,169 @@ class VGGT_Long:
             M = ecorr[k][local] @ M
         return M
 
+    def _stac_frame_graph(self):
+        """STAC patch: per-frame RIGID pose graph — kills the intra-chunk WARP.
+
+        Measured on test4 (2026-07-10): after the elastic stage, nearby frames
+        still place the same surface at offset-like displacements (the ground as
+        two sheets ~9 cm apart INSIDE one chunk). The depth-graph model ladder
+        pinpointed it: held-out disagreement collapses under a free per-frame
+        OFFSET field (1.22%→0.34%, but ±1 m — an unbounded warp, rightly vetoed)
+        and not at all under scale-only (1.22%→1.20%) — a POSE error, not a
+        depth error. The elastic stage cannot reach it: it corrects frames only
+        inside seam overlaps; chunk INTERIORS keep the model's warped trajectory.
+
+        Fix, purely geometric (loop_utils.metric_lock): for nearby frame pairs
+        the exact-surface rigid residual T_fg is fitted (robust_rigid on
+        projected correspondences — the seam machinery, generalized to ANY
+        nearby pair), one small rigid correction per frame is solved from the
+        LINEAR se(3) graph, and points AND pose move together — camera-relative
+        depth is invariant, so depth maps and the TSDF need no rewrite. The
+        corrections compose into the elastic per-frame field, so poses, the
+        depth graph, the depth cap and the origins writer all see ONE field.
+        SELF-GATED on held-out pairs (offsets 4 and 10, never fitted), same
+        discipline as every stage of this family. Resume-safe via
+        frame_graph.json + a per-npy stamp."""
+        if not self.config['Model'].get('frame_graph') or len(self.chunk_indices) < 2:
+            return
+        import json as _json
+        from loop_utils.metric_lock import (surface_pair_correspondences,
+                                            robust_rigid, solve_frame_graph,
+                                            frame_graph_verdict, se3_matrices,
+                                            frame_owner)
+        _sick = getattr(self, '_stac_sick_chunks', set())
+        N = len(self.img_list)
+        owner = frame_owner(self.chunk_indices, N)
+        sick_frames = {g for g in range(N) if owner[g] in _sick}
+
+        fg_path = os.path.join(self.output_dir, "frame_graph.json")
+        xi = None
+        if os.path.exists(fg_path):
+            try:
+                prev = _json.load(open(fg_path))
+                if prev.get("chunk_indices") == [list(ci) for ci in self.chunk_indices]:
+                    xi = np.asarray(prev["xi"], np.float64)
+                    print("[frame-graph] resume: solution loaded from frame_graph.json")
+            except Exception as _e:
+                print(f"[frame-graph] frame_graph.json unreadable ({_e}) — remeasuring")
+
+        if xi is None:
+            # per-frame owned view: points+conf+pose+K of each frame's canonical copy
+            cache = {}
+            for k, (start, end) in enumerate(self.chunk_indices):
+                data = np.load(os.path.join(self.result_aligned_dir, f"chunk_{k}.npy"),
+                               allow_pickle=True).item()
+                if data.get('_stac_frame_graph_applied'):
+                    raise RuntimeError(
+                        f"[frame-graph] chunk {k} already pose-corrected but "
+                        f"frame_graph.json is missing/stale — remeasuring on corrected "
+                        f"data would be wrong. Delete _tmp_results_aligned + pcd and re-run.")
+                wp = np.asarray(data['world_points'])
+                if wp.ndim == 5:
+                    wp = wp[0]
+                cf = np.asarray(data['world_points_conf']).reshape(wp.shape[:3])
+                ext = np.asarray(data['extrinsic'])
+                K = np.asarray(data['intrinsic'])
+                for local, g in enumerate(range(start, end)):
+                    if owner[g] == k and g not in sick_frames:
+                        c2w = self._stac_aligned_pose(k, local, ext[local])
+                        cache[g] = (wp[local].astype(np.float32), cf[local].astype(np.float32),
+                                    np.linalg.inv(c2w), K[local])
+                del data
+            fit_offsets = (1, 2, 3, 5, 8, 12)
+            holdout_offsets = (4, 10)
+            taus, held = [], []
+            for f in sorted(cache):
+                for d in fit_offsets + holdout_offsets:
+                    g = f + d
+                    if g not in cache:
+                        continue
+                    pq = surface_pair_correspondences(cache[f][0], cache[f][1],
+                                                      cache[g][0], cache[g][1],
+                                                      cache[g][2], cache[g][3])
+                    if pq is None:
+                        continue
+                    if d in holdout_offsets:
+                        held.append((f, g, pq[0][:2000], pq[1][:2000]))
+                        continue
+                    fit = robust_rigid(pq[0], pq[1], sample=8000)
+                    if fit is None:
+                        continue
+                    R_, t_, _res, _n = fit
+                    rvec, _ = cv2.Rodrigues(np.asarray(R_, np.float64))
+                    taus.append((f, g, np.concatenate([rvec.ravel(), t_]), 1.0))
+            del cache
+            if len(taus) < N // 4 or len(held) < N // 8:
+                print(f"[frame-graph] too thin ({len(taus)} fit / {len(held)} held-out "
+                      f"pairs for {N} frames) — SKIPPING (nothing modified)")
+                return
+            xi_r = solve_frame_graph(taus, N, sick_frames=sick_frames)
+            v = frame_graph_verdict(xi_r, taus, held)
+            verdict = "APPLY" if (v["bounded"] and v["improves"]) else "SKIP"
+            tmax = float(np.max(np.linalg.norm(xi_r[:, 3:], axis=1)))
+            print(f"[frame-graph] {len(taus)} fit + {len(held)} held-out pairs — "
+                  f"held-out surface disagreement {v['med_before'] * 100:.2f} cm -> "
+                  f"{v['med_after'] * 100:.2f} cm | max correction {tmax * 100:.1f} cm | "
+                  f"bounded={v['bounded']} improves={v['improves']} -> {verdict}")
+            if verdict == "SKIP":
+                print(f"[frame-graph] ⛔ the per-frame rigid model does NOT explain "
+                      f"this scan's warp — geometry left UNTOUCHED (an unearned "
+                      f"correction is a warp, not a fix). See frame_graph.json.")
+                xi = np.zeros((N, 6))
+            else:
+                xi = xi_r
+                print(f"[frame-graph] ✅ per-frame rigid consensus earned — every "
+                      f"frame now agrees with its neighbours on WHERE the shared "
+                      f"surface is (pose moves with points: depth/TSDF invariant)")
+            with open(fg_path, "w") as f_:
+                _json.dump({"chunk_indices": [list(ci) for ci in self.chunk_indices],
+                            "verdict": verdict, "xi": xi.tolist(),
+                            "n_pairs_fit": len(taus), "n_pairs_holdout": len(held),
+                            "holdout_before_cm": v["med_before"] * 100,
+                            "holdout_after_cm": v["med_after"] * 100,
+                            "bounded": v["bounded"], "improves": v["improves"]},
+                           f_, indent=1)
+
+        X = se3_matrices(xi)
+        # compose into the elastic per-frame fields FIRST: poses, depth graph,
+        # depth cap and the origins writer all read _stac_elastic_corr
+        ecorr = getattr(self, '_stac_elastic_corr', None)
+        if ecorr is None:
+            ecorr = {k: np.tile(np.eye(4), (end - start, 1, 1))
+                     for k, (start, end) in enumerate(self.chunk_indices)}
+            self._stac_elastic_corr = ecorr
+        for k, (start, end) in enumerate(self.chunk_indices):
+            for local, g in enumerate(range(start, end)):
+                ecorr[k][local] = X[g] @ ecorr[k][local]
+        # apply to points (BOTH copies of every shared frame get the same rigid
+        # move, so the elastic seam consensus is preserved exactly)
+        for k, (start, end) in enumerate(self.chunk_indices):
+            path = os.path.join(self.result_aligned_dir, f"chunk_{k}.npy")
+            data = np.load(path, allow_pickle=True).item()
+            if data.get('_stac_frame_graph_applied'):
+                print(f"[frame-graph] chunk {k}: already corrected — skipped")
+                continue
+            wp = np.asarray(data['world_points'])
+            lead = wp.ndim == 5
+            if lead:
+                wp = wp[0]
+            moved = 0
+            for local, g in enumerate(range(start, end)):
+                M = X[g]
+                if np.allclose(M, np.eye(4), atol=1e-12):
+                    continue
+                p = wp[local].reshape(-1, 3).astype(np.float64)
+                wp[local] = (p @ M[:3, :3].T + M[:3, 3]).reshape(wp[local].shape).astype(wp.dtype)
+                moved += 1
+            data['world_points'] = wp[None] if lead else wp
+            data['_stac_frame_graph_applied'] = True
+            np.save(path, data)
+            if moved:
+                dmax = float(np.max(np.linalg.norm(
+                    X[start:end, :3, 3], axis=1)))
+                print(f"[frame-graph] chunk {k}: {moved}/{end - start} frames "
+                      f"pose-corrected (max {dmax * 100:.1f} cm)")
+
     def _stac_depth_graph(self):
         """STAC patch: per-frame DEPTH GRAPH — kills the depth duplication.
 
@@ -1646,6 +1809,7 @@ class VGGT_Long:
         # agree on the depth of shared surfaces), then the deferred PLY/origins
         # from the FINAL geometry. save_camera_poses applies the elastic pose moves.
         self._stac_elastic_seams()
+        self._stac_frame_graph()
         self._stac_depth_graph()
         self._stac_blend_copies()
         if _elastic:
