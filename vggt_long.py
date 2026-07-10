@@ -334,9 +334,13 @@ class VGGT_Long:
         ml = (self.config['Model'].get('metric_lock') or {})
         if not ml.get('enable'):
             return
-        from loop_utils.metric_lock import (chunk_scale, apply_scale, real_frame_number,
+        from loop_utils.metric_lock import (chunk_scale, chunk_anchor_ratios,
+                                            apply_scale, apply_scale_drift,
+                                            real_frame_number,
                                             seam_relative_scale, solve_scale_graph,
-                                            chunk_tri_angle, flag_sick_chunks)
+                                            solve_scale_drift, scale_drift_gate,
+                                            chunk_tri_angle, flag_sick_chunks,
+                                            flag_suspect_chunks)
         anchor_dir = ml['anchor_dir']
         near_frac = float(ml.get('near_frac', 0.25))
         import json as _json
@@ -359,6 +363,8 @@ class VGGT_Long:
         scales = {}
         n_anchor_map = {}
         seam_rel = {}
+        anchors_pos = {}     # chunk -> [(u in [0,1], ratio)] positioned DA3 anchors
+        seam_obs = {}        # seam k -> [(u_k, u_{k+1}, r)] per-shared-frame scale
         tri_map = {}         # chunk -> triangulation angle (health gate signal 1)
         fx_map = {}          # chunk -> median estimated focal (zoom detector)
         prev_shared = None   # (chunk_idx, {global_frame: depth}) for the seam ratio
@@ -372,14 +378,21 @@ class VGGT_Long:
                 continue
             data = np.load(path, allow_pickle=True).item()
             nums = [real_frame_number(self.img_list[i]) for i in range(start, end)]
-            s, n, ratios = chunk_scale(data, nums, anchor_dir, near_frac=near_frac)
+            locs, ratios = chunk_anchor_ratios(data, nums, anchor_dir,
+                                               near_frac=near_frac)
+            s = float(np.median(ratios)) if ratios else None
+            n = len(ratios)
+            S_k = max(end - start, 1)
+            anchors_pos[k] = [(loc / (S_k - 1) if S_k > 1 else 0.5, r)
+                              for loc, r in zip(locs, ratios)]
             if s is not None:
                 scales[k] = s
                 n_anchor_map[k] = n
                 spread = (f" spread {min(ratios):.3f}-{max(ratios):.3f}"
                           if len(ratios) > 1 else "")
                 print(f"[metric-lock] chunk {k}: DA3 s={s:.4f} from {n} anchor(s){spread}")
-            report["chunks"][str(k)] = {"s": s, "n_anchors": n, "ratios": ratios}
+            report["chunks"][str(k)] = {"s": s, "n_anchors": n, "ratios": ratios,
+                                        "anchor_locals": locs}
             # health gate signal: parallax the chunk actually holds (scale-invariant,
             # so valid for fresh AND resumed/already-locked chunks alike)
             tri_map[k] = chunk_tri_angle(data.get("depth"),
@@ -387,15 +400,24 @@ class VGGT_Long:
                                          data.get("extrinsic"))
             if data.get("intrinsic") is not None:
                 fx_map[k] = float(np.median(np.asarray(data["intrinsic"])[:, 0, 0]))
-            # seam with the previous chunk: ratio over ALL shared frames
+            # seam with the previous chunk: ratio over ALL shared frames —
+            # kept per frame WITH its position inside both chunks (the drift
+            # model needs to know WHERE on each chunk the seam was measured)
             depth_k = np.asarray(data["depth"])
             if prev_shared is not None and prev_shared[0] == k - 1:
+                p_start, p_end = self.chunk_indices[k - 1]
+                S_prev = max(p_end - p_start, 1)
                 rs = []
                 for local, g in enumerate(range(start, end)):
                     if g in prev_shared[1]:
                         r = seam_relative_scale(prev_shared[1][g], depth_k[local])
                         if r is not None:
                             rs.append(r)
+                            u_prev = ((g - p_start) / (S_prev - 1)
+                                      if S_prev > 1 else 0.5)
+                            u_cur = ((g - start) / (S_k - 1) if S_k > 1 else 0.5)
+                            seam_obs.setdefault(k - 1, []).append(
+                                (u_prev, u_cur, r))
                 if rs:
                     seam_rel[k - 1] = float(np.median(rs))
                     report["seams"][str(k - 1)] = {"rel": seam_rel[k - 1],
@@ -441,6 +463,43 @@ class VGGT_Long:
                 "[metric-lock] NO chunk found any DA3 anchor — cannot lock metric scale. "
                 f"anchor_dir={anchor_dir}. The anchors must cover every chunk's frame range.")
         fallback = float(np.median(list(scales.values())))
+
+        # ── SCALE DRIFT (self-gated): a chunk whose internal scale DRIFTS is not
+        # one number (test4: anchor ratios spread 48% inside chunk 3; adjacent
+        # locked scales jumped 18-29% — the leftover warp is the z-drift on tall
+        # structures). Linear log-scale per chunk, positioned anchors + positioned
+        # per-frame seam ratios; held-out anchors judge whether the model explains
+        # the data — an unearned correction is a warp, not a fix. Resumed runs
+        # keep the constant path (mixed already-scaled chunks would poison the
+        # seam observations).
+        drift_frames = None
+        n_chunks_all = len(self.chunk_indices)
+        if ml.get('scale_drift', True) and not already and anchors_pos and seam_obs:
+            ok, info = scale_drift_gate(anchors_pos, scales, seam_obs, n_chunks_all)
+            report["drift"] = dict(info, verdict="APPLY" if ok else "SKIP")
+            if ok:
+                s0, s1 = solve_scale_drift(anchors_pos, seam_obs, n_chunks_all,
+                                           prior=scales)
+                drift_frames = {}
+                for k, (start, end) in enumerate(self.chunk_indices):
+                    S_k = max(end - start, 1)
+                    u = np.linspace(0.0, 1.0, S_k) if S_k > 1 else np.array([0.5])
+                    drift_frames[k] = np.exp((1 - u) * np.log(s0[k])
+                                             + u * np.log(s1[k]))
+                    scales[k] = float(np.sqrt(s0[k] * s1[k]))
+                    report["chunks"].setdefault(str(k), {})["s0_s1"] = \
+                        [float(s0[k]), float(s1[k])]
+                    print(f"[metric-lock] chunk {k}: DRIFT s {s0[k]:.4f}→{s1[k]:.4f} "
+                          f"({(s1[k]/s0[k]-1)*100:+.1f}% along the chunk)")
+                print(f"[metric-lock] scale drift APPLIED — held-out anchor error "
+                      f"{info['holdout_const']*100:.2f}% → {info['holdout_drift']*100:.2f}%")
+            else:
+                print(f"[metric-lock] scale drift SKIPPED (constant scale kept): "
+                      f"{info.get('reason', '')}"
+                      + (f" held-out {info['holdout_const']*100:.2f}% → "
+                         f"{info['holdout_drift']*100:.2f}%, max drift "
+                         f"{info['max_drift_log']:.3f} (bound {info['bound_log']:.3f})"
+                         if 'holdout_const' in info else ""))
         for k in range(len(self.chunk_indices)):
             if k in already:
                 continue
@@ -454,7 +513,10 @@ class VGGT_Long:
                       f"median scale of the anchored chunks (s={s:.4f})")
                 report["chunks"][str(k)]["s_applied"] = s
             data = np.load(path, allow_pickle=True).item()
-            apply_scale(data, s)
+            if drift_frames is not None and k in drift_frames:
+                apply_scale_drift(data, drift_frames[k])
+            else:
+                apply_scale(data, s)
             np.save(path, data)
         # 2) loop-bridge predictions (in memory) — they are Omega passes with their own
         # arbitrary scale; the SE(3) loop legs need them metric too. Anchors inside the
@@ -485,24 +547,43 @@ class VGGT_Long:
         # bridge between its neighbours.
         anchor_iqr = {}
         for k_str, v in report["chunks"].items():
-            r = np.asarray(v.get("ratios") or [], np.float64)
+            k_int = int(k_str)
+            obs = anchors_pos.get(k_int)
+            if obs:
+                r = np.asarray([ri for _, ri in obs], np.float64)
+                if drift_frames is not None and v.get("s0_s1"):
+                    # the drift model EXPLAINS part of the spread — judge the
+                    # chunk on what remains, not on what was corrected
+                    s0k, s1k = v["s0_s1"]
+                    pred = np.exp([(1 - u) * np.log(s0k) + u * np.log(s1k)
+                                   for u, _ in obs])
+                    r = r / pred
+            else:
+                r = np.asarray(v.get("ratios") or [], np.float64)
             if len(r) > 1 and np.median(r) > 0:
-                anchor_iqr[int(k_str)] = float(
+                anchor_iqr[k_int] = float(
                     (np.percentile(r, 75) - np.percentile(r, 25)) / np.median(r))
             else:
-                anchor_iqr[int(k_str)] = None
+                anchor_iqr[k_int] = None
         sick = flag_sick_chunks(tri_map, anchor_iqr, fx_median=fx_map)
+        suspect = flag_suspect_chunks(anchor_iqr, sick=sick,
+                                      spread_cut=float(ml.get('suspect_spread', 0.30)))
         # resume: chunks whose unaligned npy is already consumed cannot be re-evaluated
         # — inherit their previous verdict so a resumed run never un-flags them.
         _health_path = os.path.join(self.output_dir, "chunk_health.json")
         if os.path.exists(_health_path):
             try:
-                for k_str, rs in (_json.load(open(_health_path)).get("sick") or {}).items():
+                _prev_health = _json.load(open(_health_path))
+                for k_str, rs in (_prev_health.get("sick") or {}).items():
                     if int(k_str) not in tri_map:
                         sick.setdefault(int(k_str), rs)
+                for k_str, rs in (_prev_health.get("suspect") or {}).items():
+                    if int(k_str) not in tri_map and int(k_str) not in sick:
+                        suspect.setdefault(int(k_str), rs)
             except Exception:
                 pass
         self._stac_sick_chunks = set(sick)
+        self._stac_suspect_chunks = set(suspect)
         with open(_health_path, "w") as f:
             _json.dump({"tri_angle": {str(k): tri_map.get(k)
                                       for k in range(len(self.chunk_indices))},
@@ -510,7 +591,11 @@ class VGGT_Long:
                                                    for k in range(len(self.chunk_indices))},
                         "fx_median": {str(k): fx_map.get(k)
                                       for k in range(len(self.chunk_indices))},
-                        "sick": {str(k): rs for k, rs in sorted(sick.items())}}, f, indent=1)
+                        "sick": {str(k): rs for k, rs in sorted(sick.items())},
+                        "suspect": {str(k): rs for k, rs
+                                    in sorted(suspect.items())}}, f, indent=1)
+        for k in sorted(suspect):
+            print(f"[health] chunk {k} SUSPECT: {suspect[k]}")
         if sick:
             for k in sorted(sick):
                 for r in sick[k]:
@@ -772,12 +857,15 @@ class VGGT_Long:
         # continuous through the ownership switch in the middle of each overlap.
         self._stac_elastic_corr = {}
         _sick = getattr(self, '_stac_sick_chunks', set())
+        _suspect = getattr(self, '_stac_suspect_chunks', set())
         for k in range(len(self.chunk_indices)):
             # sick chunks: healthy neighbours never bend toward them (alpha pinned
             # inside elastic_corrections); their own npy still gets corrected —
             # harmless, and it keeps every seam's two copies coincident — but they
-            # write no outputs later (declared hole).
-            corr = elastic_corrections(self.chunk_indices, k, fits, sick=_sick)
+            # write no outputs later (declared hole). Suspect chunks (soft tier):
+            # the consensus is BIASED toward the trusted side, not pinned.
+            corr = elastic_corrections(self.chunk_indices, k, fits, sick=_sick,
+                                       suspect=_suspect)
             self._stac_elastic_corr[k] = corr
             path = os.path.join(self.result_aligned_dir, f"chunk_{k}.npy")
             data = np.load(path, allow_pickle=True).item()

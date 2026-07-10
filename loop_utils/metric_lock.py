@@ -58,18 +58,18 @@ def anchor_ratio(omega_depth, da3_depth, conf=None, near_frac=0.25, min_px=50):
     return float(np.median(da[mm] / om[mm]))
 
 
-def chunk_scale(chunk_data, frame_numbers, anchor_dir, near_frac=0.25):
-    """Metric scale for one chunk from the DA3 anchors that fall inside it.
+def chunk_anchor_ratios(chunk_data, frame_numbers, anchor_dir, near_frac=0.25):
+    """Per-anchor (local_index, ratio) pairs for one chunk — the positioned form
+    of the anchor evidence, so a scale that DRIFTS along the chunk is visible
+    instead of being collapsed into one median.
 
     chunk_data: the chunk's prediction dict ('depth', 'world_points_conf', ...).
     frame_numbers: REAL frame number of each local frame (len == S).
     anchor_dir: dir holding frame_<num>.npz (keys: depth [, conf]) from isolated DA3.
-
-    Returns (s, n_anchors, ratios) — s is None when no anchor lands in the chunk.
     """
     depth = np.asarray(chunk_data["depth"])
     conf3 = chunk_data.get("world_points_conf")
-    ratios = []
+    locals_, ratios = [], []
     for local, num in enumerate(frame_numbers):
         npz_path = os.path.join(str(anchor_dir), f"frame_{int(num)}.npz")
         if not os.path.exists(npz_path):
@@ -83,7 +83,18 @@ def chunk_scale(chunk_data, frame_numbers, anchor_dir, near_frac=0.25):
             conf = c[local] if local < c.shape[0] else None
         r = anchor_ratio(depth[local], z["depth"], conf=conf, near_frac=near_frac)
         if r is not None and np.isfinite(r) and r > 0:
+            locals_.append(int(local))
             ratios.append(r)
+    return locals_, ratios
+
+
+def chunk_scale(chunk_data, frame_numbers, anchor_dir, near_frac=0.25):
+    """Metric scale for one chunk from the DA3 anchors that fall inside it.
+
+    Returns (s, n_anchors, ratios) — s is None when no anchor lands in the chunk.
+    """
+    _, ratios = chunk_anchor_ratios(chunk_data, frame_numbers, anchor_dir,
+                                    near_frac=near_frac)
     if not ratios:
         return None, 0, []
     return float(np.median(ratios)), len(ratios), ratios
@@ -161,6 +172,164 @@ def solve_scale_graph(s_da3, n_anchors, seam_rel, n_chunks,
     return np.exp(x)
 
 
+def solve_scale_drift(anchors, seam_obs, n_chunks, prior=None,
+                      sigma_anchor=0.08, sigma_seam=0.01,
+                      sigma_drift=0.12, sigma_prior=0.5):
+    """Per-chunk LINEAR scale drift, weighted least squares in log-scale space.
+
+    A single scalar per chunk cannot represent a chunk whose internal scale
+    DRIFTS (measured on test4: DA3 anchor ratios spread 10.9-16.1 inside one
+    chunk — 48% — while adjacent locked scales jumped 18-29%; the leftover
+    warp is the z-drift on tall structures). Model: log s_k(u) is linear in
+    the chunk position u∈[0,1], two unknowns per chunk (x_k0 at the start,
+    x_k1 at the end):
+
+        anchors  : (1-u)·x_k0 + u·x_k1 = log r          / sigma_anchor
+        seams    : x_{k+1}(u') - x_k(u) = log r_seam    / sigma_seam
+        drift    : x_k1 - x_k0 = 0                      / sigma_drift  (prior)
+        prior    : x_k(0.5) = log s_prior[k]            / sigma_prior  (weak)
+
+    anchors:  {k: [(u, ratio), ...]} positioned DA3 evidence per chunk.
+    seam_obs: {k: [(u_k, u_k1, r), ...]} per-shared-frame relative scale
+              between chunk k (at u_k) and k+1 (at u_k1) — the same-pixel
+              seam sensor, now positioned inside BOTH chunks.
+    prior:    {k: s} optional (e.g. the constant scale-graph solution) — keeps
+              data-starved chunks near the proven constant answer.
+
+    Returns (s0, s1) arrays of per-chunk start/end scales.
+    """
+    rows, rhs, w = [], [], []
+
+    def _row(coeffs, value, sigma):
+        row = np.zeros(2 * n_chunks)
+        for j, c in coeffs:
+            row[j] += c
+        rows.append(row); rhs.append(value); w.append(1.0 / sigma)
+
+    for k, obs in (anchors or {}).items():
+        for u, r in obs:
+            if r is None or not np.isfinite(r) or r <= 0:
+                continue
+            u = min(max(float(u), 0.0), 1.0)
+            _row([(2 * k, 1.0 - u), (2 * k + 1, u)], np.log(r), sigma_anchor)
+    for k, obs in (seam_obs or {}).items():
+        if k + 1 >= n_chunks:
+            continue
+        for u_k, u_k1, r in obs:
+            if r is None or not np.isfinite(r) or r <= 0:
+                continue
+            u_k = min(max(float(u_k), 0.0), 1.0)
+            u_k1 = min(max(float(u_k1), 0.0), 1.0)
+            _row([(2 * k, -(1.0 - u_k)), (2 * k + 1, -u_k),
+                  (2 * (k + 1), 1.0 - u_k1), (2 * (k + 1) + 1, u_k1)],
+                 np.log(r), sigma_seam)
+    for k in range(n_chunks):
+        _row([(2 * k, -1.0), (2 * k + 1, 1.0)], 0.0, sigma_drift)
+        s_p = (prior or {}).get(k)
+        if s_p is not None and np.isfinite(s_p) and s_p > 0:
+            _row([(2 * k, 0.5), (2 * k + 1, 0.5)], np.log(s_p), sigma_prior)
+    if not rows:
+        raise ValueError("scale drift graph has no constraints")
+    A = np.asarray(rows) * np.asarray(w)[:, None]
+    b = np.asarray(rhs) * np.asarray(w)
+    x, *_ = np.linalg.lstsq(A, b, rcond=None)
+    return np.exp(x[0::2]), np.exp(x[1::2])
+
+
+def scale_drift_gate(anchors, s_const, seam_obs, n_chunks,
+                     min_holdout=5, improve=0.75, max_drift_log=None, **solve_kw):
+    """Self-validation for the drift model — it must EARN the right to touch
+    the geometry (same discipline as the depth graph).
+
+    The judge is the PRECISE sensor: the per-frame seam ratios (same pixels,
+    0.3-1% noise — the drift signature is their variation ALONG the overlap;
+    DA3 anchors at 8-15% noise cannot discriminate a model this fine). Every
+    3rd seam observation is HELD OUT; both the drift model and a CONSTANT
+    reference are fitted on the SAME remaining data — the constant one is
+    the identical solver with the drift DOF pinned, so the comparison leaks
+    nothing and favours nobody:
+
+      apply ⟺ held-out |log error| median improves by ≥ (1-improve)
+              (default 25% — measured: real ±10-20% drift improves ~9x while
+              pure seam noise buys at most ~17% by overfitting the 2 extra
+              DOF/chunk, so the cut separates them with an order of magnitude
+              of margin)
+              AND every chunk's |log(s1/s0)| ≤ max_drift_log (default log 1.6).
+
+    Returns (verdict_bool, info dict). The caller refits on ALL data when
+    the verdict is True."""
+    if max_drift_log is None:
+        max_drift_log = float(np.log(1.6))
+    fit_seams, held = {}, []
+    for k, obs in (seam_obs or {}).items():
+        keep = []
+        for i, (u_k, u_k1, r) in enumerate(obs):
+            if len(obs) >= 3 and i % 3 == 2:
+                held.append((k, u_k, u_k1, r))
+            else:
+                keep.append((u_k, u_k1, r))
+        fit_seams[k] = keep
+    if len(held) < int(min_holdout):
+        return False, {"reason": f"held-out too thin ({len(held)} seam obs "
+                                 f"< {min_holdout})",
+                       "n_holdout": len(held)}
+    s0, s1 = solve_scale_drift(anchors, fit_seams, n_chunks,
+                               prior=s_const, **solve_kw)
+    kw_const = dict(solve_kw, sigma_drift=1e-6)      # same solver, drift pinned
+    c0, c1 = solve_scale_drift(anchors, fit_seams, n_chunks,
+                               prior=s_const, **kw_const)
+
+    def _pred(a0, a1, k, u):
+        return (1.0 - u) * np.log(a0[k]) + u * np.log(a1[k])
+
+    err_d, err_c = [], []
+    for k, u_k, u_k1, r in held:
+        err_d.append(abs(np.log(r) - (_pred(s0, s1, k + 1, u_k1)
+                                      - _pred(s0, s1, k, u_k))))
+        err_c.append(abs(np.log(r) - (_pred(c0, c1, k + 1, u_k1)
+                                      - _pred(c0, c1, k, u_k))))
+    med_d, med_c = float(np.median(err_d)), float(np.median(err_c))
+    drift_mag = float(np.max(np.abs(np.log(s1 / s0))))
+    ok = med_d <= float(improve) * med_c and drift_mag <= max_drift_log
+    return ok, {"n_holdout": len(held), "holdout_const": med_c,
+                "holdout_drift": med_d, "max_drift_log": drift_mag,
+                "bound_log": max_drift_log}
+
+
+def apply_scale_drift(chunk_data, s_frames):
+    """Scale a chunk with a PER-FRAME factor, in place. Depth scales about each
+    frame's own camera; the trajectory is re-integrated step by step so camera
+    spacing follows the local scale. With a constant factor this reduces EXACTLY
+    to apply_scale. Extrinsics here are c2w (center = translation column)."""
+    s = np.asarray(s_frames, np.float64).reshape(-1)
+    ext0 = np.asarray(chunk_data["extrinsic"])
+    ext = ext0.astype(np.float64).copy()
+    S = ext.shape[0]
+    if len(s) != S:
+        raise ValueError(f"s_frames has {len(s)} entries for {S} frames")
+    c_old = ext[:, :3, 3].copy()
+    c_new = np.empty_like(c_old)
+    c_new[0] = s[0] * c_old[0]
+    for i in range(1, S):
+        c_new[i] = c_new[i - 1] + np.sqrt(s[i - 1] * s[i]) * (c_old[i] - c_old[i - 1])
+    ext[:, :3, 3] = c_new
+    chunk_data["extrinsic"] = ext.astype(ext0.dtype)
+
+    if chunk_data.get("depth") is not None:
+        d0 = np.asarray(chunk_data["depth"])
+        d = d0.astype(np.float64) * s.reshape((S,) + (1,) * (d0.ndim - 1))
+        chunk_data["depth"] = d.astype(d0.dtype)
+
+    if chunk_data.get("world_points") is not None:
+        wp0 = np.asarray(chunk_data["world_points"])
+        lead = wp0.ndim == 5
+        w = (wp0[0] if lead else wp0).astype(np.float64)
+        for i in range(S):
+            w[i] = c_new[i] + s[i] * (w[i] - c_old[i])
+        chunk_data["world_points"] = (w[None] if lead else w).astype(wp0.dtype)
+    return chunk_data
+
+
 def robust_rigid(src, dst, iters=8, sample=200000, seed=0):
     """Rigid fit dst ≈ R·src + t from EXACT correspondences (same pixel, same
     frame, two chunks), IRLS with a Cauchy weight on the residuals so the
@@ -215,7 +384,7 @@ def rigid_mat(R, t):
     return M
 
 
-def elastic_corrections(chunk_indices, k, seam_fits, sick=None):
+def elastic_corrections(chunk_indices, k, seam_fits, sick=None, suspect=None):
     """Per-frame ELASTIC seam corrections for chunk k: [S, 4, 4] world-space rigid
     moves, one per local frame (identity where nothing constrains the frame).
 
@@ -251,11 +420,18 @@ def elastic_corrections(chunk_indices, k, seam_fits, sick=None):
     chunk must NEVER bend toward a sick neighbour's garbage, so on a mixed seam
     alpha is pinned to keep the consensus entirely at the healthy side's copy (the
     sick side adopts it fully — harmless, its frames don't write points anyway).
+
+    `suspect`: the SOFT tier (flag_suspect_chunks). On a seam where exactly one
+    side is suspect the consensus is BIASED toward the trusted side (alpha warped
+    quadratically) instead of pinned — endpoints stay exact (1→0), so interiors
+    are never torn and the field stays continuous; the shaky chunk just gets
+    less say in where the shared pixels land.
     """
     start, end = chunk_indices[k]
     S = end - start
     corr = np.tile(np.eye(4), (S, 1, 1))
     sick = frozenset(sick or ())
+    suspect = frozenset(suspect or ()) - sick
 
     def _fit_for(j, g, shared):
         d = seam_fits.get(j) or {}
@@ -270,7 +446,11 @@ def elastic_corrections(chunk_indices, k, seam_fits, sick=None):
         # weight of chunk j's (dst-side) opinion; pinned on mixed-health seams
         if (j in sick) != (j + 1 in sick):
             return 0.0 if j in sick else 1.0
-        return 1.0 - (i / (L - 1.0)) if L > 1 else 0.5
+        a = 1.0 - (i / (L - 1.0)) if L > 1 else 0.5
+        # soft tier: bias toward the trusted side, endpoints kept exact
+        if (j in suspect) != (j + 1 in suspect):
+            a = a * a if j in suspect else 1.0 - (1.0 - a) ** 2
+        return a
 
     # left seam (j = k-1): this chunk is the SRC side of the fit -> B_g
     if k > 0:
@@ -593,6 +773,25 @@ def flag_sick_chunks(tri_angle, anchor_iqr, fx_median=None,
                         f"(robust z={z:.1f}) — magnification adds no baseline: no "
                         f"parallax, no 3D information, and DA3 metric depth breaks")
     return sick
+
+
+def flag_suspect_chunks(anchor_iqr, sick=None, spread_cut=0.30):
+    """SOFT health tier below `sick`: chunks whose DA3 anchor spread says their
+    internal scale is shaky (IQR/median > spread_cut — test4 chunk 3 sat at
+    0.12 raw but its full anchor RANGE spanned 48%) yet not bad enough for the
+    sick gate's robust-z cut. A suspect chunk keeps writing points; it just
+    argues MORE QUIETLY where opinions are weighed (elastic seam consensus,
+    fine_register unit confidence). Returns {k: reason}."""
+    sick = frozenset(sick or ())
+    out = {}
+    for k, v in (anchor_iqr or {}).items():
+        if k in sick or v is None or not np.isfinite(v):
+            continue
+        if v > float(spread_cut):
+            out[k] = (f"DA3 anchor spread IQR/median {v:.3f} > {spread_cut:.2f} — "
+                      f"internal scale is shaky (opinion down-weighted, "
+                      f"points still written)")
+    return out
 
 
 def frame_owner(chunk_indices, n_frames):
