@@ -192,6 +192,100 @@ def robust_rigid(src, dst, iters=8, sample=200000, seed=0):
     return R, t, float(np.median(r)), int(len(src))
 
 
+def rigid_fraction(R, t, alpha):
+    """Fractional rigid transform as a 4x4: the rotation angle is scaled on its own
+    axis (Rodrigues) and the translation linearly. Smooth in alpha, EXACTLY identity
+    at alpha=0 and exactly (R, t) at alpha=1. Seam agreement never depends on the
+    interpolation path (elastic_corrections composes the dst side as B @ T^-1), so
+    the path only needs smoothness and exact endpoints."""
+    a = float(alpha)
+    rvec, _ = cv2.Rodrigues(np.asarray(R, np.float64))
+    Ra, _ = cv2.Rodrigues(rvec * a)
+    M = np.eye(4)
+    M[:3, :3] = Ra
+    M[:3, 3] = a * np.asarray(t, np.float64).reshape(3)
+    return M
+
+
+def rigid_mat(R, t):
+    """(R, t) as a 4x4 homogeneous matrix."""
+    M = np.eye(4)
+    M[:3, :3] = np.asarray(R, np.float64)
+    M[:3, 3] = np.asarray(t, np.float64).reshape(3)
+    return M
+
+
+def elastic_corrections(chunk_indices, k, seam_fits):
+    """Per-frame ELASTIC seam corrections for chunk k: [S, 4, 4] world-space rigid
+    moves, one per local frame (identity where nothing constrains the frame).
+
+    The anchoring directive this stage exists for: the same pixel of a frame present
+    in two chunks MUST land at the same 3D position. Per shared frame g of seam j
+    (between chunks j and j+1), seam_fits[j][g] = (R, t) is the rigid residual T_g
+    mapping chunk j+1's copy of the frame onto chunk j's copy (robust_rigid on the
+    exact pixel-to-pixel correspondences, AFTER the global alignment). Both copies
+    are moved onto ONE consensus pose:
+
+        chunk j+1 (src side of the fit):  B_g = rigid_fraction(T_g, alpha_g)
+        chunk j   (dst side of the fit):  A_g = B_g @ T_g^-1
+
+    A_g @ T_g == B_g by construction, so the two corrected copies COINCIDE exactly
+    — the only residual left is the per-frame fit residual (intra-frame non-rigid
+    disagreement, the physical floor).
+
+    alpha_g is the weight of chunk j's opinion, linear in the frame's position
+    inside the overlap: 1 at the overlap start (chunk j's centre — its copy stays
+    put, A = I) down to 0 at the overlap end (chunk j+1's centre — ITS copy stays
+    put, B = I). Each chunk's correction field is therefore identity at its own
+    centre and grows toward its edges: interiors are never torn, edges bend onto
+    the consensus, and the fused cloud is continuous through the frame-ownership
+    switch in the middle of every overlap. (With the pipeline's 50% overlap each
+    frame belongs to at most two chunks, so the two seams of a chunk touch
+    disjoint frame ranges.)
+
+    A shared frame whose fit starved inherits the nearest fitted frame of the same
+    seam (the seam is already rigid-glued, so per-frame residuals are small and
+    smooth); a seam with no fits at all contributes identity.
+    """
+    start, end = chunk_indices[k]
+    S = end - start
+    corr = np.tile(np.eye(4), (S, 1, 1))
+
+    def _fit_for(j, g, shared):
+        d = seam_fits.get(j) or {}
+        if g in d:
+            return d[g]
+        fitted = [gg for gg in shared if gg in d]
+        if not fitted:
+            return None
+        return d[min(fitted, key=lambda gg: abs(gg - g))]
+
+    # left seam (j = k-1): this chunk is the SRC side of the fit -> B_g
+    if k > 0:
+        _, e_prev = chunk_indices[k - 1]
+        shared = list(range(start, min(e_prev, end)))
+        L = len(shared)
+        for i, g in enumerate(shared):
+            f = _fit_for(k - 1, g, shared)
+            if f is None:
+                continue
+            alpha = 1.0 - (i / (L - 1.0)) if L > 1 else 0.5
+            corr[g - start] = rigid_fraction(f[0], f[1], alpha)
+    # right seam (j = k): this chunk is the DST side -> A_g = B_g @ T_g^-1
+    if k < len(chunk_indices) - 1:
+        s_next, _ = chunk_indices[k + 1]
+        shared = list(range(max(s_next, start), end))
+        L = len(shared)
+        for i, g in enumerate(shared):
+            f = _fit_for(k, g, shared)
+            if f is None:
+                continue
+            alpha = 1.0 - (i / (L - 1.0)) if L > 1 else 0.5
+            T = rigid_mat(f[0], f[1])
+            corr[g - start] = rigid_fraction(f[0], f[1], alpha) @ np.linalg.inv(T)
+    return corr
+
+
 def frame_owner(chunk_indices, n_frames):
     """owner[g] = index of the chunk that WRITES frame g's points to the cloud.
     Every frame is written by exactly ONE chunk (the one whose centre is nearest)

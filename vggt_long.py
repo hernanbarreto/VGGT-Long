@@ -558,6 +558,172 @@ class VGGT_Long:
         except Exception as _e:
             print(f"[STAC] WARN: could not write {K}_origins.npz: {_e}")
 
+    def _stac_write_chunk_outputs(self, chunk_data, K):
+        """PLY + origins for chunk K from its (aligned, possibly elastic-corrected)
+        data — ONE ownership mask and ONE conf threshold shared by both writers, so
+        the PLY and {K}_origins.npz stay 1:1 by construction."""
+        points = chunk_data['world_points'].reshape(-1, 3)
+        colors = (chunk_data['images'].transpose(0, 2, 3, 1).reshape(-1, 3) * 255).astype(np.uint8)
+        confs = self._stac_owned_confs(chunk_data['world_points_conf'].reshape(-1), K)
+        thr = self._stac_conf_threshold(confs)
+        save_confident_pointcloud_batch(
+            points=points,
+            colors=colors,
+            confs=confs,
+            output_path=os.path.join(self.pcd_dir, f'{K}_pcd.ply'),
+            conf_threshold=thr,
+            sample_ratio=self.config['Model']['Pointcloud_Save']['sample_ratio'])
+        self._stac_write_origins(chunk_data, K, conf_threshold=thr, confs_override=confs)
+
+    def _stac_elastic_fit_seams(self):
+        """Per-shared-frame rigid residual fits over every seam, computed on the
+        ALIGNED (not yet elastic-corrected) chunks. Returns (fits, report) where
+        fits[j][g] = (R, t) maps chunk j+1's copy of global frame g onto chunk j's
+        copy — EXACT pixel-to-pixel correspondences, robust to the intra-frame
+        non-rigid noise (IRLS Cauchy)."""
+        from loop_utils.metric_lock import robust_rigid
+        fits, report_seams = {}, {}
+        prev_tail = None      # (k, {g: (points [HW,3] f32, conf [HW] f32)})
+        for k, (start, end) in enumerate(self.chunk_indices):
+            path = os.path.join(self.result_aligned_dir, f"chunk_{k}.npy")
+            data = np.load(path, allow_pickle=True).item()
+            if data.get('_stac_elastic_applied'):
+                raise RuntimeError(
+                    f"[elastic] chunk {k} is already elastic-corrected but the fits in "
+                    f"elastic_seams.json are missing or stale — refitting on corrected "
+                    f"data would be wrong. Delete _tmp_results_aligned + pcd and re-run.")
+            wp = np.asarray(data['world_points'])
+            if wp.ndim == 5:
+                wp = wp[0]
+            S = wp.shape[0]
+            conf = np.asarray(data['world_points_conf']).reshape(S, -1)
+            if prev_tail is not None and prev_tail[0] == k - 1:
+                j = k - 1
+                sf, rep, before_all, res_all = {}, {}, [], []
+                for local, g in enumerate(range(start, end)):
+                    if g not in prev_tail[1]:
+                        continue
+                    p_dst, c_dst = prev_tail[1][g]
+                    p_src = wp[local].reshape(-1, 3)
+                    ok = (c_dst > 1e-5) & (conf[local] > 1e-5)
+                    entry = {"n_valid_px": int(ok.sum())}
+                    if ok.any():
+                        d = p_dst[ok].astype(np.float64) - p_src[ok].astype(np.float64)
+                        entry["before_m"] = float(np.median(np.linalg.norm(d, axis=1)))
+                        before_all.append(entry["before_m"])
+                    fit = robust_rigid(p_src[ok], p_dst[ok])
+                    if fit is not None:
+                        R_, t_, res_, n_ = fit
+                        sf[g] = (R_, t_)
+                        entry.update({"R": R_.tolist(), "t": t_.tolist(),
+                                      "residual_m": res_, "n_fit": n_})
+                        res_all.append(res_)
+                    else:
+                        entry["starved"] = True
+                    rep[str(g)] = entry
+                fits[j] = sf
+                report_seams[str(j)] = rep
+                bm = float(np.median(before_all)) * 100 if before_all else float("nan")
+                rm = float(np.median(res_all)) * 100 if res_all else float("nan")
+                print(f"[elastic] seam {j}->{k}: {len(sf)}/{len(rep)} frame fits — "
+                      f"copies disagreed {bm:.1f} cm median → per-frame residual "
+                      f"{rm:.2f} cm (the non-rigid floor both copies now share)")
+            if k + 1 < len(self.chunk_indices):
+                nxt0 = self.chunk_indices[k + 1][0]
+                prev_tail = (k, {g: (wp[g - start].reshape(-1, 3).astype(np.float32),
+                                     conf[g - start].astype(np.float32))
+                                 for g in range(max(nxt0, start), end)})
+            else:
+                prev_tail = None
+            del data
+        report = {"chunk_indices": [list(ci) for ci in self.chunk_indices],
+                  "seams": report_seams}
+        return fits, report
+
+    def _stac_elastic_seams(self):
+        """STAC patch: per-frame ELASTIC seam consensus — the final stitching stage.
+
+        The per-chunk rigid glue (exact_seam_align) leaves each seam with a ~cm
+        NON-rigid residual: every shared frame disagrees between its two chunks by
+        its own small rigid offset (measured on test4: 1.7-6.1 cm median per seam
+        after the scale graph + rigid glue). The anchoring directive: the same
+        pixel of a frame present in two chunks MUST land at the same 3D position.
+        So per shared frame the exact-correspondence rigid residual T_g between the
+        two aligned copies is fitted, and BOTH copies move onto a consensus
+        interpolated across the overlap — identity at each chunk's centre (see
+        loop_utils.metric_lock.elastic_corrections). Camera poses follow their
+        frames (save_camera_poses applies the same per-frame moves), so per-frame
+        depth and the TSDF stay consistent by rigidity.
+
+        Resume safety: fits are computed BEFORE any chunk is modified and persisted
+        to elastic_seams.json; every corrected chunk npy carries a
+        '_stac_elastic_applied' stamp so a resumed run never double-applies."""
+        if not self.config['Model'].get('elastic_seam') or len(self.chunk_indices) < 2:
+            return
+        import json as _json
+        from loop_utils.metric_lock import elastic_corrections
+
+        seams_path = os.path.join(self.output_dir, "elastic_seams.json")
+        fits = None
+        if os.path.exists(seams_path):
+            try:
+                prev = _json.load(open(seams_path))
+                if prev.get("chunk_indices") == [list(ci) for ci in self.chunk_indices]:
+                    fits = {int(j): {int(g): (np.asarray(v["R"], np.float64),
+                                              np.asarray(v["t"], np.float64))
+                                     for g, v in d.items() if "R" in v}
+                            for j, d in prev.get("seams", {}).items()}
+                    print(f"[elastic] resume: fits loaded from elastic_seams.json "
+                          f"({sum(len(d) for d in fits.values())} frame fits)")
+                else:
+                    print("[elastic] elastic_seams.json belongs to another chunk plan "
+                          "— refitting")
+            except Exception as _e:
+                print(f"[elastic] elastic_seams.json unreadable ({_e}) — refitting")
+        if fits is None:
+            fits, report = self._stac_elastic_fit_seams()
+            with open(seams_path, "w") as f:
+                _json.dump(report, f, indent=1)
+
+        # apply: every chunk gets its per-frame field. Both sides of every seam land
+        # on the SAME consensus, so the fused cloud (one writer per frame) is
+        # continuous through the ownership switch in the middle of each overlap.
+        self._stac_elastic_corr = {}
+        for k in range(len(self.chunk_indices)):
+            corr = elastic_corrections(self.chunk_indices, k, fits)
+            self._stac_elastic_corr[k] = corr
+            path = os.path.join(self.result_aligned_dir, f"chunk_{k}.npy")
+            data = np.load(path, allow_pickle=True).item()
+            outputs_ok = (os.path.exists(os.path.join(self.pcd_dir, f"{k}_pcd.ply"))
+                          and os.path.exists(os.path.join(self.pcd_dir, f"{k}_origins.npz")))
+            if data.get('_stac_elastic_applied'):
+                if outputs_ok:
+                    print(f"[elastic] chunk {k}: already corrected + written — skipped")
+                    continue
+                print(f"[elastic] chunk {k}: already corrected — rewriting outputs")
+            else:
+                wp = np.asarray(data['world_points'])
+                lead = wp.ndim == 5           # (1,S,H,W,3) — same guard as the origins writer
+                if lead:
+                    wp = wp[0]
+                moved = 0
+                for local in range(wp.shape[0]):
+                    M = corr[local]
+                    if np.allclose(M, np.eye(4), atol=1e-12):
+                        continue
+                    p = wp[local].reshape(-1, 3).astype(np.float64)
+                    wp[local] = (p @ M[:3, :3].T + M[:3, 3]).reshape(wp[local].shape).astype(wp.dtype)
+                    moved += 1
+                data['world_points'] = wp[None] if lead else wp
+                data['_stac_elastic_applied'] = True
+                np.save(path, data)
+                dmax = float(np.max(np.linalg.norm(corr[:, :3, 3], axis=1)))
+                print(f"[elastic] chunk {k}: {moved}/{wp.shape[0]} frames moved "
+                      f"(max frame translation {dmax * 100:.1f} cm)")
+            self._stac_write_chunk_outputs(data, k)
+        print(f"[elastic] ✅ all {len(self.chunk_indices)} chunks on the per-frame "
+              f"seam consensus — shared pixels now share ONE 3D position")
+
     def process_long_sequence(self):
         if self.overlap >= self.chunk_size:
             raise ValueError(f"[SETTING ERROR] Overlap ({self.overlap}) must be less than chunk size ({self.chunk_size})")
@@ -822,26 +988,28 @@ class VGGT_Long:
                 cd0 = np.load(os.path.join(self.result_unaligned_dir, "chunk_0.npy"),
                               allow_pickle=True).item()
                 np.save(os.path.join(self.result_aligned_dir, "chunk_0.npy"), cd0)
-                pts0 = cd0['world_points'].reshape(-1, 3)
-                col0 = (cd0['images'].transpose(0, 2, 3, 1).reshape(-1, 3) * 255).astype(np.uint8)
-                cf0 = self._stac_owned_confs(cd0['world_points_conf'].reshape(-1), 0)
-                thr0 = self._stac_conf_threshold(cf0)
-                save_confident_pointcloud_batch(
-                    points=pts0, colors=col0, confs=cf0,
-                    output_path=os.path.join(self.pcd_dir, "0_pcd.ply"),
-                    conf_threshold=thr0,
-                    sample_ratio=self.config['Model']['Pointcloud_Save']['sample_ratio'])
-                self._stac_write_origins(cd0, 0, conf_threshold=thr0, confs_override=cf0)
-                print(f'[STAC] single chunk: saved 0_pcd.ply ({len(pts0)} pts)')
+                self._stac_write_chunk_outputs(cd0, 0)
+                print(f'[STAC] single chunk: saved 0_pcd.ply')
+
+        # STAC: with the per-frame ELASTIC seam consensus enabled, each chunk's PLY +
+        # origins must be written AFTER the elastic correction — the apply loop only
+        # produces the aligned .npys and _stac_elastic_seams() writes the outputs.
+        _elastic = (bool(self.config['Model'].get('elastic_seam'))
+                    and len(self.chunk_indices) > 1)
+        if _elastic:
+            print("[elastic] enabled — per-chunk PLY/origins deferred to the elastic stage")
 
         for chunk_idx in range(len(self.chunk_indices) - 1):
             # STAC patch (resume): skip this chunk's apply if its aligned .npy + pcd .ply
             # already exist (from a prior run). chunk_0 is written inside the idx==0 branch.
-            _done = (os.path.exists(os.path.join(self.result_aligned_dir, f"chunk_{chunk_idx + 1}.npy"))
-                     and os.path.exists(os.path.join(self.pcd_dir, f"{chunk_idx + 1}_pcd.ply")))
+            # With elastic ON the .ply is written later, so only the .npy gates the skip.
+            _done = os.path.exists(os.path.join(self.result_aligned_dir, f"chunk_{chunk_idx + 1}.npy"))
+            if not _elastic:
+                _done = _done and os.path.exists(os.path.join(self.pcd_dir, f"{chunk_idx + 1}_pcd.ply"))
             if chunk_idx == 0:
-                _done = _done and os.path.exists(os.path.join(self.result_aligned_dir, "chunk_0.npy")) \
-                        and os.path.exists(os.path.join(self.pcd_dir, "0_pcd.ply"))
+                _done = _done and os.path.exists(os.path.join(self.result_aligned_dir, "chunk_0.npy"))
+                if not _elastic:
+                    _done = _done and os.path.exists(os.path.join(self.pcd_dir, "0_pcd.ply"))
             if _done:
                 print(f'[STAC resume] chunk {chunk_idx + 1} aligned+pcd exist — apply skipped')
                 continue
@@ -872,22 +1040,8 @@ class VGGT_Long:
 
                 np.save(os.path.join(self.result_aligned_dir, "chunk_0.npy"), chunk_data_first)
 
-                points_first = chunk_data_first['world_points'].reshape(-1, 3)
-                colors_first = (chunk_data_first['images'].transpose(0, 2, 3, 1).reshape(-1, 3) * 255).astype(np.uint8)
-                confs_first = chunk_data_first['world_points_conf'].reshape(-1)
-                ply_path_first = os.path.join(self.pcd_dir, f'0_pcd.ply')
-                confs_first = self._stac_owned_confs(confs_first, 0)
-                thr_first = self._stac_conf_threshold(confs_first)
-                save_confident_pointcloud_batch(
-                    points=points_first,  # shape: (H, W, 3)
-                    colors=colors_first,  # shape: (H, W, 3)
-                    confs=confs_first,  # shape: (H, W)
-                    output_path=ply_path_first,
-                    conf_threshold=thr_first,
-                    sample_ratio=self.config['Model']['Pointcloud_Save']['sample_ratio']
-                )
-                self._stac_write_origins(chunk_data_first, 0, conf_threshold=thr_first,
-                                         confs_override=confs_first)
+                if not _elastic:
+                    self._stac_write_chunk_outputs(chunk_data_first, 0)
                 # STAC: free unaligned chunk_0 NOW — its aligned .npy + pcd + origins are
                 # written and nothing downstream reads unaligned (the TSDF reads
                 # _tmp_results_aligned). Incremental cleanup so the apply phase never holds
@@ -904,25 +1058,10 @@ class VGGT_Long:
             # chunk_1's PLY + origins on the first iteration → chunk_001.ply duplicated
             # chunk_000's points (identical counts) while chunk_001_origins held the real
             # chunk_1 count → reproject_chunks aborted on the points!=origins mismatch.
-            aligned_chunk_data = np.load(os.path.join(self.result_aligned_dir, f"chunk_{chunk_idx+1}.npy"),
-                                             allow_pickle=True).item()
-
-            points = aligned_chunk_data['world_points'].reshape(-1, 3)
-            colors = (aligned_chunk_data['images'].transpose(0, 2, 3, 1).reshape(-1, 3) * 255).astype(np.uint8)
-            confs = aligned_chunk_data['world_points_conf'].reshape(-1)
-            ply_path = os.path.join(self.pcd_dir, f'{chunk_idx + 1}_pcd.ply')
-            confs = self._stac_owned_confs(confs, chunk_idx + 1)
-            thr_k = self._stac_conf_threshold(confs)
-            save_confident_pointcloud_batch(
-                points=points,  # shape: (H, W, 3)
-                colors=colors,  # shape: (H, W, 3)
-                confs=confs,  # shape: (H, W)
-                output_path=ply_path,
-                conf_threshold=thr_k,
-                sample_ratio=self.config['Model']['Pointcloud_Save']['sample_ratio']
-            )
-            self._stac_write_origins(aligned_chunk_data, chunk_idx + 1, conf_threshold=thr_k,
-                                     confs_override=confs)
+            if not _elastic:
+                aligned_chunk_data = np.load(os.path.join(self.result_aligned_dir, f"chunk_{chunk_idx+1}.npy"),
+                                                 allow_pickle=True).item()
+                self._stac_write_chunk_outputs(aligned_chunk_data, chunk_idx + 1)
             # STAC: free this chunk's unaligned .npy immediately (see chunk_0 note above) —
             # incremental cleanup keeps the apply phase ~flat on disk instead of doubling.
             try:
@@ -930,8 +1069,13 @@ class VGGT_Long:
             except OSError:
                 pass
 
+        # STAC patch: per-frame ELASTIC seam consensus (see _stac_elastic_seams) —
+        # runs on the aligned chunks, writes every chunk's PLY + origins, and leaves
+        # per-frame pose corrections for save_camera_poses to apply.
+        self._stac_elastic_seams()
+
         self.save_camera_poses()
-        
+
         print('Done.')
 
     def run(self):
@@ -1043,10 +1187,19 @@ class VGGT_Long:
         all_poses = [None] * len(self.img_list)
         all_intrinsics = [None] * len(self.img_list)
 
+        # STAC: when the elastic seam consensus ran, every frame's points were moved
+        # by a per-frame rigid correction — the camera must move WITH its points
+        # (depth maps and the TSDF stay valid by rigidity). _stac_elastic_corr[k][i]
+        # is chunk k's world-space 4x4 for local frame i, applied AFTER the chunk's
+        # accumulated Sim3 (the corrections were fitted on the aligned chunks).
+        _ecorr = getattr(self, '_stac_elastic_corr', None)
+
         first_chunk_range, first_chunk_extrinsics = self.all_camera_poses[0]
         _, first_chunk_intrinsics = self.all_camera_intrinsics[0]
         for i, idx in enumerate(range(first_chunk_range[0], first_chunk_range[1])):
             c2w = first_chunk_extrinsics[i]
+            if _ecorr is not None:
+                c2w = _ecorr[0][i] @ c2w
             all_poses[idx] = c2w
             if first_chunk_intrinsics is not None:
                 all_intrinsics[idx] = first_chunk_intrinsics[i]
@@ -1066,6 +1219,9 @@ class VGGT_Long:
 
                 transformed_c2w = S @ c2w  # Be aware of the left multiplication!
                 transformed_c2w[:3, :3] /= s  # Normalize rotation
+
+                if _ecorr is not None:
+                    transformed_c2w = _ecorr[chunk_idx][i] @ transformed_c2w
 
                 all_poses[idx] = transformed_c2w
                 if chunk_intrinsics is not None:
