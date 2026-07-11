@@ -1013,8 +1013,19 @@ class VGGT_Long:
                     cur_state["w2c"][kl] = w2c0 @ np.linalg.inv(M)
                 return cur_state["wp"][kl], cf0, cur_state["w2c"][kl], K0
 
+            dc_logged = set()
+
             def _measure(k, xi_total, offsets=fit_offsets, want_points=False):
-                """Chunk k's pairs vs the CURRENT state; cross partners g=-1."""
+                """Chunk k's pairs vs the CURRENT state; cross partners g=-1.
+
+                Cross pairs carry TWO signals: the intra-chunk warp (what this
+                stage corrects) and the SEAM-LEVEL rigid offset between the
+                chunks (what the clamped fields cannot express — run 7: a
+                26.5 cm seam offset kept the iteration pushing 22 cm/round
+                without converging). The per-seam DC (component-wise median of
+                that seam's taus) is SUBTRACTED before solving: only the
+                expressible residual drives the field; the DC is logged and
+                left to the seam/finereg level where it belongs."""
                 if k in _sick:
                     return []
                 start, end = self.chunk_indices[k]
@@ -1026,7 +1037,8 @@ class VGGT_Long:
                     cur_state["wp"].clear()
                     cur_state["w2c"].clear()
                 X = se3_matrices(xi_total)
-                out_fits, out_pts = [], []
+                within_fits, out_pts = [], []
+                cross_fits = {}
                 for f in range(S):
                     for d in offsets:
                         pk = _partner(k, f, d)
@@ -1046,11 +1058,28 @@ class VGGT_Long:
                             continue
                         fit = robust_rigid(pq[0], pq[1], sample=8000)
                         if fit is not None:
-                            out_fits.append((f, -1 if cross else f + d,
-                                             fit[0], fit[1], fit[2], fit[3]))
+                            rec = (f, -1 if cross else f + d,
+                                   fit[0], fit[1], fit[2], fit[3])
+                            if cross:
+                                cross_fits.setdefault(pk[0], []).append(rec)
+                            else:
+                                within_fits.append(rec)
                 if want_points:
                     return out_pts
-                return filter_pair_fits(out_fits)
+                taus = filter_pair_fits(within_fits)
+                for kn, fl in cross_fits.items():
+                    ct = filter_pair_fits(fl)
+                    if len(ct) >= 5:
+                        dc = np.median(np.stack([t for _, _, t, _ in ct]), axis=0)
+                        if (k, kn) not in dc_logged:
+                            dc_logged.add((k, kn))
+                            print(f"[intra-chunk] seam {k}-{kn}: DC offset "
+                                  f"{float(np.linalg.norm(dc[3:])) * 100:.1f} cm "
+                                  f"removed from the intra signal (seam-level "
+                                  f"business, not expressible by clamped fields)")
+                        ct = [(f, g, t - dc, w) for f, g, t, w in ct]
+                    taus += ct
+                return taus
 
             # ── held-out captured BEFORE any correction (the honest judge) ──
             xi0 = np.zeros((N, 6))

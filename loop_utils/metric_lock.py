@@ -1059,11 +1059,23 @@ def iterate_chunk_fields(measure_fn, chunk_indices, n_frames,
     every chunk's increment (endpoint-clamped — no round can create a field
     longer than one chunk), blend per global frame, apply with under-
     relaxation, and TRUST-REGION the round to ``bound``× the p90 of its own
-    pair signal. Stops when the max increment < tol_t or rounds run out.
-    Returns (xi_total (N,6), rounds: [{round, max_inc_cm, n_pairs, capped}])."""
+    pair signal.
+
+    STALL GUARD (run 7, 2026-07-11: a seam-level offset the clamped fields
+    cannot express kept the increments at ~22 cm/round, integrating 161 cm
+    over 6 rounds — a persistent gradient, not convergence): when the
+    increment fails to shrink for two consecutive rounds, the two stalled
+    rounds are ROLLED BACK and the iteration stops — an unexpressible signal
+    is never integrated. Stops on max increment < tol_t, stall, or rounds
+    out. Returns (xi_total (N,6), rounds: [{round, max_inc_cm, n_pairs,
+    capped, stalled}])."""
     xi_total = np.zeros((n_frames, 6))
     history = []
+    snaps = []
+    prev_mx = None
+    stall = 0
     for r in range(int(max_rounds)):
+        snaps.append(xi_total.copy())
         fields = {}
         t_sig = []
         n_pairs = 0
@@ -1085,8 +1097,22 @@ def iterate_chunk_fields(measure_fn, chunk_indices, n_frames,
             inc *= cap / mx
             mx = cap
         xi_total = xi_total + inc
+        stalled = prev_mx is not None and mx > 0.95 * prev_mx
         history.append({"round": r + 1, "max_inc_cm": mx * 100,
-                        "n_pairs": n_pairs, "capped": bool(capped)})
+                        "n_pairs": n_pairs, "capped": bool(capped),
+                        "stalled": bool(stalled)})
+        if stalled:
+            stall += 1
+            if stall >= 2:
+                # roll back the two stalled rounds: their pushes were the
+                # integration of a signal the fields cannot express
+                xi_total = snaps[-2]
+                history[-1]["rolled_back"] = True
+                history[-2]["rolled_back"] = True
+                break
+        else:
+            stall = 0
+        prev_mx = mx
         if mx < float(tol_t):
             break
     return xi_total, history
