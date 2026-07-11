@@ -930,6 +930,10 @@ def solve_chunk_field(pair_taus, S, smooth_w=0.5, prior_w=0.3):
     Constraints (local frame indices, 0..S-1):
 
         xi_f - xi_g = tau_fg     (within-chunk exact-surface pair residuals)
+        xi_f = tau_fg            (CROSS-chunk pair: g = -1 marks a partner in
+                                  a NEIGHBOUR chunk, held fixed this sweep —
+                                  the coupling that makes the iterative
+                                  relaxation converge chunks TOGETHER)
         xi_{f+1} - xi_f = 0      (smoothness, weight smooth_w)
         xi_f = 0                 (zero-prior, weight prior_w — damping)
         xi_0 = xi_{S-1} = 0      (HARD: solved-out, not weighted — no field
@@ -940,7 +944,7 @@ def solve_chunk_field(pair_taus, S, smooth_w=0.5, prior_w=0.3):
     xi = np.zeros((S, 6))
     taus = [(int(f), int(g), np.asarray(t, np.float64).reshape(6), float(w))
             for f, g, t, w in (pair_taus or [])
-            if 0 <= f < S and 0 <= g < S and np.all(np.isfinite(t))]
+            if 0 <= f < S and g < S and np.all(np.isfinite(t))]
     if not taus or S < 3:
         return xi
     free = list(range(1, S - 1))               # endpoints clamped out
@@ -951,7 +955,7 @@ def solve_chunk_field(pair_taus, S, smooth_w=0.5, prior_w=0.3):
         r = np.zeros(n)
         if f in col:
             r[col[f]] += w
-        if g in col:
+        if 0 <= g < S and g in col:            # g == -1: fixed neighbour
             r[col[g]] -= w
         if not r.any():
             continue
@@ -1036,3 +1040,53 @@ def chunk_field_verdict(xi, pair_taus, held, improve=0.8, bound=5.0):
     return {"bounded": bounded, "improves": improves,
             "med_before": med_b, "med_after": med_a,
             "t_sig": t_sig, "r_sig": r_sig}
+
+
+def iterate_chunk_fields(measure_fn, chunk_indices, n_frames,
+                         max_rounds=6, relax=0.7, tol_t=0.01, bound=5.0):
+    """ITERATIVE relaxation of the per-chunk fields (block Gauss-Seidel on the
+    coupled problem): correcting one chunk changes what its neighbours see, so
+    the neighbours must be re-measured and re-corrected IN RESPONSE, round
+    after round, until the corrections converge to zero (measured 2026-07-11,
+    test4 run 6: chunk 2 earned a 16 cm field while chunk 1's was refused —
+    the one-shot per-chunk gate created a 24 cm divergence between neighbours;
+    the answer is not to refuse a correction that disturbs the neighbour but
+    to let the neighbour respond and converge together).
+
+    measure_fn(k, xi_total) → [(f_local, g_local_or_-1, tau[6], w)] measures
+    chunk k's residual pairs against the CURRENT state (xi_total composed in),
+    cross-chunk partners marked g = -1 (fixed this sweep). Per round: solve
+    every chunk's increment (endpoint-clamped — no round can create a field
+    longer than one chunk), blend per global frame, apply with under-
+    relaxation, and TRUST-REGION the round to ``bound``× the p90 of its own
+    pair signal. Stops when the max increment < tol_t or rounds run out.
+    Returns (xi_total (N,6), rounds: [{round, max_inc_cm, n_pairs, capped}])."""
+    xi_total = np.zeros((n_frames, 6))
+    history = []
+    for r in range(int(max_rounds)):
+        fields = {}
+        t_sig = []
+        n_pairs = 0
+        for k, (start, end) in enumerate(chunk_indices):
+            taus = measure_fn(k, xi_total)
+            if not taus:
+                continue
+            n_pairs += len(taus)
+            t_sig += [float(np.linalg.norm(np.asarray(t, np.float64).reshape(6)[3:]))
+                      for _, _, t, _ in taus]
+            fields[k] = solve_chunk_field(taus, end - start)
+        if not fields:
+            break
+        inc = blend_chunk_fields(chunk_indices, fields, n_frames) * float(relax)
+        cap = bound * max(float(np.percentile(t_sig, 90)), 1e-3)
+        mx = float(np.max(np.linalg.norm(inc[:, 3:], axis=1)))
+        capped = mx > cap
+        if capped:
+            inc *= cap / mx
+            mx = cap
+        xi_total = xi_total + inc
+        history.append({"round": r + 1, "max_inc_cm": mx * 100,
+                        "n_pairs": n_pairs, "capped": bool(capped)})
+        if mx < float(tol_t):
+            break
+    return xi_total, history
