@@ -930,10 +930,6 @@ def solve_chunk_field(pair_taus, S, smooth_w=0.5, prior_w=0.3):
     Constraints (local frame indices, 0..S-1):
 
         xi_f - xi_g = tau_fg     (within-chunk exact-surface pair residuals)
-        xi_f = tau_fg            (CROSS-chunk pair: g = -1 marks a partner in
-                                  a NEIGHBOUR chunk, held fixed this sweep —
-                                  the coupling that makes the iterative
-                                  relaxation converge chunks TOGETHER)
         xi_{f+1} - xi_f = 0      (smoothness, weight smooth_w)
         xi_f = 0                 (zero-prior, weight prior_w — damping)
         xi_0 = xi_{S-1} = 0      (HARD: solved-out, not weighted — no field
@@ -944,7 +940,7 @@ def solve_chunk_field(pair_taus, S, smooth_w=0.5, prior_w=0.3):
     xi = np.zeros((S, 6))
     taus = [(int(f), int(g), np.asarray(t, np.float64).reshape(6), float(w))
             for f, g, t, w in (pair_taus or [])
-            if 0 <= f < S and g < S and np.all(np.isfinite(t))]
+            if 0 <= f < S and 0 <= g < S and np.all(np.isfinite(t))]
     if not taus or S < 3:
         return xi
     free = list(range(1, S - 1))               # endpoints clamped out
@@ -955,7 +951,7 @@ def solve_chunk_field(pair_taus, S, smooth_w=0.5, prior_w=0.3):
         r = np.zeros(n)
         if f in col:
             r[col[f]] += w
-        if 0 <= g < S and g in col:            # g == -1: fixed neighbour
+        if g in col:
             r[col[g]] -= w
         if not r.any():
             continue
@@ -983,20 +979,29 @@ def solve_chunk_field(pair_taus, S, smooth_w=0.5, prior_w=0.3):
     return xi
 
 
-def assemble_domain_fields(domains, fields, n_frames):
-    """Per-GLOBAL-frame field from per-DOMAIN solutions. Domains are DISJOINT
-    ownership ranges tiling the session, so what was solved is what gets
-    applied — EXACTLY (run 7/8 measured the alternative: triangular blending
-    over 50%-overlap chunks halved every chunk's solution near its edges, so
-    each round re-pushed the unapplied half and the iteration never
-    converged). Every domain field is zero at its endpoints, so the assembled
-    field is continuous across domain boundaries. Returns xi (n_frames, 6)."""
-    out = np.zeros((n_frames, 6))
-    for k, (start, end) in enumerate(domains):
-        fld = fields.get(k)
-        if fld is None:
+def blend_chunk_fields(chunk_indices, fields, n_frames):
+    """Per-GLOBAL-frame field from the per-chunk solutions: where two chunks
+    share a frame their fields are blended with the elastic's triangular
+    weights (1 at a chunk's own centre → 0 at its edges). Every chunk field is
+    zero at its endpoints, so the blend is continuous and both copies of every
+    shared frame receive ONE identical correction — the seam consensus is
+    preserved exactly. Returns xi (n_frames, 6)."""
+    num = np.zeros((n_frames, 6))
+    den = np.zeros(n_frames)
+    for k, (start, end) in enumerate(chunk_indices):
+        S = end - start
+        fld = np.asarray(fields.get(k)) if fields.get(k) is not None else None
+        if fld is None or S < 2:
             continue
-        out[start:end] = np.asarray(fld, np.float64)
+        w = 1.0 - np.abs(np.linspace(-1.0, 1.0, S))
+        w = np.maximum(w, 1e-6)
+        for local in range(S):
+            g = start + local
+            num[g] += w[local] * fld[local]
+            den[g] += w[local]
+    out = np.zeros((n_frames, 6))
+    m = den > 0
+    out[m] = num[m] / den[m, None]
     return out
 
 
@@ -1031,130 +1036,3 @@ def chunk_field_verdict(xi, pair_taus, held, improve=0.8, bound=5.0):
     return {"bounded": bounded, "improves": improves,
             "med_before": med_b, "med_after": med_a,
             "t_sig": t_sig, "r_sig": r_sig}
-
-
-def iterate_chunk_fields(measure_fn, domains, n_frames,
-                         max_rounds=6, relax=0.7, tol_t=0.01, bound=5.0,
-                         xi_init=None):
-    """ITERATIVE relaxation of the per-chunk fields (block Gauss-Seidel on the
-    coupled problem): correcting one chunk changes what its neighbours see, so
-    the neighbours must be re-measured and re-corrected IN RESPONSE, round
-    after round, until the corrections converge to zero (measured 2026-07-11,
-    test4 run 6: chunk 2 earned a 16 cm field while chunk 1's was refused —
-    the one-shot per-chunk gate created a 24 cm divergence between neighbours;
-    the answer is not to refuse a correction that disturbs the neighbour but
-    to let the neighbour respond and converge together).
-
-    ``domains`` are DISJOINT ownership ranges tiling the session (run 7/8
-    measured why: with 50%-overlap chunk windows the applied field was the
-    triangular BLEND of two solutions — applied ≠ solved, every round re-
-    pushed its unapplied half and the iteration plateaued at ~22 cm/round.
-    Disjoint domains make applied == solved exactly; coupling between
-    domains flows only through the cross pairs, re-measured every round).
-
-    measure_fn(k, xi_total) → [(f_local, g_local_or_-1, tau[6], w)] measures
-    domain k's residual pairs against the CURRENT state (xi_total composed
-    in), cross-domain partners marked g = -1 (fixed this sweep). Per round:
-    solve every domain's increment (endpoint-clamped — no field longer than
-    one domain), assemble, apply with under-relaxation, TRUST-REGION the
-    round to ``bound``× the p90 of its own pair signal.
-
-    STALL GUARD (tightened after runs 7/8): an increment that fails to
-    shrink by ≥10% for two consecutive rounds means the remaining signal is
-    not expressible — the stalled rounds are ROLLED BACK and the iteration
-    stops. Stops on max increment < tol_t, stall, or rounds out. Returns
-    (xi_total (N,6), rounds: [{round, max_inc_cm, n_pairs, capped,
-    stalled}]). ``xi_init``: start from an already-earned base state (e.g.
-    the DC chain correction) — increments accumulate on top of it."""
-    xi_total = (np.array(xi_init, np.float64) if xi_init is not None
-                else np.zeros((n_frames, 6)))
-    history = []
-    snaps = []
-    prev_mx = None
-    stall = 0
-    for r in range(int(max_rounds)):
-        snaps.append(xi_total.copy())
-        fields = {}
-        t_sig = []
-        n_pairs = 0
-        for k, (start, end) in enumerate(domains):
-            taus = measure_fn(k, xi_total)
-            if not taus:
-                continue
-            n_pairs += len(taus)
-            t_sig += [float(np.linalg.norm(np.asarray(t, np.float64).reshape(6)[3:]))
-                      for _, _, t, _ in taus]
-            fields[k] = solve_chunk_field(taus, end - start)
-        if not fields:
-            break
-        inc = assemble_domain_fields(domains, fields, n_frames) * float(relax)
-        cap = bound * max(float(np.percentile(t_sig, 90)), 1e-3)
-        mx = float(np.max(np.linalg.norm(inc[:, 3:], axis=1)))
-        capped = mx > cap
-        if capped:
-            inc *= cap / mx
-            mx = cap
-        xi_total = xi_total + inc
-        stalled = prev_mx is not None and mx > 0.90 * prev_mx
-        history.append({"round": r + 1, "max_inc_cm": mx * 100,
-                        "n_pairs": n_pairs, "capped": bool(capped),
-                        "stalled": bool(stalled)})
-        if stalled:
-            stall += 1
-            if stall >= 2:
-                # roll back the two stalled rounds: their pushes were the
-                # integration of a signal the fields cannot express
-                xi_total = snaps[-2]
-                history[-1]["rolled_back"] = True
-                history[-2]["rolled_back"] = True
-                break
-        else:
-            stall = 0
-        prev_mx = mx
-        if mx < float(tol_t):
-            break
-    return xi_total, history
-
-
-def chain_from_dcs(dc_map, n_domains, domain_lengths=None):
-    """Per-domain rigid corrections from the measured seam DC offsets, chained
-    along the session (run 9 insight: the per-seam DC — the component-wise
-    median of that seam's cross-pair taus — is the CLEAN, rigid part of the
-    remaining drift, 3-27 cm on test4, and no stage was applying it).
-
-    For seam (k, k+1) the constraint is xi_k − xi_{k+1} = dc (pair fits map
-    k's copy onto k+1's copy), so:  c_{k+1} = c_k − dc_{k,k+1}, c_0 = 0,
-    then the weighted mean (weights = domain lengths) is removed — the gauge
-    that redistributes the correction instead of shoving the whole session
-    relative to domain 0. Missing seams contribute identity links.
-    Returns c (n_domains, 6)."""
-    c = np.zeros((n_domains, 6))
-    for k in range(n_domains - 1):
-        dc = dc_map.get((k, k + 1))
-        step = np.asarray(dc, np.float64).reshape(6) if dc is not None else np.zeros(6)
-        c[k + 1] = c[k] - step
-    w = (np.asarray(domain_lengths, np.float64)
-         if domain_lengths is not None else np.ones(n_domains))
-    c -= (c * w[:, None]).sum(0) / max(w.sum(), 1e-9)
-    return c
-
-
-def interp_domain_chain(domains, c, n_frames):
-    """Per-frame field from per-domain chain corrections: linear interpolation
-    between DOMAIN CENTRES (constant before the first and after the last).
-    A hard per-domain step would cut a cliff into a physically continuous
-    walk at every boundary; the ramp spreads each seam DC across the span it
-    actually accumulated over. Returns xi (n_frames, 6)."""
-    c = np.asarray(c, np.float64)
-    centers = [0.5 * (ds + de - 1) for ds, de in domains]
-    xi = np.zeros((n_frames, 6))
-    for g in range(n_frames):
-        if g <= centers[0]:
-            xi[g] = c[0]
-        elif g >= centers[-1]:
-            xi[g] = c[-1]
-        else:
-            j = int(np.searchsorted(centers, g)) - 1
-            a = (g - centers[j]) / max(centers[j + 1] - centers[j], 1e-9)
-            xi[g] = (1.0 - a) * c[j] + a * c[j + 1]
-    return xi

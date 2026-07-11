@@ -917,31 +917,24 @@ class VGGT_Long:
 
         The residual warp lives BETWEEN frames of the same chunk (test4: the
         same ground reconstructed ~7-9 cm apart by frames a few indices apart
-        — the depth-graph ladder proved it is a POSE error). Two measured
-        lessons shape this stage: (1) the failed global pose graph — short-
-        span evidence must never produce corrections longer than its span, so
-        every chunk field has its endpoints CLAMPED to zero (the elastic seam
-        consensus) and nothing longer than one chunk can exist; (2) run 6's
-        one-shot per-chunk gate — refusing chunk 1 while correcting chunk 2
-        opened a 24 cm divergence between neighbours. Correcting one chunk
-        CREATES the need for its neighbours' corrections, so the solve is
-        ITERATIVE (block relaxation): every round re-measures each chunk
-        against the CURRENT state of its neighbours (cross-chunk pairs
-        included), solves increments, applies them under-relaxed, and repeats
-        until the increments converge to zero. Final self-gate on held-out
-        pairs captured BEFORE any correction (within-chunk and cross-chunk
-        strata, no seam may degrade); fail → the whole stage is identity.
-        Points and pose move together: depth/TSDF invariant. Resume-safe via
-        intra_chunk.json + per-npy stamp."""
+        — the depth-graph ladder proved it is a POSE error). The failed global
+        pose graph taught the constraint this stage is built on: short-span
+        evidence must never produce corrections longer than its span. Here
+        every chunk is solved ALONE, its endpoint frames CLAMPED to zero (the
+        seam consensus the elastic already established), so no correction
+        longer than one chunk can exist; per-chunk held-out pairs gate each
+        field independently — a chunk that does not earn its correction stays
+        identity, alone. Shared frames get ONE blended correction (fields are
+        zero at chunk edges → the blend is continuous and both copies stay
+        coincident). Points and pose move together: depth/TSDF invariant.
+        Resume-safe via intra_chunk.json + per-npy stamp."""
         if not self.config['Model'].get('intra_chunk') or len(self.chunk_indices) < 1:
             return
         import json as _json
         from loop_utils.metric_lock import (surface_pair_correspondences,
                                             robust_rigid, filter_pair_fits,
-                                            solve_chunk_field,
-                                            iterate_chunk_fields,
-                                            chain_from_dcs, interp_domain_chain,
-                                            se3_matrices, frame_owner)
+                                            solve_chunk_field, blend_chunk_fields,
+                                            chunk_field_verdict, se3_matrices)
         _sick = getattr(self, '_stac_sick_chunks', set())
         N = len(self.img_list)
 
@@ -959,10 +952,12 @@ class VGGT_Long:
         if xi is None:
             fit_offsets = (1, 2, 3, 5, 8, 12)
             holdout_offsets = (4, 10)
-
-            # ── full-session cache: every chunk's OWN copies (base state) ──
-            base = {}                    # (k, local) -> (wp32, cf32, w2c0, K)
+            fields, report = {}, {}
             for k, (start, end) in enumerate(self.chunk_indices):
+                S = end - start
+                if k in _sick or S < 8:
+                    report[str(k)] = {"verdict": "SKIP", "reason": "sick or tiny"}
+                    continue
                 data = np.load(os.path.join(self.result_aligned_dir, f"chunk_{k}.npy"),
                                allow_pickle=True).item()
                 if data.get('_stac_intra_applied'):
@@ -976,226 +971,63 @@ class VGGT_Long:
                 cf = np.asarray(data['world_points_conf']).reshape(wp.shape[:3])
                 ext = np.asarray(data['extrinsic'])
                 K = np.asarray(data['intrinsic'])
-                for local in range(end - start):
+                cache = {}
+                for local in range(S):
                     c2w = self._stac_aligned_pose(k, local, ext[local])
-                    base[(k, local)] = (wp[local].astype(np.float32),
-                                        cf[local].astype(np.float32),
-                                        np.linalg.inv(c2w), K[local])
+                    cache[local] = (wp[local].astype(np.float32),
+                                    cf[local].astype(np.float32),
+                                    np.linalg.inv(c2w), K[local])
                 del data
-
-            # ── DISJOINT ownership domains (run 7/8 lesson: with overlapping
-            # windows the applied field was the blend of two solutions —
-            # applied ≠ solved and the iteration never converged; ownership
-            # ranges tile the session, so applied == solved exactly) ──
-            owner = frame_owner(self.chunk_indices, N)
-            domains = []
-            d_start = 0
-            for g in range(1, N + 1):
-                if g == N or owner[g] != owner[d_start]:
-                    domains.append((d_start, g))
-                    d_start = g
-            dom_of = {}
-            for di, (ds, de) in enumerate(domains):
-                for g in range(ds, de):
-                    dom_of[g] = di
-
-            def _copy_of(g):
-                """(chunk, local) of frame g's OWNER copy."""
-                k = owner[g]
-                return k, g - self.chunk_indices[k][0]
-
-            cur_state = {"key": None, "wp": {}, "w2c": {}}
-
-            def _current(kl, X):
-                """Frame (k,local)'s wp and w2c under the ACCUMULATED field."""
-                wp0, cf0, w2c0, K0 = base[kl]
-                k, local = kl
-                g = self.chunk_indices[k][0] + local
-                M = X[g]
-                if np.allclose(M, np.eye(4), atol=1e-12):
-                    return wp0, cf0, w2c0, K0
-                if kl not in cur_state["wp"]:
-                    p = wp0.reshape(-1, 3).astype(np.float64)
-                    cur_state["wp"][kl] = ((p @ M[:3, :3].T + M[:3, 3])
-                                           .reshape(wp0.shape).astype(np.float32))
-                    cur_state["w2c"][kl] = w2c0 @ np.linalg.inv(M)
-                return cur_state["wp"][kl], cf0, cur_state["w2c"][kl], K0
-
-            dc_logged = set()
-            dc_current = {}              # (di, dj) -> latest measured DC tau
-
-            def _measure(di, xi_total, offsets=fit_offsets, want_points=False):
-                """Domain di's pairs vs the CURRENT state; cross-domain
-                partners g=-1 (their state fixed this sweep — the coupling of
-                the iteration). Every frame is measured on its OWNER copy.
-
-                Cross pairs carry TWO signals: the intra warp (what this stage
-                corrects) and the DOMAIN-LEVEL rigid offset (what clamped
-                fields cannot express — run 7: a 26.5 cm seam offset kept the
-                iteration pushing without converging). The per-neighbour DC
-                (component-wise median) is SUBTRACTED before solving; only
-                the expressible residual drives the field."""
-                ds, de = domains[di]
-                S = de - ds
-                if owner[ds] in _sick or S < 8:
-                    return []
-                if cur_state["key"] != id(xi_total):
-                    cur_state["key"] = id(xi_total)
-                    cur_state["wp"].clear()
-                    cur_state["w2c"].clear()
-                X = se3_matrices(xi_total)
-                within_fits, out_pts = [], []
-                cross_fits = {}
-                for f_glob in range(ds, de):
-                    for d in offsets:
-                        g_glob = f_glob + d
-                        if g_glob >= N:
+                fits, held = [], []
+                for f in range(S):
+                    for d in fit_offsets + holdout_offsets:
+                        g = f + d
+                        if g >= S:
                             continue
-                        dj = dom_of[g_glob]
-                        cross = dj != di
-                        wp_s, cf_s, _w, _K = _current(_copy_of(f_glob), X)
-                        wp_d, cf_d, w2c_d, K_d = _current(_copy_of(g_glob), X)
-                        pq = surface_pair_correspondences(wp_s, cf_s, wp_d, cf_d,
-                                                          w2c_d, K_d)
+                        pq = surface_pair_correspondences(
+                            cache[f][0], cache[f][1],
+                            cache[g][0], cache[g][1], cache[g][2], cache[g][3])
                         if pq is None:
                             continue
-                        if want_points:
-                            out_pts.append((f_glob, g_glob,
-                                            pq[0][:2000], pq[1][:2000]))
+                        if d in holdout_offsets:
+                            held.append((f, g, pq[0][:2000], pq[1][:2000]))
                             continue
                         fit = robust_rigid(pq[0], pq[1], sample=8000)
                         if fit is not None:
-                            rec = (f_glob - ds,
-                                   -1 if cross else g_glob - ds,
-                                   fit[0], fit[1], fit[2], fit[3])
-                            if cross:
-                                cross_fits.setdefault(dj, []).append(rec)
-                            else:
-                                within_fits.append(rec)
-                if want_points:
-                    return out_pts
-                taus = filter_pair_fits(within_fits)
-                for dj, fl in cross_fits.items():
-                    ct = filter_pair_fits(fl)
-                    if len(ct) >= 5:
-                        dc = np.median(np.stack([t for _, _, t, _ in ct]), axis=0)
-                        dc_current[(di, dj)] = dc
-                        if (di, dj) not in dc_logged:
-                            dc_logged.add((di, dj))
-                            print(f"[intra-chunk] domains {di}-{dj}: DC offset "
-                                  f"{float(np.linalg.norm(dc[3:])) * 100:.1f} cm "
-                                  f"(rigid seam signal — handled by the DC "
-                                  f"chain, removed from the warp signal)")
-                        ct = [(f, g, t - dc, w) for f, g, t, w in ct]
-                    taus += ct
-                return taus
-
-            # ── held-out captured BEFORE any correction (the honest judge) ──
-            xi0 = np.zeros((N, 6))
-            held, taus0 = [], []
-            for di in range(len(domains)):
-                held += _measure(di, xi0, offsets=holdout_offsets, want_points=True)
-                for f, g, t, w in _measure(di, xi0):
-                    taus0.append((f, g, t, w))
-            if len(taus0) < N or len(held) < N // 4:
-                print(f"[intra-chunk] too thin ({len(taus0)} fit / {len(held)} "
-                      f"held-out) — SKIPPING (nothing modified)")
-                return
-            print(f"[intra-chunk] {len(domains)} ownership domains | "
-                  f"{len(taus0)} pairs (within+cross) + {len(held)} held-out")
-            dc0 = {k_: np.array(v_) for k_, v_ in dc_current.items()}
-
-            def _held_stats(xi_eval):
-                """(global median, {seam: median}) of held-out disagreement
-                under a candidate field — the one honest ruler for every
-                verdict in this stage."""
-                Xh = se3_matrices(xi_eval)
-                glob, per = [], {}
-                for f, g, p, q in held:
-                    p1 = np.asarray(p, np.float64)
-                    q1 = np.asarray(q, np.float64)
-                    p2 = p1 @ Xh[f][:3, :3].T + Xh[f][:3, 3]
-                    q2 = q1 @ Xh[g][:3, :3].T + Xh[g][:3, 3]
-                    m = float(np.median(np.linalg.norm(p2 - q2, axis=1)))
-                    glob.append(m)
-                    key = (int(owner[f]), int(owner[g]))
-                    if key[0] != key[1]:
-                        per.setdefault(key, []).append(m)
-                return (float(np.median(glob)),
-                        {k2: float(np.median(v2)) for k2, v2 in per.items()})
-
-            def _no_seam_degrades(s_new, s_ref):
-                return all(s_new.get(k2, 0.0) <= 1.1 * s_ref[k2] + 0.005
-                           for k2 in s_ref)
-
-            g_base, s_base = _held_stats(xi0)
-
-            # ── step 1: DC CHAIN — the measured RIGID seam offsets, ramped
-            # between domain centres (a hard step would cut the walk; the ramp
-            # spreads each DC over the span it accumulated on) ──
-            dlens = [de - ds for ds, de in domains]
-            cchain = chain_from_dcs(dc0, len(domains), dlens)
-            xi_dc = interp_domain_chain(domains, cchain, N)
-            g_dc, s_dc = _held_stats(xi_dc)
-            dc_ok = g_dc <= 0.95 * g_base and _no_seam_degrades(s_dc, s_base)
-            print(f"[intra-chunk] DC chain: held-out {g_base * 100:.2f} -> "
-                  f"{g_dc * 100:.2f} cm | max shift "
-                  f"{float(np.max(np.linalg.norm(xi_dc[:, 3:], axis=1))) * 100:.1f} cm "
-                  f"-> {'APPLY' if dc_ok else 'IDENTITY'}")
-            for k2 in sorted(s_base):
-                print(f"[intra-chunk]   seam {k2[0]}-{k2[1]}: "
-                      f"{s_base[k2] * 100:.1f} -> {s_dc[k2] * 100:.1f} cm")
-            base_xi = xi_dc if dc_ok else np.zeros((N, 6))
-            g_ref, s_ref = (g_dc, s_dc) if dc_ok else (g_base, s_base)
-
-            # ── step 2: warp iteration FROM the DC-corrected base (its
-            # unexpressible seam component is now gone); fallback = base ──
-            xi_t, rounds = iterate_chunk_fields(_measure, domains, N,
-                                                xi_init=base_xi)
-            for h in rounds:
-                print(f"[intra-chunk] round {h['round']}: max increment "
-                      f"{h['max_inc_cm']:.2f} cm ({h['n_pairs']} pairs"
-                      + (", trust-region capped)" if h["capped"] else ")"))
-            g_tot, s_tot = _held_stats(xi_t)
-            delta = xi_t - base_xi
-            t90 = max(float(np.percentile(
-                [float(np.linalg.norm(np.asarray(t, np.float64).reshape(6)[3:]))
-                 for _, _, t, _ in taus0], 90)), 1e-3)
-            w_bounded = float(np.max(np.linalg.norm(delta[:, 3:], axis=1))) <= 5 * t90
-            warp_ok = (w_bounded and g_tot <= 0.9 * g_ref
-                       and _no_seam_degrades(s_tot, s_ref))
-            _w_msg = ("APPLY" if warp_ok else
-                      "discarded (keeping " + ("DC chain" if dc_ok else "identity") + ")")
-            print(f"[intra-chunk] warp on top: held-out {g_ref * 100:.2f} -> "
-                  f"{g_tot * 100:.2f} cm | bounded={w_bounded} -> {_w_msg}")
-            xi = xi_t if warp_ok else base_xi
-            verdict = ("DC+WARP" if (dc_ok and warp_ok) else
-                       "DC" if dc_ok else "WARP" if warp_ok else "SKIP")
-            if verdict == "SKIP":
-                print("[intra-chunk] ⛔ nothing earned — geometry left UNTOUCHED "
-                      "(an unearned correction is a warp, not a fix)")
-            else:
-                print(f"[intra-chunk] ✅ {verdict} earned — held-out "
-                      f"{g_base * 100:.2f} -> "
-                      f"{_held_stats(xi)[0] * 100:.2f} cm")
-            del base, cur_state
+                            fits.append((f, g, fit[0], fit[1], fit[2], fit[3]))
+                del cache
+                taus = filter_pair_fits(fits)
+                if len(taus) < S or len(held) < S // 4:
+                    report[str(k)] = {"verdict": "SKIP",
+                                      "reason": f"thin ({len(taus)} fit/{len(held)} held)"}
+                    print(f"[intra-chunk] chunk {k}: too thin "
+                          f"({len(taus)} fit / {len(held)} held) — identity")
+                    continue
+                fld = solve_chunk_field(taus, S)
+                v = chunk_field_verdict(fld, taus, held)
+                ok = v["bounded"] and v["improves"]
+                tmax = float(np.max(np.linalg.norm(fld[:, 3:], axis=1)))
+                print(f"[intra-chunk] chunk {k}: held-out "
+                      f"{v['med_before'] * 100:.2f} -> {v['med_after'] * 100:.2f} cm | "
+                      f"max correction {tmax * 100:.1f} cm | bounded={v['bounded']} "
+                      f"improves={v['improves']} -> {'APPLY' if ok else 'IDENTITY'}")
+                report[str(k)] = {"verdict": "APPLY" if ok else "SKIP",
+                                  "held_before_cm": v["med_before"] * 100,
+                                  "held_after_cm": v["med_after"] * 100,
+                                  "max_correction_cm": tmax * 100,
+                                  "bounded": bool(v["bounded"]),
+                                  "improves": bool(v["improves"]),
+                                  "n_fit": len(taus), "n_held": len(held)}
+                if ok:
+                    fields[k] = fld
+            xi = blend_chunk_fields(self.chunk_indices, fields, N)
+            n_ok = len(fields)
+            print(f"[intra-chunk] {n_ok}/{len(self.chunk_indices)} chunk field(s) "
+                  f"earned; blended max correction "
+                  f"{float(np.max(np.linalg.norm(xi[:, 3:], axis=1))) * 100:.1f} cm")
             with open(ic_path, "w") as f_:
                 _json.dump({"chunk_indices": [list(ci) for ci in self.chunk_indices],
-                            "xi": xi.tolist(), "verdict": verdict,
-                            "rounds": rounds,
-                            "dc_chain_cm": {f"{a}-{b}": float(np.linalg.norm(
-                                np.asarray(t, np.float64).reshape(6)[3:])) * 100
-                                for (a, b), t in dc0.items()},
-                            "held_base_cm": g_base * 100,
-                            "held_dc_cm": g_dc * 100,
-                            "held_total_cm": g_tot * 100,
-                            "dc_ok": bool(dc_ok), "warp_ok": bool(warp_ok),
-                            "seams_base_cm": {f"{a}-{b}": m * 100
-                                              for (a, b), m in s_base.items()},
-                            "seams_final_cm": {f"{a}-{b}": m * 100
-                                               for (a, b), m in
-                                               _held_stats(xi)[1].items()}},
-                           f_, indent=1)
+                            "xi": xi.tolist(), "chunks": report}, f_, indent=1)
 
         X = se3_matrices(xi)
         # compose into the elastic per-frame fields FIRST: poses, depth graph,
