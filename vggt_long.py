@@ -911,6 +911,161 @@ class VGGT_Long:
             M = ecorr[k][local] @ M
         return M
 
+    def _stac_intra_chunk(self):
+        """STAC patch: INTRA-CHUNK per-frame consensus — bounded fields with
+        anchored boundaries.
+
+        The residual warp lives BETWEEN frames of the same chunk (test4: the
+        same ground reconstructed ~7-9 cm apart by frames a few indices apart
+        — the depth-graph ladder proved it is a POSE error). The failed global
+        pose graph taught the constraint this stage is built on: short-span
+        evidence must never produce corrections longer than its span. Here
+        every chunk is solved ALONE, its endpoint frames CLAMPED to zero (the
+        seam consensus the elastic already established), so no correction
+        longer than one chunk can exist; per-chunk held-out pairs gate each
+        field independently — a chunk that does not earn its correction stays
+        identity, alone. Shared frames get ONE blended correction (fields are
+        zero at chunk edges → the blend is continuous and both copies stay
+        coincident). Points and pose move together: depth/TSDF invariant.
+        Resume-safe via intra_chunk.json + per-npy stamp."""
+        if not self.config['Model'].get('intra_chunk') or len(self.chunk_indices) < 1:
+            return
+        import json as _json
+        from loop_utils.metric_lock import (surface_pair_correspondences,
+                                            robust_rigid, filter_pair_fits,
+                                            solve_chunk_field, blend_chunk_fields,
+                                            chunk_field_verdict, se3_matrices)
+        _sick = getattr(self, '_stac_sick_chunks', set())
+        N = len(self.img_list)
+
+        ic_path = os.path.join(self.output_dir, "intra_chunk.json")
+        xi = None
+        if os.path.exists(ic_path):
+            try:
+                prev = _json.load(open(ic_path))
+                if prev.get("chunk_indices") == [list(ci) for ci in self.chunk_indices]:
+                    xi = np.asarray(prev["xi"], np.float64)
+                    print("[intra-chunk] resume: solution loaded from intra_chunk.json")
+            except Exception as _e:
+                print(f"[intra-chunk] intra_chunk.json unreadable ({_e}) — remeasuring")
+
+        if xi is None:
+            fit_offsets = (1, 2, 3, 5, 8, 12)
+            holdout_offsets = (4, 10)
+            fields, report = {}, {}
+            for k, (start, end) in enumerate(self.chunk_indices):
+                S = end - start
+                if k in _sick or S < 8:
+                    report[str(k)] = {"verdict": "SKIP", "reason": "sick or tiny"}
+                    continue
+                data = np.load(os.path.join(self.result_aligned_dir, f"chunk_{k}.npy"),
+                               allow_pickle=True).item()
+                if data.get('_stac_intra_applied'):
+                    raise RuntimeError(
+                        f"[intra-chunk] chunk {k} already corrected but intra_chunk.json "
+                        f"is missing/stale — remeasuring on corrected data would be "
+                        f"wrong. Delete _tmp_results_aligned + pcd and re-run.")
+                wp = np.asarray(data['world_points'])
+                if wp.ndim == 5:
+                    wp = wp[0]
+                cf = np.asarray(data['world_points_conf']).reshape(wp.shape[:3])
+                ext = np.asarray(data['extrinsic'])
+                K = np.asarray(data['intrinsic'])
+                cache = {}
+                for local in range(S):
+                    c2w = self._stac_aligned_pose(k, local, ext[local])
+                    cache[local] = (wp[local].astype(np.float32),
+                                    cf[local].astype(np.float32),
+                                    np.linalg.inv(c2w), K[local])
+                del data
+                fits, held = [], []
+                for f in range(S):
+                    for d in fit_offsets + holdout_offsets:
+                        g = f + d
+                        if g >= S:
+                            continue
+                        pq = surface_pair_correspondences(
+                            cache[f][0], cache[f][1],
+                            cache[g][0], cache[g][1], cache[g][2], cache[g][3])
+                        if pq is None:
+                            continue
+                        if d in holdout_offsets:
+                            held.append((f, g, pq[0][:2000], pq[1][:2000]))
+                            continue
+                        fit = robust_rigid(pq[0], pq[1], sample=8000)
+                        if fit is not None:
+                            fits.append((f, g, fit[0], fit[1], fit[2], fit[3]))
+                del cache
+                taus = filter_pair_fits(fits)
+                if len(taus) < S or len(held) < S // 4:
+                    report[str(k)] = {"verdict": "SKIP",
+                                      "reason": f"thin ({len(taus)} fit/{len(held)} held)"}
+                    print(f"[intra-chunk] chunk {k}: too thin "
+                          f"({len(taus)} fit / {len(held)} held) — identity")
+                    continue
+                fld = solve_chunk_field(taus, S)
+                v = chunk_field_verdict(fld, taus, held)
+                ok = v["bounded"] and v["improves"]
+                tmax = float(np.max(np.linalg.norm(fld[:, 3:], axis=1)))
+                print(f"[intra-chunk] chunk {k}: held-out "
+                      f"{v['med_before'] * 100:.2f} -> {v['med_after'] * 100:.2f} cm | "
+                      f"max correction {tmax * 100:.1f} cm | bounded={v['bounded']} "
+                      f"improves={v['improves']} -> {'APPLY' if ok else 'IDENTITY'}")
+                report[str(k)] = {"verdict": "APPLY" if ok else "SKIP",
+                                  "held_before_cm": v["med_before"] * 100,
+                                  "held_after_cm": v["med_after"] * 100,
+                                  "max_correction_cm": tmax * 100,
+                                  "bounded": bool(v["bounded"]),
+                                  "improves": bool(v["improves"]),
+                                  "n_fit": len(taus), "n_held": len(held)}
+                if ok:
+                    fields[k] = fld
+            xi = blend_chunk_fields(self.chunk_indices, fields, N)
+            n_ok = len(fields)
+            print(f"[intra-chunk] {n_ok}/{len(self.chunk_indices)} chunk field(s) "
+                  f"earned; blended max correction "
+                  f"{float(np.max(np.linalg.norm(xi[:, 3:], axis=1))) * 100:.1f} cm")
+            with open(ic_path, "w") as f_:
+                _json.dump({"chunk_indices": [list(ci) for ci in self.chunk_indices],
+                            "xi": xi.tolist(), "chunks": report}, f_, indent=1)
+
+        X = se3_matrices(xi)
+        # compose into the elastic per-frame fields FIRST: poses, depth graph,
+        # depth cap and the origins writer all read _stac_elastic_corr
+        ecorr = getattr(self, '_stac_elastic_corr', None)
+        if ecorr is None:
+            ecorr = {k: np.tile(np.eye(4), (end - start, 1, 1))
+                     for k, (start, end) in enumerate(self.chunk_indices)}
+            self._stac_elastic_corr = ecorr
+        for k, (start, end) in enumerate(self.chunk_indices):
+            for local, g in enumerate(range(start, end)):
+                ecorr[k][local] = X[g] @ ecorr[k][local]
+        # apply to points — BOTH copies of every shared frame get the same
+        # rigid move, so the elastic seam consensus is preserved exactly
+        for k, (start, end) in enumerate(self.chunk_indices):
+            path = os.path.join(self.result_aligned_dir, f"chunk_{k}.npy")
+            data = np.load(path, allow_pickle=True).item()
+            if data.get('_stac_intra_applied'):
+                print(f"[intra-chunk] chunk {k}: already corrected — skipped")
+                continue
+            wp = np.asarray(data['world_points'])
+            lead = wp.ndim == 5
+            if lead:
+                wp = wp[0]
+            moved = 0
+            for local, g in enumerate(range(start, end)):
+                M = X[g]
+                if np.allclose(M, np.eye(4), atol=1e-12):
+                    continue
+                p = wp[local].reshape(-1, 3).astype(np.float64)
+                wp[local] = (p @ M[:3, :3].T + M[:3, 3]).reshape(wp[local].shape).astype(wp.dtype)
+                moved += 1
+            data['world_points'] = wp[None] if lead else wp
+            data['_stac_intra_applied'] = True
+            np.save(path, data)
+            if moved:
+                print(f"[intra-chunk] chunk {k}: {moved}/{end - start} frames moved")
+
     def _stac_depth_graph(self):
         """STAC patch: per-frame DEPTH GRAPH — kills the depth duplication.
 
@@ -1646,6 +1801,7 @@ class VGGT_Long:
         # agree on the depth of shared surfaces), then the deferred PLY/origins
         # from the FINAL geometry. save_camera_poses applies the elastic pose moves.
         self._stac_elastic_seams()
+        self._stac_intra_chunk()
         self._stac_depth_graph()
         self._stac_blend_copies()
         if _elastic:

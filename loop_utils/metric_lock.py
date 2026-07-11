@@ -844,3 +844,195 @@ def frame_owner(chunk_indices, n_frames):
                     best, bd = k, d
         owner[g] = best
     return owner
+
+
+# ── INTRA-CHUNK per-frame consensus (bounded fields, anchored boundaries) ──
+# History (test4, 2026-07-10): a GLOBAL per-frame pose graph with free
+# boundaries hallucinated wavelengths longer than its pair span (163 cm bend,
+# chimney 7→130 cm) — short-span evidence cannot certify long corrections.
+# This design inverts it: each chunk is solved ALONE with its endpoints
+# CLAMPED to zero (the seam consensus the elastic already established), so no
+# correction longer than one chunk can exist, and per-chunk self-gates keep
+# the worst case at identity for that chunk only.
+
+
+def surface_pair_correspondences(wp_src, conf_src, wp_dst, conf_dst, w2c_dst, K_dst,
+                                 max_samples=8000, seed=0):
+    """EXACT-surface 3D correspondences between two frames: project src's valid
+    points into dst's camera and pair them with dst's OWN 3D point at the hit
+    pixel. Returns (p_src[n,3], q_dst[n,3]) or None when starved — the rigid
+    analogue of depth_pair_samples (same association, full 3D instead of z)."""
+    H, W = wp_dst.shape[:2]
+    p = np.asarray(wp_src, np.float64).reshape(-1, 3)
+    c = np.asarray(conf_src, np.float32).reshape(-1)
+    idx = np.flatnonzero(c > 1e-5)
+    if len(idx) < 500:
+        return None
+    if len(idx) > max_samples:
+        idx = np.random.default_rng(seed).choice(idx, max_samples, replace=False)
+    p = p[idx]
+    w2c = np.asarray(w2c_dst, np.float64)
+    X = p @ w2c[:3, :3].T + w2c[:3, 3]
+    z = X[:, 2]
+    m = z > 0.3
+    if m.sum() < 300:
+        return None
+    fx, fy, cx, cy = float(K_dst[0, 0]), float(K_dst[1, 1]), float(K_dst[0, 2]), float(K_dst[1, 2])
+    u = np.round(X[m, 0] / z[m] * fx + cx).astype(int)
+    v = np.round(X[m, 1] / z[m] * fy + cy).astype(int)
+    inb = (u >= 0) & (u < W) & (v >= 0) & (v < H)
+    if inb.sum() < 300:
+        return None
+    u, v, p_in = u[inb], v[inb], p[m][inb]
+    q = np.asarray(wp_dst, np.float64)[v, u]
+    cq = np.asarray(conf_dst, np.float32).reshape(H, W)[v, u]
+    good = cq > 1e-5
+    if good.sum() < 300:
+        return None
+    return p_in[good], q[good]
+
+
+def se3_matrices(xi):
+    """(N,6) se(3) vectors (rotvec, t) → (N,4,4) rigid matrices."""
+    xi = np.asarray(xi, np.float64).reshape(-1, 6)
+    out = np.tile(np.eye(4), (len(xi), 1, 1))
+    for i, x in enumerate(xi):
+        R, _ = cv2.Rodrigues(x[:3].copy())
+        out[i, :3, :3] = R
+        out[i, :3, 3] = x[3:]
+    return out
+
+
+def filter_pair_fits(fits, min_points=800, res_factor=3.0):
+    """Pair-fit hygiene: drop occlusion-contaminated fits — residual beyond
+    ``res_factor``× the SESSION's own median residual, or too few inliers —
+    and weight the survivors by inverse residual (session-derived, nothing
+    absolute). fits: [(f, g, R, t, res_m, n_used)]. Returns
+    [(f, g, tau[6], w)] ready for the solver."""
+    good = [(f, g, R, t, res, n) for f, g, R, t, res, n in fits
+            if n >= int(min_points) and np.isfinite(res)]
+    if not good:
+        return []
+    med = max(float(np.median([res for *_, res, _n in good])), 1e-4)
+    out = []
+    for f, g, R, t, res, n in good:
+        if res > res_factor * med:
+            continue
+        rvec, _ = cv2.Rodrigues(np.asarray(R, np.float64))
+        tau = np.concatenate([rvec.ravel(), np.asarray(t, np.float64).reshape(3)])
+        out.append((f, g, tau, med / max(res, 0.25 * med)))
+    return out
+
+
+def solve_chunk_field(pair_taus, S, smooth_w=0.5, prior_w=0.3):
+    """Per-frame rigid corrections for ONE chunk, endpoints CLAMPED to zero.
+
+    Constraints (local frame indices, 0..S-1):
+
+        xi_f - xi_g = tau_fg     (within-chunk exact-surface pair residuals)
+        xi_{f+1} - xi_f = 0      (smoothness, weight smooth_w)
+        xi_f = 0                 (zero-prior, weight prior_w — damping)
+        xi_0 = xi_{S-1} = 0      (HARD: solved-out, not weighted — no field
+                                  longer than the chunk can exist)
+
+    Six independent scalar problems, one lstsq. Returns xi (S,6); zeros when
+    starved."""
+    xi = np.zeros((S, 6))
+    taus = [(int(f), int(g), np.asarray(t, np.float64).reshape(6), float(w))
+            for f, g, t, w in (pair_taus or [])
+            if 0 <= f < S and 0 <= g < S and np.all(np.isfinite(t))]
+    if not taus or S < 3:
+        return xi
+    free = list(range(1, S - 1))               # endpoints clamped out
+    col = {f: i for i, f in enumerate(free)}
+    n = len(free)
+    rows, rhs = [], []
+    for f, g, t, w in taus:
+        r = np.zeros(n)
+        if f in col:
+            r[col[f]] += w
+        if g in col:
+            r[col[g]] -= w
+        if not r.any():
+            continue
+        rows.append(r)
+        rhs.append(w * t)
+    for i in range(S - 1):                     # smoothness incl. clamped ends
+        r = np.zeros(n)
+        if i in col:
+            r[col[i]] -= smooth_w
+        if i + 1 in col:
+            r[col[i + 1]] += smooth_w
+        if r.any():
+            rows.append(r)
+            rhs.append(np.zeros(6))
+    for i in free:                             # zero-prior damping
+        r = np.zeros(n)
+        r[col[i]] = prior_w
+        rows.append(r)
+        rhs.append(np.zeros(6))
+    if not rows:
+        return xi
+    x, *_ = np.linalg.lstsq(np.asarray(rows), np.asarray(rhs), rcond=None)
+    for f, i in col.items():
+        xi[f] = x[i]
+    return xi
+
+
+def blend_chunk_fields(chunk_indices, fields, n_frames):
+    """Per-GLOBAL-frame field from the per-chunk solutions: where two chunks
+    share a frame their fields are blended with the elastic's triangular
+    weights (1 at a chunk's own centre → 0 at its edges). Every chunk field is
+    zero at its endpoints, so the blend is continuous and both copies of every
+    shared frame receive ONE identical correction — the seam consensus is
+    preserved exactly. Returns xi (n_frames, 6)."""
+    num = np.zeros((n_frames, 6))
+    den = np.zeros(n_frames)
+    for k, (start, end) in enumerate(chunk_indices):
+        S = end - start
+        fld = np.asarray(fields.get(k)) if fields.get(k) is not None else None
+        if fld is None or S < 2:
+            continue
+        w = 1.0 - np.abs(np.linspace(-1.0, 1.0, S))
+        w = np.maximum(w, 1e-6)
+        for local in range(S):
+            g = start + local
+            num[g] += w[local] * fld[local]
+            den[g] += w[local]
+    out = np.zeros((n_frames, 6))
+    m = den > 0
+    out[m] = num[m] / den[m, None]
+    return out
+
+
+def chunk_field_verdict(xi, pair_taus, held, improve=0.8, bound=5.0):
+    """Per-chunk self-gate (the family discipline): held-out within-chunk pairs
+    judge, corrections bounded by 5× the P90 pair magnitude — a smooth bump's
+    pointwise correction legitimately exceeds the MEDIAN pairwise difference,
+    while p99 proved inflatable by occlusion outliers (run 4); p90 sits
+    between, and filter_pair_fits has already capped the tail.
+    held: [(f, g, p[n,3], q[n,3])] with LOCAL indices. Returns dict
+    bounded/improves/med_before/med_after."""
+    xi = np.asarray(xi, np.float64)
+    X = se3_matrices(xi)
+    before, after = [], []
+    for f, g, p, q in held:
+        p = np.asarray(p, np.float64)
+        q = np.asarray(q, np.float64)
+        before.append(float(np.median(np.linalg.norm(p - q, axis=1))))
+        p2 = p @ X[f][:3, :3].T + X[f][:3, 3]
+        q2 = q @ X[g][:3, :3].T + X[g][:3, 3]
+        after.append(float(np.median(np.linalg.norm(p2 - q2, axis=1))))
+    med_b, med_a = float(np.median(before)), float(np.median(after))
+    t_pair = [float(np.linalg.norm(np.asarray(t, np.float64).reshape(6)[3:]))
+              for _, _, t, _ in pair_taus]
+    r_pair = [float(np.linalg.norm(np.asarray(t, np.float64).reshape(6)[:3]))
+              for _, _, t, _ in pair_taus]
+    t_sig = max(float(np.percentile(t_pair, 90)), 1e-3)
+    r_sig = max(float(np.percentile(r_pair, 90)), 1e-4)
+    bounded = (float(np.max(np.linalg.norm(xi[:, 3:], axis=1))) <= bound * t_sig
+               and float(np.max(np.linalg.norm(xi[:, :3], axis=1))) <= bound * r_sig)
+    improves = med_a <= improve * med_b
+    return {"bounded": bounded, "improves": improves,
+            "med_before": med_b, "med_after": med_a,
+            "t_sig": t_sig, "r_sig": r_sig}
