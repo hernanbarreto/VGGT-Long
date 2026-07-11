@@ -517,6 +517,7 @@ class VGGT_Long:
                 apply_scale_drift(data, drift_frames[k])
             else:
                 apply_scale(data, s)
+            self._stac_hybrid_da3(data, k, anchor_dir, near_frac)
             np.save(path, data)
         # 2) loop-bridge predictions (in memory) — they are Omega passes with their own
         # arbitrary scale; the SE(3) loop legs need them metric too. Anchors inside the
@@ -650,19 +651,36 @@ class VGGT_Long:
         if (not self.config['Model'].get('frame_ownership')
                 or self.chunk_indices is None or len(self.chunk_indices) <= 1):
             return confs
-        from loop_utils.metric_lock import frame_owner
+        from loop_utils.metric_lock import frame_owner, backfill_mask
         owner = frame_owner(self.chunk_indices, len(self.img_list))
         start, end = self.chunk_indices[chunk_idx]
         S = end - start
         cf = np.asarray(confs).reshape(S, -1).copy()
-        kept = 0
+        bfstore = getattr(self, '_stac_backfill', None) or {}
+        kept, bf_frames, bf_px = 0, 0, 0
         for local in range(S):
             if owner[start + local] != chunk_idx:
-                cf[local] = 0.0
+                entry = bfstore.get((chunk_idx, local))
+                if entry is not None:
+                    # BACKFILL: keep exactly the pixels the owner will NOT write
+                    oc, othr = entry
+                    m = (backfill_mask(oc, othr) if oc is not None
+                         else np.ones(cf[local].shape, bool))
+                    cf[local] = np.where(m, cf[local], 0.0)
+                    n = int((cf[local] > 1e-5).sum())
+                    if n:
+                        bf_frames += 1
+                        bf_px += n
+                else:
+                    cf[local] = 0.0
             else:
                 kept += 1
-        print(f"[frame-owner] chunk {chunk_idx}: writes {kept}/{S} frames "
-              f"(the rest belong to neighbours)")
+        msg = (f"[frame-owner] chunk {chunk_idx}: writes {kept}/{S} frames "
+               f"(the rest belong to neighbours)")
+        if bf_px:
+            msg += (f" + backfills {bf_px:,} owner-dropped px over "
+                    f"{bf_frames} shared frame(s)")
+        print(msg)
         return cf.reshape(-1)
 
     def _stac_write_origins(self, chunk_data, K, conf_threshold=None, confs_override=None):
@@ -732,7 +750,11 @@ class VGGT_Long:
             if n_drop:
                 print(f"[depth-cap] chunk {K}: {n_drop:,} contradicted far points "
                       f"dropped (displaced duplicates of near-observed surfaces)")
-        thr = self._stac_conf_threshold(confs)
+        # frozen threshold (backfill prepare pass) keeps the owner-writes
+        # prediction exact; without backfill the live computation is unchanged
+        thr = getattr(self, '_stac_write_thr', {}).get(K)
+        if thr is None:
+            thr = self._stac_conf_threshold(confs)
         save_confident_pointcloud_batch(
             points=points,
             colors=colors,
@@ -851,6 +873,18 @@ class VGGT_Long:
             fits, report = self._stac_elastic_fit_seams()
             with open(seams_path, "w") as f:
                 _json.dump(report, f, indent=1)
+
+        # tame the raw fits: along-trajectory smoothing + translation cap (both
+        # sides consume the same smoothed fit, so copy coincidence is preserved)
+        _win = int(self.config['Model'].get('elastic_smooth_win', 5) or 1)
+        _cap = self.config['Model'].get('elastic_max_t_m', 0.30)
+        _cap = float(_cap) if _cap else None
+        if _win > 1 or _cap:
+            from loop_utils.metric_lock import smooth_seam_fits
+            fits, _ncap = smooth_seam_fits(fits, window=_win, max_t=_cap)
+            print(f"[elastic] fits tamed: smoothing window {_win} frames along the "
+                  f"trajectory, |t| cap {(_cap or 0) * 100:.0f} cm "
+                  f"({_ncap} frame fit(s) capped)")
 
         # apply: every chunk gets its per-frame field. Both sides of every seam land
         # on the SAME consensus, so the fused cloud (one writer per frame) is
@@ -1429,6 +1463,130 @@ class VGGT_Long:
                   f"far coverage → KEPT")
         return masks
 
+    def _stac_hybrid_da3(self, data, k, anchor_dir, near_frac):
+        """HYBRID WRITE driver for one metric-scaled chunk (in place, BEFORE the
+        Sim3 chain and every consensus stage, while world_points ↔ depth ↔
+        extrinsic are still one coherent chunk-local system): each frame with an
+        isolated DA3 depth map adopts DA3's depth SHAPE at omega's scale and
+        pose (loop_utils.metric_lock.hybrid_substitute). Downstream stages
+        (exact seams, elastic, depth graph, writers) then consume the straighter
+        geometry with zero pose bookkeeping. Frames without a DA3 map keep omega
+        (log the count — the server extracts DA3 for every keyframe when
+        Model.hybrid_da3 is on)."""
+        if not self.config['Model'].get('hybrid_da3'):
+            return
+        from loop_utils.metric_lock import (anchor_ratio, hybrid_substitute,
+                                            real_frame_number)
+        far_m = self.config['Model'].get('hybrid_da3_far_m', 15.0)
+        far_m = float(far_m) if far_m else None
+        start, end = self.chunk_indices[k]
+        wp = np.asarray(data['world_points'])
+        lead = wp.ndim == 5
+        if lead:
+            wp = wp[0]
+        S = wp.shape[0]
+        depth = np.asarray(data['depth'])
+        dlead = depth.ndim == 4 and depth.shape[0] == 1
+        if dlead:
+            depth = depth[0]
+        conf = np.asarray(data['world_points_conf'])
+        ext = np.asarray(data['extrinsic'])
+        if ext.ndim == 4:
+            ext = ext[0]
+        n_sub_frames, n_missing, n_starved, px_total, deltas = 0, 0, 0, 0, []
+        for local in range(S):
+            num = real_frame_number(self.img_list[start + local])
+            npz_path = os.path.join(str(anchor_dir), f"frame_{int(num)}.npz")
+            if not os.path.exists(npz_path):
+                n_missing += 1
+                continue
+            z = np.load(npz_path)
+            if "depth" not in z:
+                n_missing += 1
+                continue
+            r = anchor_ratio(depth[local], z["depth"], conf=conf[local],
+                             near_frac=near_frac)
+            if r is None or not np.isfinite(r) or r <= 0:
+                n_starved += 1
+                continue
+            wp_new, d_new, n_px, med = hybrid_substitute(
+                wp[local], conf[local], depth[local], ext[local],
+                z["depth"], r, far_m=far_m)
+            if n_px == 0:
+                n_starved += 1
+                continue
+            wp[local] = wp_new
+            depth[local] = d_new
+            n_sub_frames += 1
+            px_total += n_px
+            deltas.append(med)
+        data['world_points'] = wp[None] if lead else wp
+        data['depth'] = depth[None] if dlead else depth
+        med_all = float(np.median(deltas)) * 100 if deltas else 0.0
+        print(f"[hybrid-da3] chunk {k}: {n_sub_frames}/{S} frames re-shaped on DA3 "
+              f"depth at omega scale/pose ({px_total:,} px, median shape "
+              f"correction {med_all:.1f}%)"
+              + (f"; {n_missing} frame(s) without DA3 map" if n_missing else "")
+              + (f"; {n_starved} starved/gated" if n_starved else ""))
+
+    def _stac_prepare_backfill(self):
+        """One sequential pass over the aligned chunks BEFORE any output is
+        written: freeze every chunk's write threshold on its OWNED confidences,
+        and for every shared frame stash the OWNER copy's confidences so the
+        non-owner can backfill exactly the pixels the owner will drop
+        (loop_utils.metric_lock.backfill_mask). Frozen thresholds make the
+        owner-writes prediction exact: owner-writes and backfill stay disjoint,
+        so no pixel enters the cloud twice. A sick owner writes nothing → its
+        healthy neighbour may backfill everything valid."""
+        self._stac_write_thr = {}
+        self._stac_backfill = {}
+        if (not self.config['Model'].get('ownership_backfill')
+                or not self.config['Model'].get('frame_ownership')
+                or self.chunk_indices is None or len(self.chunk_indices) <= 1):
+            return
+        from loop_utils.metric_lock import frame_owner
+        owner = frame_owner(self.chunk_indices, len(self.img_list))
+        sick = getattr(self, '_stac_sick_chunks', set())
+        prev_tail = None       # (k-1, {g: conf_row}) for the shared frames
+        for k, (start, end) in enumerate(self.chunk_indices):
+            path = os.path.join(self.result_aligned_dir, f"chunk_{k}.npy")
+            if not os.path.exists(path):
+                print(f"[frame-owner] backfill: chunk_{k}.npy missing — backfill "
+                      f"disabled this run (plain ownership)")
+                self._stac_write_thr, self._stac_backfill = {}, {}
+                return
+            data = np.load(path, allow_pickle=True).item()
+            S = end - start
+            cf = np.asarray(data['world_points_conf']).reshape(S, -1).astype(np.float32)
+            del data
+            owned_rows = [l for l in range(S) if owner[start + l] == k]
+            self._stac_write_thr[k] = (
+                None if k in sick or not owned_rows
+                else self._stac_conf_threshold(cf[owned_rows].reshape(-1)))
+            if prev_tail is not None and prev_tail[0] == k - 1:
+                j = k - 1
+                s_j, e_j = self.chunk_indices[j]
+                for g in range(start, min(e_j, end)):
+                    if owner[g] == j and j not in sick:
+                        # k is the non-owner: it backfills what j drops
+                        self._stac_backfill[(k, g - start)] = (
+                            prev_tail[1][g], self._stac_write_thr[j])
+                    elif owner[g] == j and j in sick:
+                        self._stac_backfill[(k, g - start)] = (None, None)
+                    elif owner[g] == k:
+                        # j is the non-owner (thr_k already frozen above)
+                        self._stac_backfill[(j, g - s_j)] = (
+                            cf[g - start].copy(),
+                            None if k in sick else self._stac_write_thr[k])
+            if k + 1 < len(self.chunk_indices):
+                nxt0 = self.chunk_indices[k + 1][0]
+                prev_tail = (k, {g: cf[g - start].copy()
+                                 for g in range(max(nxt0, start), end)})
+            else:
+                prev_tail = None
+        print(f"[frame-owner] backfill armed: {len(self._stac_backfill)} shared "
+              f"frame(s) may recover owner-dropped pixels (frozen thresholds)")
+
     def _stac_write_deferred_outputs(self):
         """PLY + origins for every chunk, AFTER all geometric stages (elastic seam
         consensus, depth graph, two-copy blend) have finished mutating the aligned
@@ -1437,6 +1595,7 @@ class VGGT_Long:
         existing outputs are kept."""
         self._stac_max_write_depth = self._stac_write_depth_cap()
         self._stac_far_drop = self._stac_far_contradictions()
+        self._stac_prepare_backfill()
         for k in range(len(self.chunk_indices)):
             if (os.path.exists(os.path.join(self.pcd_dir, f"{k}_pcd.ply"))
                     and os.path.exists(os.path.join(self.pcd_dir, f"{k}_origins.npz"))):

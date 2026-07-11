@@ -384,6 +384,119 @@ def rigid_mat(R, t):
     return M
 
 
+def hybrid_substitute(wp_frame, conf_frame, depth_frame, c2w, da3_depth,
+                      ratio, far_m=None, max_shape_delta=0.35):
+    """HYBRID WRITE (best of both worlds): adopt DA3's per-pixel depth SHAPE for
+    one frame while keeping omega's SCALE and POSE.
+
+    Omega's feed-forward output serpentines straight surfaces (per-frame depth/
+    pose noise, no BA); isolated DA3 depth is locally straight but its absolute
+    per-frame metric scale jitters. So: ``ratio`` = median(da3/omega) of this
+    frame (anchor_ratio) — dividing DA3 by it pins the frame's median depth to
+    omega's, leaving ONLY the relative shape correction. Every surviving point
+    moves along its own camera ray:
+
+        z_new = da3 / ratio
+        P'    = C + (P - C) * (z_new / z_omega)
+
+    Pixels keep omega when: invalid in either map, omega says the surface is
+    beyond ``far_m`` (isolated DA3 degrades at range), or the shape correction
+    exceeds ``max_shape_delta`` relative (occlusion mismatch / moving object /
+    DA3 gross error — an unearned correction is a warp, not a fix).
+
+    Returns (wp_new, depth_new, n_substituted, median_abs_shape_delta)."""
+    wp = np.asarray(wp_frame, np.float64)
+    H, W = wp.shape[:2]
+    zo = np.asarray(depth_frame, np.float32).reshape(H, W)
+    da = np.asarray(da3_depth, np.float32).squeeze()
+    if da.shape != (H, W):
+        da = cv2.resize(da, (W, H), interpolation=cv2.INTER_LINEAR)
+    cf = np.asarray(conf_frame, np.float32).reshape(H, W)
+    zn = da / float(ratio)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        factor = zn / zo
+    ok = (np.isfinite(factor) & (zo > 1e-6) & (zn > 1e-6) & (cf > 1e-5)
+          & (np.abs(factor - 1.0) <= float(max_shape_delta)))
+    if far_m:
+        ok &= zo <= float(far_m)
+    if not ok.any():
+        return np.asarray(wp_frame), np.asarray(depth_frame), 0, 0.0
+    C = np.asarray(c2w, np.float64)[:3, 3]
+    wp_new = wp.copy()
+    f3 = factor[..., None]
+    wp_new[ok] = C + (wp[ok] - C) * f3[ok]
+    z_out = zo.copy()
+    z_out[ok] = zn[ok]
+    med = float(np.median(np.abs(factor[ok] - 1.0)))
+    return (wp_new.astype(np.asarray(wp_frame).dtype),
+            z_out.reshape(np.asarray(depth_frame).shape).astype(
+                np.asarray(depth_frame).dtype),
+            int(ok.sum()), med)
+
+
+def backfill_mask(conf_owner, thr_owner):
+    """OWNERSHIP BACKFILL: pixels of a shared frame that the OWNER chunk will NOT
+    write — below its frozen write threshold, or invalid (sky/masked). The
+    non-owner copy may write exactly these pixels: the overlap redundancy that
+    frame ownership discarded pays for HOLES instead of re-creating duplicates
+    (a pixel is never written twice: owner-writes and backfill are complements
+    by construction). ``thr_owner=None`` means the owner writes nothing at all
+    (sick chunk) — everything may be backfilled."""
+    c = np.asarray(conf_owner, np.float32).reshape(-1)
+    if thr_owner is None:
+        return np.ones(c.shape, bool)
+    return ~((c >= max(float(thr_owner), 0.0)) & (c > 1e-5))
+
+
+def smooth_seam_fits(seam_fits, window=5, max_t=None):
+    """Tame the per-frame elastic seam fits BEFORE they become corrections.
+
+    Two measured pathologies of the raw fits (test4 2026-07-11): (1) adjacent
+    shared frames get INDEPENDENT rigid fits with no along-trajectory coherence,
+    so a continuous surface receives uncorrelated moves frame to frame; (2) a
+    degenerate frame pair can fit a huge transform to close a small disagreement
+    (seam 7->8: |t| median 63 cm, max 159 cm, to close an 8 cm gap).
+
+    (1) moving-average smoothing over the fitted frames of each seam, in
+        rotation-vector + translation space (seam residuals are small-angle, so
+        averaging Rodrigues vectors is exact enough and dependency-free);
+    (2) per-frame translation cap: a smoothed fit whose |t| still exceeds
+        ``max_t`` is scaled DOWN as a whole twist (rigid_fraction), preserving
+        the direction of the correction but bounding its authority — beyond the
+        cap it is an upstream pose problem this stage must not fake away.
+
+    Both sides of a seam consume the SAME smoothed fit, so the two-copy
+    coincidence property of elastic_corrections is preserved exactly.
+
+    Returns (new_fits, n_capped)."""
+    if window <= 1 and not max_t:
+        return seam_fits, 0
+    out, n_capped = {}, 0
+    half = max(int(window), 1) // 2
+    for j, d in seam_fits.items():
+        gs = sorted(d.keys())
+        rvecs, ts = {}, {}
+        for g in gs:
+            R_, t_ = d[g]
+            rv, _ = cv2.Rodrigues(np.asarray(R_, np.float64))
+            rvecs[g] = rv.reshape(3)
+            ts[g] = np.asarray(t_, np.float64).reshape(3)
+        sd = {}
+        for i, g in enumerate(gs):
+            nb = gs[max(0, i - half):i + half + 1]
+            rv = np.mean([rvecs[gg] for gg in nb], axis=0)
+            t = np.mean([ts[gg] for gg in nb], axis=0)
+            R_, _ = cv2.Rodrigues(rv)
+            tn = float(np.linalg.norm(t))
+            if max_t and tn > float(max_t):
+                M = rigid_fraction(R_, t, float(max_t) / tn)
+                R_, t = M[:3, :3], M[:3, 3]
+                n_capped += 1
+            sd[g] = (R_, t)
+        out[j] = sd
+    return out, n_capped
+
+
 def elastic_corrections(chunk_indices, k, seam_fits, sick=None, suspect=None):
     """Per-frame ELASTIC seam corrections for chunk k: [S, 4, 4] world-space rigid
     moves, one per local frame (identity where nothing constrains the frame).
