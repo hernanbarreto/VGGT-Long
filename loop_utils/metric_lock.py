@@ -1034,7 +1034,8 @@ def chunk_field_verdict(xi, pair_taus, held, improve=0.8, bound=5.0):
 
 
 def iterate_chunk_fields(measure_fn, domains, n_frames,
-                         max_rounds=6, relax=0.7, tol_t=0.01, bound=5.0):
+                         max_rounds=6, relax=0.7, tol_t=0.01, bound=5.0,
+                         xi_init=None):
     """ITERATIVE relaxation of the per-chunk fields (block Gauss-Seidel on the
     coupled problem): correcting one chunk changes what its neighbours see, so
     the neighbours must be re-measured and re-corrected IN RESPONSE, round
@@ -1063,8 +1064,10 @@ def iterate_chunk_fields(measure_fn, domains, n_frames,
     not expressible — the stalled rounds are ROLLED BACK and the iteration
     stops. Stops on max increment < tol_t, stall, or rounds out. Returns
     (xi_total (N,6), rounds: [{round, max_inc_cm, n_pairs, capped,
-    stalled}])."""
-    xi_total = np.zeros((n_frames, 6))
+    stalled}]). ``xi_init``: start from an already-earned base state (e.g.
+    the DC chain correction) — increments accumulate on top of it."""
+    xi_total = (np.array(xi_init, np.float64) if xi_init is not None
+                else np.zeros((n_frames, 6)))
     history = []
     snaps = []
     prev_mx = None
@@ -1111,3 +1114,47 @@ def iterate_chunk_fields(measure_fn, domains, n_frames,
         if mx < float(tol_t):
             break
     return xi_total, history
+
+
+def chain_from_dcs(dc_map, n_domains, domain_lengths=None):
+    """Per-domain rigid corrections from the measured seam DC offsets, chained
+    along the session (run 9 insight: the per-seam DC — the component-wise
+    median of that seam's cross-pair taus — is the CLEAN, rigid part of the
+    remaining drift, 3-27 cm on test4, and no stage was applying it).
+
+    For seam (k, k+1) the constraint is xi_k − xi_{k+1} = dc (pair fits map
+    k's copy onto k+1's copy), so:  c_{k+1} = c_k − dc_{k,k+1}, c_0 = 0,
+    then the weighted mean (weights = domain lengths) is removed — the gauge
+    that redistributes the correction instead of shoving the whole session
+    relative to domain 0. Missing seams contribute identity links.
+    Returns c (n_domains, 6)."""
+    c = np.zeros((n_domains, 6))
+    for k in range(n_domains - 1):
+        dc = dc_map.get((k, k + 1))
+        step = np.asarray(dc, np.float64).reshape(6) if dc is not None else np.zeros(6)
+        c[k + 1] = c[k] - step
+    w = (np.asarray(domain_lengths, np.float64)
+         if domain_lengths is not None else np.ones(n_domains))
+    c -= (c * w[:, None]).sum(0) / max(w.sum(), 1e-9)
+    return c
+
+
+def interp_domain_chain(domains, c, n_frames):
+    """Per-frame field from per-domain chain corrections: linear interpolation
+    between DOMAIN CENTRES (constant before the first and after the last).
+    A hard per-domain step would cut a cliff into a physically continuous
+    walk at every boundary; the ramp spreads each seam DC across the span it
+    actually accumulated over. Returns xi (n_frames, 6)."""
+    c = np.asarray(c, np.float64)
+    centers = [0.5 * (ds + de - 1) for ds, de in domains]
+    xi = np.zeros((n_frames, 6))
+    for g in range(n_frames):
+        if g <= centers[0]:
+            xi[g] = c[0]
+        elif g >= centers[-1]:
+            xi[g] = c[-1]
+        else:
+            j = int(np.searchsorted(centers, g)) - 1
+            a = (g - centers[j]) / max(centers[j + 1] - centers[j], 1e-9)
+            xi[g] = (1.0 - a) * c[j] + a * c[j + 1]
+    return xi
