@@ -651,7 +651,8 @@ class VGGT_Long:
                 or self.chunk_indices is None or len(self.chunk_indices) <= 1):
             return confs
         from loop_utils.metric_lock import frame_owner
-        owner = frame_owner(self.chunk_indices, len(self.img_list))
+        owner = frame_owner(self.chunk_indices, len(self.img_list),
+                            sick=getattr(self, '_stac_sick_chunks', ()))
         start, end = self.chunk_indices[chunk_idx]
         S = end - start
         cf = np.asarray(confs).reshape(S, -1).copy()
@@ -1094,7 +1095,9 @@ class VGGT_Long:
                                             frame_owner)
         _sick = getattr(self, '_stac_sick_chunks', set())
         N = len(self.img_list)
-        owner = frame_owner(self.chunk_indices, N)
+        owner = frame_owner(self.chunk_indices, N, sick=_sick)
+        # only frames with NO healthy coverage remain sick — reassigned overlap
+        # frames now have a healthy owner and participate normally
         sick_frames = {g for g in range(N) if owner[g] in _sick}
 
         dg_path = os.path.join(self.output_dir, "depth_graph.json")
@@ -1377,8 +1380,8 @@ class VGGT_Long:
             return {}
         from loop_utils.metric_lock import frame_owner, classify_far_points
         floor, rate = stats
-        owner = frame_owner(self.chunk_indices, len(self.img_list))
         _sick = getattr(self, '_stac_sick_chunks', set())
+        owner = frame_owner(self.chunk_indices, len(self.img_list), sick=_sick)
         cache = {}          # g -> (wp, conf, depth, w2c, K, cam)
         for k, (start, end) in enumerate(self.chunk_indices):
             if k in _sick:

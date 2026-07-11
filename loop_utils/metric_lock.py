@@ -827,22 +827,33 @@ def flag_suspect_chunks(anchor_iqr, sick=None, spread_cut=0.30):
     return out
 
 
-def frame_owner(chunk_indices, n_frames):
+def frame_owner(chunk_indices, n_frames, sick=()):
     """owner[g] = index of the chunk that WRITES frame g's points to the cloud.
     Every frame is written by exactly ONE chunk (the one whose centre is nearest)
     — overlap frames used to be written by BOTH chunks, putting two displaced
     copies of the same pixels into the cloud (the mechanical half of the
-    duplicated-objects problem)."""
+    duplicated-objects problem).
+
+    `sick`: chunk indices excluded by the health gate. A sick chunk writes
+    nothing, so a frame it would own is REASSIGNED to the nearest healthy chunk
+    that also covers it (its copy is real data, already on the seam consensus) —
+    otherwise the overlap half of a sick chunk's domain becomes a hole that a
+    healthy neighbour could have filled. A frame covered ONLY by sick chunks
+    keeps its sick owner: the writer drops it and the hole stays declared."""
+    sick = frozenset(sick or ())
     owner = np.full(int(n_frames), -1, np.int32)
     centers = [(s0 + e0) / 2.0 for s0, e0 in chunk_indices]
     for g in range(int(n_frames)):
         best, bd = -1, None
+        best_any, bd_any = -1, None
         for k, (s0, e0) in enumerate(chunk_indices):
             if s0 <= g < e0:
                 d = abs(g - centers[k])
-                if bd is None or d < bd:
+                if bd_any is None or d < bd_any:
+                    best_any, bd_any = k, d
+                if k not in sick and (bd is None or d < bd):
                     best, bd = k, d
-        owner[g] = best
+        owner[g] = best if best >= 0 else best_any
     return owner
 
 
