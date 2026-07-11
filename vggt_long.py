@@ -938,9 +938,10 @@ class VGGT_Long:
         import json as _json
         from loop_utils.metric_lock import (surface_pair_correspondences,
                                             robust_rigid, filter_pair_fits,
-                                            solve_chunk_field, blend_chunk_fields,
+                                            solve_chunk_field,
                                             iterate_chunk_fields,
-                                            chunk_field_verdict, se3_matrices)
+                                            chunk_field_verdict, se3_matrices,
+                                            frame_owner)
         _sick = getattr(self, '_stac_sick_chunks', set())
         N = len(self.img_list)
 
@@ -982,19 +983,26 @@ class VGGT_Long:
                                         np.linalg.inv(c2w), K[local])
                 del data
 
-            def _partner(k, local, d):
-                """(k', local') holding global frame start_k+local+d — inside
-                this chunk when possible, else the neighbour's copy."""
-                start, end = self.chunk_indices[k]
-                g = start + local + d
-                if start <= g < end:
-                    return k, g - start
-                for kn in (k + 1, k - 1):
-                    if 0 <= kn < len(self.chunk_indices):
-                        sn, en = self.chunk_indices[kn]
-                        if sn <= g < en:
-                            return kn, g - sn
-                return None
+            # ── DISJOINT ownership domains (run 7/8 lesson: with overlapping
+            # windows the applied field was the blend of two solutions —
+            # applied ≠ solved and the iteration never converged; ownership
+            # ranges tile the session, so applied == solved exactly) ──
+            owner = frame_owner(self.chunk_indices, N)
+            domains = []
+            d_start = 0
+            for g in range(1, N + 1):
+                if g == N or owner[g] != owner[d_start]:
+                    domains.append((d_start, g))
+                    d_start = g
+            dom_of = {}
+            for di, (ds, de) in enumerate(domains):
+                for g in range(ds, de):
+                    dom_of[g] = di
+
+            def _copy_of(g):
+                """(chunk, local) of frame g's OWNER copy."""
+                k = owner[g]
+                return k, g - self.chunk_indices[k][0]
 
             cur_state = {"key": None, "wp": {}, "w2c": {}}
 
@@ -1015,22 +1023,20 @@ class VGGT_Long:
 
             dc_logged = set()
 
-            def _measure(k, xi_total, offsets=fit_offsets, want_points=False):
-                """Chunk k's pairs vs the CURRENT state; cross partners g=-1.
+            def _measure(di, xi_total, offsets=fit_offsets, want_points=False):
+                """Domain di's pairs vs the CURRENT state; cross-domain
+                partners g=-1 (their state fixed this sweep — the coupling of
+                the iteration). Every frame is measured on its OWNER copy.
 
-                Cross pairs carry TWO signals: the intra-chunk warp (what this
-                stage corrects) and the SEAM-LEVEL rigid offset between the
-                chunks (what the clamped fields cannot express — run 7: a
-                26.5 cm seam offset kept the iteration pushing 22 cm/round
-                without converging). The per-seam DC (component-wise median of
-                that seam's taus) is SUBTRACTED before solving: only the
-                expressible residual drives the field; the DC is logged and
-                left to the seam/finereg level where it belongs."""
-                if k in _sick:
-                    return []
-                start, end = self.chunk_indices[k]
-                S = end - start
-                if S < 8:
+                Cross pairs carry TWO signals: the intra warp (what this stage
+                corrects) and the DOMAIN-LEVEL rigid offset (what clamped
+                fields cannot express — run 7: a 26.5 cm seam offset kept the
+                iteration pushing without converging). The per-neighbour DC
+                (component-wise median) is SUBTRACTED before solving; only
+                the expressible residual drives the field."""
+                ds, de = domains[di]
+                S = de - ds
+                if owner[ds] in _sick or S < 8:
                     return []
                 if cur_state["key"] != id(xi_total):
                     cur_state["key"] = id(xi_total)
@@ -1039,41 +1045,42 @@ class VGGT_Long:
                 X = se3_matrices(xi_total)
                 within_fits, out_pts = [], []
                 cross_fits = {}
-                for f in range(S):
+                for f_glob in range(ds, de):
                     for d in offsets:
-                        pk = _partner(k, f, d)
-                        if pk is None:
+                        g_glob = f_glob + d
+                        if g_glob >= N:
                             continue
-                        cross = pk[0] != k
-                        wp_s, cf_s, _w, _K = _current((k, f), X)
-                        wp_d, cf_d, w2c_d, K_d = _current(pk, X)
+                        dj = dom_of[g_glob]
+                        cross = dj != di
+                        wp_s, cf_s, _w, _K = _current(_copy_of(f_glob), X)
+                        wp_d, cf_d, w2c_d, K_d = _current(_copy_of(g_glob), X)
                         pq = surface_pair_correspondences(wp_s, cf_s, wp_d, cf_d,
                                                           w2c_d, K_d)
                         if pq is None:
                             continue
                         if want_points:
-                            g_glob = start + f + d
-                            out_pts.append((start + f, g_glob,
+                            out_pts.append((f_glob, g_glob,
                                             pq[0][:2000], pq[1][:2000]))
                             continue
                         fit = robust_rigid(pq[0], pq[1], sample=8000)
                         if fit is not None:
-                            rec = (f, -1 if cross else f + d,
+                            rec = (f_glob - ds,
+                                   -1 if cross else g_glob - ds,
                                    fit[0], fit[1], fit[2], fit[3])
                             if cross:
-                                cross_fits.setdefault(pk[0], []).append(rec)
+                                cross_fits.setdefault(dj, []).append(rec)
                             else:
                                 within_fits.append(rec)
                 if want_points:
                     return out_pts
                 taus = filter_pair_fits(within_fits)
-                for kn, fl in cross_fits.items():
+                for dj, fl in cross_fits.items():
                     ct = filter_pair_fits(fl)
                     if len(ct) >= 5:
                         dc = np.median(np.stack([t for _, _, t, _ in ct]), axis=0)
-                        if (k, kn) not in dc_logged:
-                            dc_logged.add((k, kn))
-                            print(f"[intra-chunk] seam {k}-{kn}: DC offset "
+                        if (di, dj) not in dc_logged:
+                            dc_logged.add((di, dj))
+                            print(f"[intra-chunk] domains {di}-{dj}: DC offset "
                                   f"{float(np.linalg.norm(dc[3:])) * 100:.1f} cm "
                                   f"removed from the intra signal (seam-level "
                                   f"business, not expressible by clamped fields)")
@@ -1084,19 +1091,20 @@ class VGGT_Long:
             # ── held-out captured BEFORE any correction (the honest judge) ──
             xi0 = np.zeros((N, 6))
             held, taus0 = [], []
-            for k in range(len(self.chunk_indices)):
-                held += _measure(k, xi0, offsets=holdout_offsets, want_points=True)
-                for f, g, t, w in _measure(k, xi0):
+            for di in range(len(domains)):
+                held += _measure(di, xi0, offsets=holdout_offsets, want_points=True)
+                for f, g, t, w in _measure(di, xi0):
                     taus0.append((f, g, t, w))
             if len(taus0) < N or len(held) < N // 4:
                 print(f"[intra-chunk] too thin ({len(taus0)} fit / {len(held)} "
                       f"held-out) — SKIPPING (nothing modified)")
                 return
-            print(f"[intra-chunk] {len(taus0)} pairs (within+cross) + "
-                  f"{len(held)} held-out — iterating to convergence")
+            print(f"[intra-chunk] {len(domains)} ownership domains | "
+                  f"{len(taus0)} pairs (within+cross) + {len(held)} held-out — "
+                  f"iterating to convergence")
 
             # ── ITERATIVE relaxation: neighbours respond to each other ──
-            xi, rounds = iterate_chunk_fields(_measure, self.chunk_indices, N)
+            xi, rounds = iterate_chunk_fields(_measure, domains, N)
             for h in rounds:
                 print(f"[intra-chunk] round {h['round']}: max increment "
                       f"{h['max_inc_cm']:.2f} cm ({h['n_pairs']} pairs"
@@ -1105,15 +1113,11 @@ class VGGT_Long:
             # ── final verdict on the pre-correction held-out (global) ──
             v = chunk_field_verdict(xi, taus0, held)
             # per-seam stratum: no neighbour pair may degrade (the run-6 mode)
-            owner_of = {}
-            for k, (start, end) in enumerate(self.chunk_indices):
-                for g in range(start, end):
-                    owner_of.setdefault(g, k)
             X = se3_matrices(xi)
             seam_bad = []
             by_seam = {}
             for f, g, p, q in held:
-                key = (owner_of.get(f), owner_of.get(g))
+                key = (int(owner[f]), int(owner[g]))
                 if key[0] == key[1]:
                     continue
                 by_seam.setdefault(key, []).append((f, g, p, q))

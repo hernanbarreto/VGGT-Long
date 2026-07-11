@@ -983,29 +983,20 @@ def solve_chunk_field(pair_taus, S, smooth_w=0.5, prior_w=0.3):
     return xi
 
 
-def blend_chunk_fields(chunk_indices, fields, n_frames):
-    """Per-GLOBAL-frame field from the per-chunk solutions: where two chunks
-    share a frame their fields are blended with the elastic's triangular
-    weights (1 at a chunk's own centre → 0 at its edges). Every chunk field is
-    zero at its endpoints, so the blend is continuous and both copies of every
-    shared frame receive ONE identical correction — the seam consensus is
-    preserved exactly. Returns xi (n_frames, 6)."""
-    num = np.zeros((n_frames, 6))
-    den = np.zeros(n_frames)
-    for k, (start, end) in enumerate(chunk_indices):
-        S = end - start
-        fld = np.asarray(fields.get(k)) if fields.get(k) is not None else None
-        if fld is None or S < 2:
-            continue
-        w = 1.0 - np.abs(np.linspace(-1.0, 1.0, S))
-        w = np.maximum(w, 1e-6)
-        for local in range(S):
-            g = start + local
-            num[g] += w[local] * fld[local]
-            den[g] += w[local]
+def assemble_domain_fields(domains, fields, n_frames):
+    """Per-GLOBAL-frame field from per-DOMAIN solutions. Domains are DISJOINT
+    ownership ranges tiling the session, so what was solved is what gets
+    applied — EXACTLY (run 7/8 measured the alternative: triangular blending
+    over 50%-overlap chunks halved every chunk's solution near its edges, so
+    each round re-pushed the unapplied half and the iteration never
+    converged). Every domain field is zero at its endpoints, so the assembled
+    field is continuous across domain boundaries. Returns xi (n_frames, 6)."""
     out = np.zeros((n_frames, 6))
-    m = den > 0
-    out[m] = num[m] / den[m, None]
+    for k, (start, end) in enumerate(domains):
+        fld = fields.get(k)
+        if fld is None:
+            continue
+        out[start:end] = np.asarray(fld, np.float64)
     return out
 
 
@@ -1042,7 +1033,7 @@ def chunk_field_verdict(xi, pair_taus, held, improve=0.8, bound=5.0):
             "t_sig": t_sig, "r_sig": r_sig}
 
 
-def iterate_chunk_fields(measure_fn, chunk_indices, n_frames,
+def iterate_chunk_fields(measure_fn, domains, n_frames,
                          max_rounds=6, relax=0.7, tol_t=0.01, bound=5.0):
     """ITERATIVE relaxation of the per-chunk fields (block Gauss-Seidel on the
     coupled problem): correcting one chunk changes what its neighbours see, so
@@ -1053,22 +1044,26 @@ def iterate_chunk_fields(measure_fn, chunk_indices, n_frames,
     the answer is not to refuse a correction that disturbs the neighbour but
     to let the neighbour respond and converge together).
 
-    measure_fn(k, xi_total) → [(f_local, g_local_or_-1, tau[6], w)] measures
-    chunk k's residual pairs against the CURRENT state (xi_total composed in),
-    cross-chunk partners marked g = -1 (fixed this sweep). Per round: solve
-    every chunk's increment (endpoint-clamped — no round can create a field
-    longer than one chunk), blend per global frame, apply with under-
-    relaxation, and TRUST-REGION the round to ``bound``× the p90 of its own
-    pair signal.
+    ``domains`` are DISJOINT ownership ranges tiling the session (run 7/8
+    measured why: with 50%-overlap chunk windows the applied field was the
+    triangular BLEND of two solutions — applied ≠ solved, every round re-
+    pushed its unapplied half and the iteration plateaued at ~22 cm/round.
+    Disjoint domains make applied == solved exactly; coupling between
+    domains flows only through the cross pairs, re-measured every round).
 
-    STALL GUARD (run 7, 2026-07-11: a seam-level offset the clamped fields
-    cannot express kept the increments at ~22 cm/round, integrating 161 cm
-    over 6 rounds — a persistent gradient, not convergence): when the
-    increment fails to shrink for two consecutive rounds, the two stalled
-    rounds are ROLLED BACK and the iteration stops — an unexpressible signal
-    is never integrated. Stops on max increment < tol_t, stall, or rounds
-    out. Returns (xi_total (N,6), rounds: [{round, max_inc_cm, n_pairs,
-    capped, stalled}])."""
+    measure_fn(k, xi_total) → [(f_local, g_local_or_-1, tau[6], w)] measures
+    domain k's residual pairs against the CURRENT state (xi_total composed
+    in), cross-domain partners marked g = -1 (fixed this sweep). Per round:
+    solve every domain's increment (endpoint-clamped — no field longer than
+    one domain), assemble, apply with under-relaxation, TRUST-REGION the
+    round to ``bound``× the p90 of its own pair signal.
+
+    STALL GUARD (tightened after runs 7/8): an increment that fails to
+    shrink by ≥10% for two consecutive rounds means the remaining signal is
+    not expressible — the stalled rounds are ROLLED BACK and the iteration
+    stops. Stops on max increment < tol_t, stall, or rounds out. Returns
+    (xi_total (N,6), rounds: [{round, max_inc_cm, n_pairs, capped,
+    stalled}])."""
     xi_total = np.zeros((n_frames, 6))
     history = []
     snaps = []
@@ -1079,7 +1074,7 @@ def iterate_chunk_fields(measure_fn, chunk_indices, n_frames,
         fields = {}
         t_sig = []
         n_pairs = 0
-        for k, (start, end) in enumerate(chunk_indices):
+        for k, (start, end) in enumerate(domains):
             taus = measure_fn(k, xi_total)
             if not taus:
                 continue
@@ -1089,7 +1084,7 @@ def iterate_chunk_fields(measure_fn, chunk_indices, n_frames,
             fields[k] = solve_chunk_field(taus, end - start)
         if not fields:
             break
-        inc = blend_chunk_fields(chunk_indices, fields, n_frames) * float(relax)
+        inc = assemble_domain_fields(domains, fields, n_frames) * float(relax)
         cap = bound * max(float(np.percentile(t_sig, 90)), 1e-3)
         mx = float(np.max(np.linalg.norm(inc[:, 3:], axis=1)))
         capped = mx > cap
@@ -1097,7 +1092,7 @@ def iterate_chunk_fields(measure_fn, chunk_indices, n_frames,
             inc *= cap / mx
             mx = cap
         xi_total = xi_total + inc
-        stalled = prev_mx is not None and mx > 0.95 * prev_mx
+        stalled = prev_mx is not None and mx > 0.90 * prev_mx
         history.append({"round": r + 1, "max_inc_cm": mx * 100,
                         "n_pairs": n_pairs, "capped": bool(capped),
                         "stalled": bool(stalled)})
