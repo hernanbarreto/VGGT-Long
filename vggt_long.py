@@ -432,6 +432,32 @@ class VGGT_Long:
             else:
                 prev_shared = None
 
+        # ── ZOOM SCALE FIX (USER ORDER 2026-09-04): a zoomed chunk's DA3
+        # anchors are broken (assumed focal) — the scale must be CORRECTED,
+        # never the chunk discarded. Same session-relative focal criterion as
+        # flag_sick_chunks; the affected chunks' anchor scales are EXCLUDED so
+        # the seam graph carries scale into them from their neighbours (seam
+        # ratios are relative depth on shared frames — zoom does not break
+        # them the way it breaks DA3's absolute metre).
+        zoom_chunks = set()
+        if ml.get('zoom_scale_fix', True) and len(fx_map) >= 3:
+            _fxv = np.array(list(fx_map.values()), np.float64)
+            _fmed = float(np.median(_fxv))
+            _fmad = float(np.median(np.abs(_fxv - _fmed)))
+            if _fmad > 0:
+                for k, v in fx_map.items():
+                    z = abs(v - _fmed) / (1.4826 * _fmad)
+                    if z > 3.5 and k in scales:
+                        zoom_chunks.add(k)
+                        report["chunks"].setdefault(str(k), {})[
+                            "zoom_anchor_excluded"] = True
+                        scales.pop(k, None)
+                        n_anchor_map.pop(k, None)
+                        print(f"[metric-lock] chunk {k}: optical ZOOM (fx {v:.0f} "
+                              f"vs session {_fmed:.0f}, z={z:.1f}) — DA3 anchors "
+                              f"EXCLUDED, scale comes from the seam graph "
+                              f"(neighbours)")
+
         # 2) fuse both sensors: seams make neighbours CONSISTENT (0.1-1% noise),
         # anchors pin the global metre (±8-15% each). Weighted LS in log space.
         if scales and seam_rel:
@@ -583,7 +609,12 @@ class VGGT_Long:
                         suspect.setdefault(int(k_str), rs)
             except Exception:
                 pass
-        self._stac_sick_chunks = set(sick)
+        # USER ORDER 2026-09-04: the write-blocking gate is OPT-IN
+        # (Model.metric_lock.health_gate). Default: flags are DIAGNOSTIC ONLY
+        # — every chunk writes; a zoomed chunk's scale is corrected upstream
+        # (zoom_scale_fix) instead of being turned into a declared hole.
+        _gate = bool(ml.get('health_gate', False))
+        self._stac_sick_chunks = set(sick) if _gate else set()
         self._stac_suspect_chunks = set(suspect)
         with open(_health_path, "w") as f:
             _json.dump({"tri_angle": {str(k): tri_map.get(k)
@@ -601,8 +632,13 @@ class VGGT_Long:
             for k in sorted(sick):
                 for r in sick[k]:
                     print(f"[health] chunk {k} SICK: {r}")
-            print(f"[health] ⛔ {len(sick)} chunk(s) EXCLUDED from the cloud "
-                  f"({sorted(sick)}) — kept as alignment bridges, see chunk_health.json")
+            if _gate:
+                print(f"[health] ⛔ {len(sick)} chunk(s) EXCLUDED from the cloud "
+                      f"({sorted(sick)}) — kept as alignment bridges, see chunk_health.json")
+            else:
+                print(f"[health] {len(sick)} chunk(s) FLAGGED ({sorted(sick)}) — "
+                      f"DIAGNOSTIC ONLY (health_gate off): they still write; zoom "
+                      f"chunks got seam-graph scale instead")
         else:
             print(f"[health] ✅ all {len(self.chunk_indices)} chunks healthy "
                   f"(parallax + anchor coherence)")
@@ -1606,6 +1642,12 @@ class VGGT_Long:
                 continue
             data = np.load(path, allow_pickle=True).item()
             self._stac_write_chunk_outputs(data, k)
+            del data
+            # NOTE (2026-09-04): do NOT delete the aligned npy here — the
+            # omega-depth writer + scale_align still read it after this stage
+            # (deleting here caused 'wrote 0 omega depths' → scale FAIL).
+            # map_worker deletes _tmp_results_aligned right after the metric
+            # scale succeeds.
 
     def process_long_sequence(self):
         if self.overlap >= self.chunk_size:
