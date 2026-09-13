@@ -1063,6 +1063,14 @@ class VGGT_Long:
                   f"(max frame translation {dmax * 100:.1f} cm)")
         print(f"[elastic] ✅ all {len(self.chunk_indices)} chunks on the per-frame "
               f"seam consensus — shared pixels now share ONE 3D position")
+        if self._stac_authority_cfg() and _cap:
+            _t_all = max(float(np.max(np.linalg.norm(c[:, :3, 3], axis=1)))
+                         for c in self._stac_elastic_corr.values())
+            _fr = _t_all / float(_cap)
+            self._stac_authority_record(
+                "elastic_seam", _fr,
+                _fr > float(self._stac_authority_cfg()["saturation_warn"]),
+                {"max_m": float(_cap), "used_max_m": _t_all, "n_capped_fits": int(_ncap)})
 
     def _stac_aligned_pose(self, k, local, ext_c2w):
         """World-space c2w of chunk k's local frame as the CLOUD sees it: the
@@ -1201,6 +1209,14 @@ class VGGT_Long:
                             "xi": xi.tolist(), "chunks": report}, f_, indent=1)
 
         X = se3_matrices(xi)
+        if self._stac_authority_cfg():
+            _acfg = self._stac_authority_cfg()
+            _used = float(np.max(np.linalg.norm(np.asarray(xi)[:, 3:], axis=1)))
+            _fr = _used / float(_acfg["intra_chunk_max_m"])
+            self._stac_authority_record("intra_chunk", _fr,
+                                        _fr > float(_acfg["saturation_warn"]),
+                                        {"max_m": float(_acfg["intra_chunk_max_m"]),
+                                         "used_max_m": _used})
         # compose into the elastic per-frame fields FIRST: poses, depth graph,
         # depth cap and the origins writer all read _stac_elastic_corr
         ecorr = getattr(self, '_stac_elastic_corr', None)
@@ -1381,6 +1397,17 @@ class VGGT_Long:
             sol = (a, b)
 
         a, b = sol
+        if self._stac_authority_cfg():
+            _acfg = self._stac_authority_cfg()
+            _fa = float(np.max(np.abs(np.log(np.asarray(a))))) / float(_acfg["depth_graph_max_log_a"])
+            _fb = float(np.max(np.abs(np.asarray(b)))) / float(_acfg["depth_graph_max_b_m"])
+            _fr = max(_fa, _fb)
+            self._stac_authority_record("depth_graph", _fr,
+                                        _fr > float(_acfg["saturation_warn"]),
+                                        {"max_log_a": float(_acfg["depth_graph_max_log_a"]),
+                                         "max_b_m": float(_acfg["depth_graph_max_b_m"]),
+                                         "used_max_log_a": float(np.max(np.abs(np.log(np.asarray(a))))),
+                                         "used_max_b_m": float(np.max(np.abs(np.asarray(b))))})
         for k, (start, end) in enumerate(self.chunk_indices):
             path = os.path.join(self.result_aligned_dir, f"chunk_{k}.npy")
             data = np.load(path, allow_pickle=True).item()
@@ -1420,7 +1447,24 @@ class VGGT_Long:
         averages with garbage. Both copies are written back, so every downstream
         reader (PLY via ownership, TSDF, omega-depth) sees the same consensus;
         the operation is idempotent (blending identical copies is a no-op), so
-        resume needs no special casing beyond the skip stamp."""
+        resume needs no special casing beyond the skip stamp.
+
+        AUDIT vs frame_ownership (claude_stac.txt §7, 2026-09-13): the two
+        operate on DIFFERENT things and stay as they are. Ownership is a WRITE
+        policy — which copy of a shared frame puts pixels into the PLY
+        (_stac_owned_confs); the blend is a PREDICTION consensus — the two
+        copies are two independent measurements of the same depth field and
+        both become their mean. The non-owner copy is not dead after the
+        blend: (1) ownership_backfill writes the owner-dropped pixels FROM the
+        non-owner copy (backfill_mask), (2) _emit_omega_depth iterates every
+        chunk's frames and the LAST chunk's copy of a shared frame wins the
+        omega depth npz, (3) the depth graph / depth cap read owner frames but
+        the seam sensors read both copies. Restricting the blend to the owner
+        copy would leave those readers with an un-blended, inconsistent copy
+        — the blend into BOTH is what keeps every downstream reader on one
+        consensus. Proof: after _stac_blend_copies both copies are bitwise
+        identical (same wp/cf/dd written back), so no reader can observe a
+        difference between "owner" and "non-owner" data."""
         if not self.config['Model'].get('blend_copies') or len(self.chunk_indices) < 2:
             return
         from loop_utils.metric_lock import blend_two_copies
@@ -2205,6 +2249,14 @@ class VGGT_Long:
                 meta["lock"]["delta_parents"] = f
         self._stac_scales_applied = {k: float(s_v1.get(k, 1.0) * delta[k]) for k in range(n_chunks)}
         self._stac_scale_delta = delta
+        if self._stac_authority_cfg():
+            _acfg = self._stac_authority_cfg()
+            _used = max(abs(float(np.log(v))) for v in delta.values()) if delta else 0.0
+            _fr = _used / float(_acfg["scale_graph_max_log"])
+            self._stac_authority_record("scale_graph", _fr,
+                                        _fr > float(_acfg["saturation_warn"]),
+                                        {"max_log": float(_acfg["scale_graph_max_log"]),
+                                         "used_max_log": _used})
         # verifier bookkeeping: s_frames from the drift stage (when it ran)
         s_frames = getattr(self, '_stac_drift_frames', None)
         rep = {"version": 1,
@@ -2264,6 +2316,8 @@ class VGGT_Long:
         edges = list(getattr(self, '_stac_loops_rejected', []) or [])
         self.loop_sim3_list = []
         self._stac_loop_edges = []
+        self._stac_loop_edges_kf = []
+        gcfg = self._stac_graph_cfg()
         for li, ((item, pred, meta), meas) in enumerate(zip(self.loop_predict_list, meas_rigid)):
             ka, kb = int(item[0]), int(item[2])
             cand = meta["candidate"]
@@ -2295,6 +2349,28 @@ class VGGT_Long:
                     "sides": meas.get("sides"), "verdict": v, "status": v["status"],
                     "stage": "verification", "intra_chunk": ka == kb}
             edges.append(edge)
+            if v["status"] in ("accepted", "scale_break") and gcfg is not None:
+                # KEYFRAME edge for the SE(3) graph (§4.3): the relative pose
+                # between the two window centres as ONE Omega pass measured it
+                # (the bridge's own metric-locked extrinsics); σ_t = the verified
+                # exact-fit residual, σ_rot from config. Intra-chunk bridges
+                # give edges too (no scale row, but a pose constraint).
+                lay = meta["layout"]
+                ext_b = np.asarray(pred['extrinsic'])
+                if ext_b.ndim == 4:
+                    ext_b = ext_b[0]
+                la = lay["bridge_a"][len(lay["bridge_a"]) // 2]
+                lb_ = lay["bridge_b"][len(lay["bridge_b"]) // 2]
+                gi = int(item[1][0] + len(lay["bridge_a"]) // 2)
+                gj = int(item[3][0] + len(lay["bridge_b"]) // 2)
+                Ei = np.asarray(ext_b[la], np.float64)
+                Ej = np.asarray(ext_b[lb_], np.float64)
+                Z = np.linalg.inv(Ei) @ Ej
+                kf_edge = {"i": gi, "j": gj, "Z": Z.tolist(), "sigma_m": float(v["sigma_m"]),
+                           "sigma_deg": float(cfg_req(gcfg, "loop_sigma_rot_deg", "graph")),
+                           "bridge": li, "status": v["status"], "chunks": [ka, kb]}
+                self._stac_loop_edges_kf.append(kf_edge)
+                edge["keyframe_edge"] = kf_edge
             if v["status"] in ("accepted", "scale_break") and ka != kb:
                 self._stac_loop_edges.append({"a": ka, "b": kb, "R_ab": np.asarray(meas["R_ab"]),
                                               "t_ab": np.asarray(meas["t_ab"]),
@@ -2320,6 +2396,505 @@ class VGGT_Long:
                                 "provisional_seams": getattr(self, '_stac_provisional_seams', None)})
         print(f"[loop-verify] {n_good} usable edge(s) with σ ≤ {max_sig} m → loop optimizer "
               f"{'ON' if self.loop_enable_opt else 'OFF (no trustworthy edge)'}; loop_edges.json")
+
+    # ══════════════════════════════════════════════════════════════════════
+    # STAC F2 — KEYFRAME SE(3) POSE GRAPH, INTRINSIC UNCERTAINTY, AUTHORITY
+    # (claude_stac.txt §4.3, §4.7, §4.8). Replaces the vendor's per-chunk Sim3
+    # loop optimizer in the vggtomega path (Model.graph present).
+    # ══════════════════════════════════════════════════════════════════════
+    def _stac_graph_cfg(self):
+        return self.config['Model'].get('graph')
+
+    def _stac_authority_cfg(self):
+        return self.config['Model'].get('authority')
+
+    def _stac_uncertainty(self):
+        """§4.8: every overlap frame is predicted twice (chunk k and k+1). The
+        per-pixel disagreement between the two ALIGNED copies is the model's
+        own uncertainty for that frame — persisted as uncert/uncert_<frame>.npy
+        (float32 metres) plus uncertainty.json (per-frame median / p90), and
+        used as a σ component of the odometry edges (§4.3) and of the witness
+        stage (F3). Frames predicted once carry the session median, declared
+        as such. Resume-safe (uncertainty.json + files)."""
+        import json as _json
+        from loop_utils.metric_lock import real_frame_number
+        udir = os.path.join(self.output_dir, "uncert")
+        os.makedirs(udir, exist_ok=True)
+        rep_path = os.path.join(self.output_dir, "uncertainty.json")
+        if os.path.exists(rep_path):
+            try:
+                prev = _json.load(open(rep_path))
+                if prev.get("chunk_indices") == [list(ci) for ci in self.chunk_indices]:
+                    self._stac_uncert = {int(k): v for k, v in prev["frames"].items()}
+                    self._stac_uncert_median = float(prev["session_median_m"])
+                    print(f"[uncertainty] resume: {len(self._stac_uncert)} frame(s) from "
+                          f"uncertainty.json")
+                    return
+            except (ValueError, KeyError) as _e:
+                print(f"[uncertainty] uncertainty.json unreadable ({_e}) — re-measuring")
+        per_frame = {}
+        prev_tail = None
+        for k, (start, end) in enumerate(self.chunk_indices):
+            data = np.load(os.path.join(self.result_aligned_dir, f"chunk_{k}.npy"),
+                           allow_pickle=True).item()
+            wp = np.asarray(data['world_points']); wp = wp[0] if wp.ndim == 5 else wp
+            cf = np.asarray(data['world_points_conf']).reshape(wp.shape[:3])
+            if prev_tail is not None and prev_tail[0] == k - 1:
+                for local, g in enumerate(range(start, end)):
+                    if g not in prev_tail[1]:
+                        continue
+                    p_prev, c_prev = prev_tail[1][g]
+                    ok = (c_prev > 1e-5) & (cf[local] > 1e-5)
+                    d = np.full(wp.shape[1:3], np.nan, np.float32)
+                    if ok.any():
+                        d[ok] = np.linalg.norm(wp[local][ok].astype(np.float64)
+                                               - p_prev[ok].astype(np.float64), axis=1)
+                    num = real_frame_number(self.img_list[g])
+                    np.save(os.path.join(udir, f"uncert_{num}.npy"), d)
+                    vals = d[np.isfinite(d)]
+                    per_frame[g] = {"frame": int(num), "median_m": float(np.median(vals)) if len(vals) else None,
+                                    "p90_m": float(np.percentile(vals, 90)) if len(vals) else None,
+                                    "n_px": int(len(vals)), "witnesses": 2}
+            if k + 1 < len(self.chunk_indices):
+                nxt0 = self.chunk_indices[k + 1][0]
+                prev_tail = (k, {g: (wp[g - start].astype(np.float32), cf[g - start])
+                                 for g in range(max(nxt0, start), end)})
+            else:
+                prev_tail = None
+            del data
+        meds = [v["median_m"] for v in per_frame.values() if v["median_m"] is not None]
+        session_med = float(np.median(meds)) if meds else 0.0
+        self._stac_uncert = per_frame
+        self._stac_uncert_median = session_med
+        with open(rep_path, "w") as f:
+            _json.dump({"version": 1, "chunk_indices": [list(ci) for ci in self.chunk_indices],
+                        "session_median_m": session_med, "n_shared_frames": len(per_frame),
+                        "frames": {str(k): v for k, v in per_frame.items()},
+                        "note": "frames predicted once carry the session median"}, f, indent=1)
+        print(f"[uncertainty] {len(per_frame)} shared frame(s): two-copy disagreement median "
+              f"{session_med * 100:.2f} cm → uncert/, uncertainty.json")
+
+    def _stac_ensemble_uncertainty(self):
+        """§4.8 (optional, Model.certify.ensemble_offset_frames > 0): a second
+        Omega pass with chunk boundaries SHIFTED by that many frames gives a
+        third prediction of every frame. Each ensemble chunk is glued to the
+        main chain by an exact rigid fit on its frames' owner copies and the
+        per-pixel disagreement joins the uncertainty files (witnesses: 3).
+        Runs while the model is loaded; OFF by default (certification runs)."""
+        cert = self.config['Model'].get('certify') or {}
+        off = int(cert.get('ensemble_offset_frames', 0) or 0)
+        if off <= 0 or len(self.chunk_indices) < 2:
+            return
+        from loop_utils.metric_lock import robust_rigid, real_frame_number, frame_owner
+        edir = os.path.join(self.output_dir, "_tmp_results_ensemble")
+        os.makedirs(edir, exist_ok=True)
+        N = len(self.img_list)
+        step = self.chunk_size - self.overlap
+        ranges = []
+        start = off
+        while start + 2 < N:
+            end = min(start + self.chunk_size, N)
+            ranges.append((start, end))
+            if end >= N:
+                break
+            start += step
+        self._stac_ensemble_ranges = ranges
+        for e_idx, (a, b) in enumerate(ranges):
+            path = os.path.join(edir, f"chunk_{e_idx}.npy")
+            if os.path.exists(path):
+                continue
+            pred = self.model.infer_chunk(self.img_list[a:b])
+            for key in list(pred.keys()):
+                if isinstance(pred[key], torch.Tensor):
+                    pred[key] = pred[key].cpu().numpy().squeeze(0)
+            pred['depth'] = np.squeeze(pred['depth'])
+            pred['_stac_range'] = [int(a), int(b)]
+            np.save(path, pred)
+            torch.cuda.empty_cache()
+        print(f"[uncertainty] ensemble pass: {len(ranges)} chunk(s) with boundaries shifted "
+              f"by {off} frame(s) → {edir}")
+
+    def _stac_ensemble_apply(self):
+        """Second half of the ensemble witness (after the main chain exists):
+        glue each ensemble chunk to the aligned main copies and merge the
+        disagreement into uncert/ + uncertainty.json (witnesses: 3)."""
+        cert = self.config['Model'].get('certify') or {}
+        off = int(cert.get('ensemble_offset_frames', 0) or 0)
+        ranges = getattr(self, '_stac_ensemble_ranges', None)
+        if off <= 0 or not ranges:
+            return
+        import json as _json
+        from loop_utils.metric_lock import (robust_rigid, real_frame_number, frame_owner,
+                                            apply_scale)
+        from loop_utils.loop_bridges import robust_sim3
+        edir = os.path.join(self.output_dir, "_tmp_results_ensemble")
+        udir = os.path.join(self.output_dir, "uncert")
+        N = len(self.img_list)
+        owner = frame_owner(self.chunk_indices, N)
+        rep_path = os.path.join(self.output_dir, "uncertainty.json")
+        rep = _json.load(open(rep_path)) if os.path.exists(rep_path) else {"frames": {}}
+        n_frames = 0
+        for e_idx, (a, b) in enumerate(ranges):
+            pred = np.load(os.path.join(edir, f"chunk_{e_idx}.npy"), allow_pickle=True).item()
+            wp = np.asarray(pred['world_points']); wp = wp[0] if wp.ndim == 5 else wp
+            cf = np.asarray(pred['world_points_conf']).reshape(wp.shape[:3])
+            # owner copies of the same frames under the FINAL chain
+            P, Q = [], []
+            owners = {}
+            for local, g in enumerate(range(a, b)):
+                k = int(owner[g])
+                d = self._stac_load_chunk_aligned(k)
+                wpk = np.asarray(d['world_points']); wpk = wpk[0] if wpk.ndim == 5 else wpk
+                cfk = np.asarray(d['world_points_conf']).reshape(wpk.shape[:3])
+                lk = g - self.chunk_indices[k][0]
+                ok = (cf[local] > 1e-5) & (cfk[lk] > 1e-5)
+                idx = np.flatnonzero(ok.reshape(-1))
+                if len(idx) > 4000:
+                    idx = np.random.default_rng(0).choice(idx, 4000, replace=False)
+                P.append(wp[local].reshape(-1, 3)[idx]); Q.append(wpk[lk].reshape(-1, 3)[idx])
+                owners[g] = (wpk[lk].astype(np.float32), cfk[lk])
+            fit = robust_sim3(np.concatenate(P), np.concatenate(Q), min_points=1000)
+            if fit is None:
+                print(f"[uncertainty] ensemble chunk {e_idx}: glue starved — skipped (declared)")
+                continue
+            s_, R_, t_, res, n_ = fit
+            for local, g in enumerate(range(a, b)):
+                wpk, cfk = owners[g]
+                pe = s_ * (wp[local].reshape(-1, 3).astype(np.float64) @ R_.T) + t_
+                pe = pe.reshape(wp.shape[1:])
+                ok = (cf[local] > 1e-5) & (cfk > 1e-5)
+                d3 = np.full(wp.shape[1:3], np.nan, np.float32)
+                if ok.any():
+                    d3[ok] = np.linalg.norm(pe[ok] - wpk[ok].astype(np.float64), axis=1)
+                num = real_frame_number(self.img_list[g])
+                fpath = os.path.join(udir, f"uncert_{num}.npy")
+                if os.path.exists(fpath):
+                    d2 = np.load(fpath)
+                    both = np.isfinite(d2) & np.isfinite(d3)
+                    merged = np.where(both, np.maximum(d2, d3), np.where(np.isfinite(d2), d2, d3))
+                else:
+                    merged = d3
+                np.save(fpath, merged.astype(np.float32))
+                vals = merged[np.isfinite(merged)]
+                rep["frames"][str(g)] = {"frame": int(num),
+                                         "median_m": float(np.median(vals)) if len(vals) else None,
+                                         "p90_m": float(np.percentile(vals, 90)) if len(vals) else None,
+                                         "n_px": int(len(vals)),
+                                         "witnesses": 3 if str(g) in rep["frames"] else 2}
+                n_frames += 1
+        meds = [v["median_m"] for v in rep["frames"].values() if v.get("median_m") is not None]
+        rep["session_median_m"] = float(np.median(meds)) if meds else 0.0
+        rep["ensemble_offset_frames"] = off
+        with open(rep_path, "w") as f:
+            _json.dump(rep, f, indent=1)
+        self._stac_uncert = {int(k): v for k, v in rep["frames"].items()}
+        self._stac_uncert_median = float(rep["session_median_m"])
+        print(f"[uncertainty] ensemble witness merged into {n_frames} frame(s)")
+
+    def _stac_load_chunk_aligned(self, k):
+        cache = getattr(self, '_stac_chunk_cache_aligned', None)
+        if cache is None:
+            cache = self._stac_chunk_cache_aligned = {}
+        if k in cache:
+            return cache[k]
+        data = np.load(os.path.join(self.result_aligned_dir, f"chunk_{k}.npy"),
+                       allow_pickle=True).item()
+        if len(cache) >= 2:
+            cache.pop(next(iter(cache)))
+        cache[k] = data
+        return data
+
+    def _stac_drop_aligned_cache(self):
+        if getattr(self, '_stac_chunk_cache_aligned', None):
+            self._stac_chunk_cache_aligned.clear()
+
+    def _stac_holdout_pairs(self, gcfg):
+        """Held-out surface pairs (frames f, f+d — d from graph.holdout_offsets,
+        every graph.holdout_stride-th f) with exact-surface correspondences
+        under the CURRENT chain: the judge of the pose graph (same strategy as
+        chunk_field_verdict). Returns [(f, g, p[n,3], q[n,3])] in world coords."""
+        from loop_utils.metric_lock import surface_pair_correspondences, frame_owner
+        from loop_utils.loop_bridges import cfg_req
+        offsets = [int(x) for x in cfg_req(gcfg, "holdout_offsets", "graph")]
+        stride = int(cfg_req(gcfg, "holdout_stride", "graph"))
+        n_samp = int(cfg_req(gcfg, "holdout_samples", "graph"))
+        N = len(self.img_list)
+        owner = frame_owner(self.chunk_indices, N)
+        wanted = set()
+        for f in range(0, N, max(stride, 1)):
+            for d in offsets:
+                if f + d < N:
+                    wanted.add(f); wanted.add(f + d)
+        cache = {}
+        for k, (start, end) in enumerate(self.chunk_indices):
+            need = [g for g in range(start, end) if g in wanted and owner[g] == k]
+            if not need:
+                continue
+            data = self._stac_load_chunk_aligned(k)
+            wp = np.asarray(data['world_points']); wp = wp[0] if wp.ndim == 5 else wp
+            cf = np.asarray(data['world_points_conf']).reshape(wp.shape[:3])
+            ext = np.asarray(data['extrinsic']); K = np.asarray(data['intrinsic'])
+            for g in need:
+                local = g - start
+                c2w = self._stac_aligned_pose(k, local, ext[local])
+                cache[g] = (wp[local].astype(np.float32), cf[local].astype(np.float32),
+                            np.linalg.inv(c2w), K[local])
+        self._stac_drop_aligned_cache()
+        pairs = []
+        for f in range(0, N, max(stride, 1)):
+            for d in offsets:
+                g = f + d
+                if f not in cache or g not in cache:
+                    continue
+                pq = surface_pair_correspondences(cache[f][0], cache[f][1],
+                                                  cache[g][0], cache[g][1],
+                                                  cache[g][2], cache[g][3],
+                                                  max_samples=n_samp)
+                if pq is not None:
+                    pairs.append((f, g, pq[0], pq[1]))
+        return pairs
+
+    def _stac_pose_graph(self):
+        """§4.3: the keyframe SE(3) graph over the ALIGNED chunks — odometry
+        from the chain (σ from seam residuals + §4.8 uncertainty), the verified
+        loop edges (σ measured), a weak gravity prior; solved by
+        loop_utils.pose_graph; §4.7 authority (veto of loop edges demanding
+        more than the drift budget, saturation report); gated by loop gain and
+        held-out surface pairs; applied as a RIGID move per frame (points and
+        camera together, both copies of a shared frame) — depth per ray and
+        provenance invariant. Resume-safe (pose_graph.json + npy stamp)."""
+        gcfg = self._stac_graph_cfg()
+        if gcfg is None or self._stac_loops_cfg() is None or len(self.chunk_indices) < 1:
+            return
+        import json as _json
+        from loop_utils.loop_bridges import cfg_req
+        from loop_utils.pose_graph import PoseGraph
+        from loop_utils.metric_lock import frame_owner, se3_matrices
+        from loop_utils.lie import se3_log, se3_inv
+        N = len(self.img_list)
+        owner = frame_owner(self.chunk_indices, N)
+        pg_path = os.path.join(self.output_dir, "pose_graph.json")
+        acfg = self._stac_authority_cfg() or {}
+        X = None
+        report = None
+        if os.path.exists(pg_path):
+            try:
+                prev = _json.load(open(pg_path))
+                if prev.get("chunk_indices") == [list(ci) for ci in self.chunk_indices] \
+                        and prev.get("verdict") in ("APPLY", "IDENTITY"):
+                    X = se3_matrices(np.asarray(prev["xi"], np.float64)) if prev["verdict"] == "APPLY" \
+                        else np.tile(np.eye(4), (N, 1, 1))
+                    print(f"[pose-graph] resume: {prev['verdict']} loaded from pose_graph.json")
+            except (ValueError, KeyError) as _e:
+                print(f"[pose-graph] pose_graph.json unreadable ({_e}) — re-solving")
+        if X is None:
+            edges_kf = list(getattr(self, '_stac_loop_edges_kf', []) or [])
+            if not edges_kf and not bool(cfg_req(gcfg, "run_without_loops", "graph")):
+                report = {"verdict": "IDENTITY", "reason": "no verified loop edge — nothing "
+                                                            "closes; odometry alone would only "
+                                                            "smooth what the seams already fixed",
+                          "chunk_indices": [list(ci) for ci in self.chunk_indices],
+                          "n_loop_edges": 0}
+                with open(pg_path, "w") as f:
+                    _json.dump(report, f, indent=1)
+                print(f"[pose-graph] IDENTITY: {report['reason']}")
+                return
+            # 1) initial poses per frame (owner copy, current chain)
+            T0 = np.zeros((N, 4, 4))
+            for k, (start, end) in enumerate(self.chunk_indices):
+                data = self._stac_load_chunk_aligned(k)
+                ext = np.asarray(data['extrinsic'])
+                for local, g in enumerate(range(start, end)):
+                    if owner[g] == k:
+                        T0[g] = self._stac_aligned_pose(k, local, ext[local])
+            self._stac_drop_aligned_cache()
+            # 2) σ per frame from the two-copy uncertainty
+            unc = getattr(self, '_stac_uncert', {}) or {}
+            unc_med = float(getattr(self, '_stac_uncert_median', 0.0) or 0.0)
+
+            def sig_u(g):
+                v = unc.get(g)
+                return float(v["median_m"]) if v and v.get("median_m") is not None else unc_med
+
+            seam_res = getattr(self, '_stac_seam_residuals', {}) or {}
+            s_intra = float(cfg_req(gcfg, "sigma_odo_intra_m", "graph"))
+            s_intra_deg = float(cfg_req(gcfg, "sigma_odo_intra_deg", "graph"))
+            pg = PoseGraph(T0, gcfg)
+            for g in range(N - 1):
+                Z = se3_inv(T0[g]) @ T0[g + 1]
+                s_t = np.sqrt(s_intra ** 2 + sig_u(g) ** 2 + sig_u(g + 1) ** 2)
+                if owner[g] != owner[g + 1]:
+                    s_t = np.sqrt(s_t ** 2 + float(seam_res.get(int(owner[g]), 0.0)) ** 2)
+                pg.add_relative(g, g + 1, Z, s_intra_deg, s_t, huber=False, tag="odo")
+            loop_ids = []
+            for e in edges_kf:
+                eid = pg.add_relative(int(e["i"]), int(e["j"]), np.asarray(e["Z"]),
+                                      float(e["sigma_deg"]), float(e["sigma_m"]), huber=True,
+                                      tag=f"loop:{e['bridge']}")
+                loop_ids.append((eid, e))
+            # 3) gravity prior: the consensus camera-down of the chain (orient's estimator)
+            downs = T0[:, :3, 1] / (np.linalg.norm(T0[:, :3, 1], axis=1, keepdims=True) + 1e-12)
+            g_down = downs.mean(0); g_down /= (np.linalg.norm(g_down) + 1e-12)
+            s_grav = float(cfg_req(gcfg, "sigma_gravity_deg", "graph"))
+            for g in range(N):
+                pg.add_gravity(g, g_down, s_grav)
+            # held-out judge BEFORE
+            held = self._stac_holdout_pairs(gcfg)
+            before_loop = pg.edge_residuals("loop")
+            loop_before = float(np.sum([r["t_m"] for r in before_loop.values()])) if before_loop else 0.0
+            # 4) solve with the §4.7 veto loop
+            vetoed = []
+            budget_cfg = (self._stac_loops_cfg() or {}).get("spatial") or {}
+            centres = T0[:, :3, 3]
+            for _round in range(len(loop_ids) + 1):
+                pg.solve(log=print)
+                Xc = pg.corrections()
+                edge_res = pg.edge_residuals("loop")
+                offenders = []
+                for eid, e in loop_ids:
+                    if not pg._edges[eid]["active"]:
+                        continue
+                    i, j = int(e["i"]), int(e["j"])
+                    lo, hi = min(i, j), max(i, j)
+                    L = float(np.linalg.norm(np.diff(centres[lo:hi + 1], axis=0), axis=1).sum())
+                    delta = max(float(budget_cfg["drift_floor_m"]),
+                                float(budget_cfg["drift_rate_m_per_m"]) * L)
+                    # what the edge DEMANDS: the correction it obtained at its
+                    # endpoints plus what it still asks for (its residual —
+                    # Huber lets a liar keep asking without being obeyed)
+                    need = max(float(np.linalg.norm(Xc[i][:3, 3])), float(np.linalg.norm(Xc[j][:3, 3])),
+                               float(edge_res.get(eid, {}).get("t_m", 0.0)))
+                    if need > delta:
+                        offenders.append((need - delta, eid, e, need, delta))
+                if not offenders:
+                    break
+                offenders.sort(reverse=True)
+                _, eid, e, need, delta = offenders[0]
+                pg.deactivate(eid)
+                vetoed.append({"bridge": e["bridge"], "i": e["i"], "j": e["j"],
+                               "correction_m": need, "budget_m": delta,
+                               "reason": "loop edge demands a correction beyond the drift "
+                                         "budget — not drift, a false loop (§4.7)"})
+                print(f"[pose-graph] VETO loop edge {e['i']}<->{e['j']} (bridge {e['bridge']}): "
+                      f"{need * 100:.0f} cm demanded > budget {delta * 100:.0f} cm — re-solving")
+            Xc = pg.corrections()
+            after_loop_res = pg.edge_residuals("loop")
+            loop_after = float(np.sum([r["t_m"] for r in after_loop_res.values()])) if after_loop_res else 0.0
+            # 5) gates
+            def _held_median(Xm):
+                vals = []
+                for f_, g_, p, q in held:
+                    p2 = p @ Xm[f_][:3, :3].T + Xm[f_][:3, 3]
+                    q2 = q @ Xm[g_][:3, :3].T + Xm[g_][:3, 3]
+                    vals.append(float(np.median(np.linalg.norm(p2 - q2, axis=1))))
+                return float(np.median(vals)) if vals else float("nan")
+            held_before = _held_median(np.tile(np.eye(4), (N, 1, 1)))
+            held_after = _held_median(Xc)
+            gain = (1.0 - loop_after / loop_before) if loop_before > 0 else 0.0
+            min_gain = float(cfg_req(gcfg, "min_loop_gain", "graph"))
+            max_deg = float(cfg_req(gcfg, "max_seam_degradation_m", "graph"))
+            n_active = sum(1 for eid, _ in loop_ids if pg._edges[eid]["active"])
+            ok_gain = (gain >= min_gain) if n_active > 0 else False
+            ok_held = (not np.isfinite(held_before)) or (held_after <= held_before + max_deg)
+            verdict = "APPLY" if (ok_gain and ok_held) else "IDENTITY"
+            # §4.7 authority: fraction used vs the declared maximum
+            t_mag = np.linalg.norm(Xc[:, :3, 3], axis=1)
+            r_mag = np.array([np.degrees(np.linalg.norm(se3_log(M)[:3])) for M in Xc])
+            a_max_m = float(cfg_req(acfg, "pose_graph_max_m", "authority"))
+            a_max_deg = float(cfg_req(acfg, "pose_graph_max_deg", "authority"))
+            frac = max(float(t_mag.max()) / a_max_m if a_max_m > 0 else 0.0,
+                       float(r_mag.max()) / a_max_deg if a_max_deg > 0 else 0.0)
+            saturated = frac > float(cfg_req(acfg, "saturation_warn", "authority"))
+            if frac > 1.0:
+                verdict = "IDENTITY"
+            xi = np.array([se3_log(M) for M in Xc])
+            report = {"chunk_indices": [list(ci) for ci in self.chunk_indices],
+                      "verdict": verdict,
+                      "gates": {"loop_gain": {"value": gain, "min": min_gain, "passed": ok_gain,
+                                              "loop_residual_before_m": loop_before,
+                                              "loop_residual_after_m": loop_after},
+                                "holdout_surface_pairs": {"n_pairs": len(held),
+                                                          "median_before_m": held_before,
+                                                          "median_after_m": held_after,
+                                                          "max_degradation_m": max_deg,
+                                                          "passed": ok_held}},
+                      "authority": {"stage": "pose_graph", "max_m": a_max_m, "max_deg": a_max_deg,
+                                    "used_max_m": float(t_mag.max()), "used_max_deg": float(r_mag.max()),
+                                    "fraction_used": frac, "saturated": bool(saturated),
+                                    "exceeded": bool(frac > 1.0)},
+                      "n_loop_edges": len(loop_ids), "n_loop_edges_active": n_active,
+                      "vetoed": vetoed, "gravity_down": g_down.tolist(),
+                      "solver": {k: v for k, v in pg.report.items() if k != "per_edge"},
+                      "loop_edges_after": {str(k): v for k, v in after_loop_res.items()},
+                      "xi": xi.tolist() if verdict == "APPLY" else None}
+            with open(pg_path, "w") as f:
+                _json.dump(report, f, indent=1)
+            print(f"[pose-graph] loop residual {loop_before * 100:.1f} → {loop_after * 100:.1f} cm "
+                  f"(gain {gain * 100:.0f}%, min {min_gain * 100:.0f}%) | held-out pairs "
+                  f"{held_before * 100:.2f} → {held_after * 100:.2f} cm | authority "
+                  f"{frac * 100:.0f}% of {a_max_m * 100:.0f} cm / {a_max_deg:.1f}° "
+                  f"{'SATURATED ' if saturated else ''}→ {verdict}")
+            X = Xc if verdict == "APPLY" else np.tile(np.eye(4), (N, 1, 1))
+            self._stac_authority_record("pose_graph", frac, saturated)
+        if not np.any([not np.allclose(M, np.eye(4), atol=1e-12) for M in X]):
+            return
+        # apply: compose into the per-frame fields (poses, depth graph, cap and the
+        # writers all read _stac_elastic_corr) and move BOTH copies of every frame.
+        # The composition happens ONCE per process (a resumed process starts with
+        # empty fields and composes once; the npys are stamped separately).
+        if not getattr(self, '_stac_pose_graph_composed', False):
+            ecorr = getattr(self, '_stac_elastic_corr', None)
+            if ecorr is None:
+                ecorr = {k: np.tile(np.eye(4), (end - start, 1, 1))
+                         for k, (start, end) in enumerate(self.chunk_indices)}
+                self._stac_elastic_corr = ecorr
+            for k, (start, end) in enumerate(self.chunk_indices):
+                for local, g in enumerate(range(start, end)):
+                    ecorr[k][local] = X[g] @ ecorr[k][local]
+            self._stac_pose_graph_composed = True
+        for k, (start, end) in enumerate(self.chunk_indices):
+            path = os.path.join(self.result_aligned_dir, f"chunk_{k}.npy")
+            data = np.load(path, allow_pickle=True).item()
+            if data.get('_stac_pose_graph_applied'):
+                print(f"[pose-graph] chunk {k}: already corrected — skipped")
+                continue
+            wp = np.asarray(data['world_points'])
+            lead = wp.ndim == 5
+            if lead:
+                wp = wp[0]
+            moved = 0
+            for local, g in enumerate(range(start, end)):
+                M = X[g]
+                if np.allclose(M, np.eye(4), atol=1e-12):
+                    continue
+                p = wp[local].reshape(-1, 3).astype(np.float64)
+                wp[local] = (p @ M[:3, :3].T + M[:3, 3]).reshape(wp[local].shape).astype(wp.dtype)
+                moved += 1
+            data['world_points'] = wp[None] if lead else wp
+            data['_stac_pose_graph_applied'] = True
+            np.save(path, data)
+            print(f"[pose-graph] chunk {k}: {moved}/{end - start} frames moved")
+        print("[pose-graph] ✅ keyframe corrections applied (rigid per frame: points + camera)")
+
+    def _stac_authority_record(self, stage, fraction, saturated, extra=None):
+        """§4.7: every corrective stage declares its authority and reports the
+        fraction it used — authority.json accumulates them for the acta."""
+        import json as _json
+        path = os.path.join(self.output_dir, "authority.json")
+        rep = {}
+        if os.path.exists(path):
+            try:
+                rep = _json.load(open(path))
+            except ValueError:
+                rep = {}
+        rep[stage] = {"fraction_used": float(fraction), "saturated": bool(saturated)}
+        if extra:
+            rep[stage].update(extra)
+        with open(path, "w") as f:
+            _json.dump(rep, f, indent=1)
+        if saturated:
+            print(f"[authority] ⚠ stage {stage} SATURATED: {fraction * 100:.0f}% of its declared "
+                  f"authority used (limit {self._stac_authority_cfg().get('saturation_warn')})")
 
     def _stac_vendor_bridge_fit(self, item, pred, meta):
         """The vendor's coarse point-map fit for one bridge (used ONLY as the
@@ -2371,6 +2946,8 @@ class VGGT_Long:
 
         _stac_loops = (self._stac_loops_cfg() is not None
                        and (self.config['Model'].get('metric_lock') or {}).get('enable'))
+        if _stac_loops:
+            self._stac_ensemble_uncertainty()      # §4.8 optional third witness (model loaded)
         if self.loop_enable:
             print('Loop SIM(3) estimating...')
             half = int(self.config['Model']['loop_chunk_size'] / 2)
@@ -2469,6 +3046,9 @@ class VGGT_Long:
                     R, t, _res, _n = _fit[0], _fit[1], _fit[2], _fit[3]
                     s = 1.0
                     self._stac_exact_seams = getattr(self, '_stac_exact_seams', 0) + 1
+                    if not hasattr(self, '_stac_seam_residuals'):
+                        self._stac_seam_residuals = {}
+                    self._stac_seam_residuals[chunk_idx] = float(_res)   # σ of the seam odometry (§4.3)
                     print(f"[exact-seam] {chunk_idx}->{chunk_idx+1}: rigid fit on "
                           f"{_n:,} exact correspondences, median residual {_res*100:.1f} cm")
                 else:
@@ -2602,7 +3182,11 @@ class VGGT_Long:
             self.loop_enable_opt = bool(self.loop_enable and len(self.loop_sim3_list) > 0)
         else:
             self.loop_enable_opt = False
-        if self.loop_enable_opt:
+        # STAC F2: in the vggtomega path the per-chunk Sim3 optimizer is REPLACED by
+        # the keyframe SE(3) graph (_stac_pose_graph, after the chunks are aligned);
+        # the vendor optimizer stays for the other backends.
+        _stac_kf_graph = bool(_stac_loops and self._stac_graph_cfg() is not None)
+        if self.loop_enable_opt and not _stac_kf_graph:
             input_abs_poses = self.loop_optimizer.sequential_to_absolute_poses(self.sim3_list)
             self.sim3_list = self.loop_optimizer.optimize(self.sim3_list, self.loop_sim3_list)
             optimized_abs_poses = self.loop_optimizer.sequential_to_absolute_poses(self.sim3_list)
@@ -2634,6 +3218,19 @@ class VGGT_Long:
 
         print('Apply alignment')
         self.sim3_list = accumulate_sim3_transforms(self.sim3_list)
+        # STAC: persist the accumulated per-chunk transforms — the post-hoc
+        # stages (quality A/B harness, certification) rebuild _stac_aligned_pose
+        # from the aligned npys + this file instead of re-running the seams.
+        try:
+            import json as _json
+            with open(os.path.join(self.output_dir, "chunk_sim3.json"), "w") as _f:
+                _json.dump({"chunk_indices": [list(ci) for ci in self.chunk_indices],
+                            "sim3": [{"s": float(s_), "R": np.asarray(R_).tolist(),
+                                      "t": np.asarray(t_).tolist()} for s_, R_, t_ in self.sim3_list]},
+                           _f, indent=1)
+        except OSError as _e:
+            raise RuntimeError(f"could not persist chunk_sim3.json ({_e}) — the post-hoc "
+                               f"stages need the accumulated chunk transforms")
 
         # STAC patch: single-chunk case (frames <= chunk_size → exactly 1 chunk). The
         # pairwise apply loop below is range(0) and saves NOTHING (chunk_0 is normally
@@ -2654,7 +3251,8 @@ class VGGT_Long:
         # _stac_write_deferred_outputs() writes the outputs at the end.
         _elastic = ((self.config['Model'].get('elastic_seam')
                      or self.config['Model'].get('depth_graph')
-                     or self.config['Model'].get('blend_copies'))
+                     or self.config['Model'].get('blend_copies')
+                     or _stac_kf_graph)
                     and len(self.chunk_indices) > 1)
         if _elastic:
             print("[STAC] per-chunk PLY/origins deferred until after the elastic/depth stages")
@@ -2733,6 +3331,14 @@ class VGGT_Long:
         # of every shared frame coincide), per-frame DEPTH GRAPH (different frames
         # agree on the depth of shared surfaces), then the deferred PLY/origins
         # from the FINAL geometry. save_camera_poses applies the elastic pose moves.
+        if _stac_kf_graph:
+            # STAC F2: §4.8 intrinsic uncertainty (two-copy disagreement per shared
+            # frame, + the optional ensemble witness) BEFORE the keyframe graph,
+            # which consumes it as σ; the graph moves every frame rigidly and its
+            # corrections flow into _stac_elastic_corr like the intra-chunk stage.
+            self._stac_uncertainty()
+            self._stac_ensemble_apply()
+            self._stac_pose_graph()
         self._stac_elastic_seams()
         self._stac_intra_chunk()
         self._stac_depth_graph()
