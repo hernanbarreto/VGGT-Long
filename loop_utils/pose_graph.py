@@ -122,12 +122,19 @@ class PoseGraph:
 
     # ── graph construction ───────────────────────────────────────────────
     def _add(self, kind, i, j, params, weight, huber, tag, huber_delta_m=None,
-             huber_delta_deg=None):
+             huber_delta_deg=None, sqrt_info=None):
         # per-edge Huber widths override Model.graph.huber_delta_* (a wall's
-        # tolerance is the wall's, not the loop's); NaN = the global value
+        # tolerance is the wall's, not the loop's); NaN = the global value.
+        # ``sqrt_info`` (m×m, L with L·Lᵀ = information) replaces the diagonal
+        # weights when a measurement observes some DOF and not others (a
+        # floor patch observes only its normal; a column only the plane
+        # across its axis): the weighted residual is L·r, its covariance I.
+        w = np.asarray(weight, np.float64).reshape(-1)
         self._edges.append({"kind": kind, "i": int(i), "j": int(j),
                             "params": np.asarray(params, np.float64).reshape(-1),
-                            "w": np.asarray(weight, np.float64).reshape(-1),
+                            "w": w,
+                            "W": (np.asarray(sqrt_info, np.float64) if sqrt_info is not None
+                                  else np.diag(w)),
                             "huber": bool(huber), "tag": tag, "active": True,
                             "hd_m": float("nan") if huber_delta_m is None else float(huber_delta_m),
                             "hd_rad": (float("nan") if huber_delta_deg is None
@@ -135,12 +142,25 @@ class PoseGraph:
         return len(self._edges) - 1
 
     def add_relative(self, i, j, Z, sigma_rot_deg, sigma_t_m, huber=False, tag="odo",
-                     huber_delta_m=None, huber_delta_deg=None):
-        """Measurement Z = T_i⁻¹ T_j (4x4). Returns the edge id."""
+                     huber_delta_m=None, huber_delta_deg=None, info_t=None, info_rot=None):
+        """Measurement Z = T_i⁻¹ T_j (4x4). Returns the edge id. ``info_t`` /
+        ``info_rot``: optional 3×3 information matrices of the translation /
+        rotation residual (expressed in node i's frame, the residual's frame)
+        for measurements that observe only some directions; the scalar σ's
+        stay the diagonal reference for the Huber thresholds."""
         Zinv = se3_inv(np.asarray(Z, np.float64)).reshape(-1)
         w = np.concatenate([np.full(3, 1.0 / math.radians(max(float(sigma_rot_deg), 1e-9))),
                             np.full(3, 1.0 / max(float(sigma_t_m), 1e-9))])
-        return self._add(_REL, i, j, Zinv, w, huber, tag, huber_delta_m, huber_delta_deg)
+        W = None
+        if info_t is not None or info_rot is not None:
+            W = np.zeros((6, 6))
+            W[:3, :3] = (np.linalg.cholesky(np.asarray(info_rot, np.float64)) if info_rot is not None
+                         else np.diag(w[:3]))
+            W[3:, 3:] = (np.linalg.cholesky(np.asarray(info_t, np.float64)) if info_t is not None
+                         else np.diag(w[3:]))
+            # the diagonal reference of a general L: the per-axis σ it implies
+            w = np.sqrt(np.clip(np.diag(W @ W.T), 1e-18, None))
+        return self._add(_REL, i, j, Zinv, w, huber, tag, huber_delta_m, huber_delta_deg, W)
 
     def add_gravity(self, i, down_world, sigma_deg, tag="gravity"):
         d = np.asarray(down_world, np.float64)
@@ -221,6 +241,7 @@ class PoseGraph:
             g["eid"].append(eid); g["i"].append(e["i"]); g["j"].append(e["j"])
             g["params"].append(e["params"]); g["w"].append(e["w"]); g["huber"].append(e["huber"])
             g["hd"].append((e["hd_rad"], e["hd_m"]))
+            g.setdefault("W", []).append(e["W"])
         out = {}
         for k, g in groups.items():
             out[k] = {"eid": np.asarray(g["eid"]),
@@ -232,7 +253,8 @@ class PoseGraph:
                                            device=self.device),
                       "huber": torch.as_tensor(np.asarray(g["huber"]), device=self.device),
                       "hd": torch.as_tensor(np.asarray(g["hd"], np.float64), dtype=torch.float64,
-                                            device=self.device)}
+                                            device=self.device),
+                      "W": torch.as_tensor(np.stack(g["W"]), dtype=torch.float64, device=self.device)}
         return out
 
     def _huber_thresholds(self, kind, g):
@@ -262,7 +284,7 @@ class PoseGraph:
                 return kern(di, dj, ti, tj, p)
 
             r = torch.vmap(f)(zero.expand(len(Ti), 6), zero.expand(len(Ti), 6), Ti, Tj, g["params"])
-            rw = r * g["w"]
+            rw = torch.einsum("eab,eb->ea", g["W"], r)      # L·r (diagonal L = the σ weights)
             # Huber (IRLS): weight min(1, δ/‖r‖) on the WEIGHTED residual, with δ
             # expressed in σ units per component — angular components
             # (rotation, normal / axis differences ≈ radians) take
@@ -280,7 +302,7 @@ class PoseGraph:
             if with_jac:
                 jac = torch.vmap(torch.func.jacrev(f, argnums=(0, 1)))(
                     zero.expand(len(Ti), 6), zero.expand(len(Ti), 6), Ti, Tj, g["params"])
-                J = torch.cat([jac[0], jac[1]], dim=2) * g["w"][:, :, None]   # (n_e, m, 12)
+                J = torch.einsum("eab,ebc->eac", g["W"], torch.cat([jac[0], jac[1]], dim=2))  # (n_e, m, 12)
                 rec["J"] = J
             out[kind] = rec
         return out
@@ -340,9 +362,16 @@ class PoseGraph:
         free = torch.arange(6, n6, device=self.device)
         A = H[free][:, free]
         b = -gvec[free]
-        A = A + lam * torch.diag(torch.diagonal(A)).clamp(min=0) + \
-            lam * float(_req(self.cfg, "lm_diag_floor")) * torch.eye(len(free), dtype=A.dtype,
-                                                                     device=self.device)
+        # LM damping on the observable freedoms; an ABSOLUTE Tikhonov floor
+        # (lm_diag_floor × the largest diagonal entry, independent of λ) on the
+        # unobservable ones — a plane node's in-plane translation and its
+        # rotation about the normal have an exactly-zero diagonal, and a
+        # floor that shrank with λ left them at 1e-13 against 1e4 entries:
+        # Cholesky reported "not positive-definite" (certify smoke, 90 kf)
+        dA = torch.diagonal(A).clamp(min=0)
+        floor = float(_req(self.cfg, "lm_diag_floor")) * float(dA.max().clamp(min=1.0))
+        A = A + lam * torch.diag(dA) + floor * torch.eye(len(free), dtype=A.dtype,
+                                                          device=self.device)
         d = torch.zeros(n6, dtype=torch.float64, device=self.device)
         if len(free) <= int(_req(self.cfg, "dense_max_unknowns")):
             L = torch.linalg.cholesky(A)
@@ -462,19 +491,31 @@ class PoseGraph:
         return np.stack([Tn[k] @ se3_inv(T0[k]) for k in range(self.n)])
 
     def edge_residuals(self, tag_prefix: Optional[str] = None) -> Dict[int, dict]:
-        """Raw relative-edge residuals (rot deg, t m) at the CURRENT state."""
+        """Relative-edge residuals at the CURRENT state: raw (rot deg, t m)
+        and, for edges with a per-DOF information matrix, the OBSERVED
+        translation residual ``t_obs_m`` = √(r_tᵀ·info_t·r_t)·σ_t — what the
+        measurement actually claims (a floor patch's in-plane components are
+        not a residual, they were never measured); ``weighted_norm`` is the
+        whole residual in σ units."""
         out = {}
         groups = self._groups()
         res = self._residuals(self.T, groups, with_jac=False)
         for kind, rec in res.items():
             raw = rec["raw"].cpu().numpy()
+            rw = rec["r"].cpu().numpy()
             for k, eid in enumerate(groups[kind]["eid"]):
-                tag = self._edges[eid]["tag"]
+                e = self._edges[eid]
+                tag = e["tag"]
                 if tag_prefix is not None and not str(tag).startswith(tag_prefix):
                     continue
                 if kind == _REL:
+                    W_t = e["W"][3:, 3:]
+                    sigma_t = 1.0 / max(float(np.max(e["w"][3:])), 1e-12)
+                    t_obs = float(np.linalg.norm(W_t.T @ raw[k][3:])) * sigma_t
                     out[int(eid)] = {"rot_deg": float(np.degrees(np.linalg.norm(raw[k][:3]))),
-                                     "t_m": float(np.linalg.norm(raw[k][3:])), "tag": tag}
+                                     "t_m": float(np.linalg.norm(raw[k][3:])), "t_obs_m": t_obs,
+                                     "weighted_norm": float(np.linalg.norm(rw[k])), "tag": tag}
                 else:
-                    out[int(eid)] = {"norm": float(np.linalg.norm(raw[k])), "tag": tag}
+                    out[int(eid)] = {"norm": float(np.linalg.norm(raw[k])),
+                                     "weighted_norm": float(np.linalg.norm(rw[k])), "tag": tag}
         return out

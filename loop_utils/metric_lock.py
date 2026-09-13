@@ -776,7 +776,8 @@ def pair_depth_relation(z_src, z_dst, iters=6):
     return float(a), float(b), before, int(len(zs))
 
 
-def solve_depth_graph(measurements, n_frames, sick_frames=(), scale_only=False):
+def solve_depth_graph(measurements, n_frames, sick_frames=(), scale_only=False, weights=None,
+                      weights_b=None):
     """Per-frame depth corrections z' = a_f*z + b_f from pairwise affine relations,
     the frame-level analogue of solve_scale_graph. For a pair (f, g) with measured
     z_g = alpha*z_f + beta, corrected consistency (a_f z + b_f == a_g(alpha z +
@@ -794,10 +795,25 @@ def solve_depth_graph(measurements, n_frames, sick_frames=(), scale_only=False):
     rung of the model ladder. After the metric lock + scale drift the residual
     inter-frame depth disagreement is mostly MULTIPLICATIVE (leftover scale
     error); the free offset is where an unbounded low-frequency warp hides
-    (measured on test4: b ran to ±112 cm while the scale stayed near 1)."""
-    meas = [(f, g, al, be) for f, g, al, be in measurements
-            if f not in sick_frames and g not in sick_frames
-            and np.isfinite(al) and al > 0 and np.isfinite(be)]
+    (measured on test4: b ran to ±112 cm while the scale stayed near 1).
+
+    ``weights``: optional per-measurement weights (1/σ, same length as
+    ``measurements``) applied to both systems — the projection sensor's rows
+    and the correspondence rows of claude_stac.txt §6.4 (triangulated
+    tracks) carry very different precisions; unweighted, 200 biased pair
+    rows outvoted 40 exact track rows and dragged clean frames (measured,
+    F3 depth test). None = every row weighs 1 (the F1/F2 behaviour).
+    ``weights_b``: weights of the OFFSET system (its residuals are metres,
+    the scale system's are log units — one 1/σ does not fit both); defaults
+    to ``weights``."""
+    idx = [q for q, (f, g, al, be) in enumerate(measurements)
+           if f not in sick_frames and g not in sick_frames
+           and np.isfinite(al) and al > 0 and np.isfinite(be)]
+    meas = [tuple(measurements[q])[:4] for q in idx]
+    wts = (np.ones(len(meas)) if weights is None
+           else np.asarray([float(weights[q]) for q in idx], np.float64))
+    wts_b = (wts if weights_b is None
+             else np.asarray([float(weights_b[q]) for q in idx], np.float64))
     a = np.ones(n_frames)
     b = np.zeros(n_frames)
     if not meas:
@@ -806,12 +822,12 @@ def solve_depth_graph(measurements, n_frames, sick_frames=(), scale_only=False):
     col = {f: i for i, f in enumerate(frames)}
     n = len(frames)
     rows, rhs = [], []
-    for f, g, al, _ in meas:
+    for (f, g, al, _), wq in zip(meas, wts):
         r = np.zeros(n)
-        r[col[f]], r[col[g]] = 1.0, -1.0
+        r[col[f]], r[col[g]] = wq, -wq
         rows.append(r)
-        rhs.append(np.log(al))
-    gauge = np.full(n, float(len(rows)) / n)      # strong: pins the mean exactly
+        rhs.append(wq * np.log(al))
+    gauge = np.full(n, float(np.mean(wts)) * float(len(rows)) / n)   # strong: pins the mean exactly
     rows.append(gauge)
     rhs.append(0.0)
     x, *_ = np.linalg.lstsq(np.asarray(rows), np.asarray(rhs), rcond=None)
@@ -820,12 +836,12 @@ def solve_depth_graph(measurements, n_frames, sick_frames=(), scale_only=False):
     if scale_only:
         return a, b
     rows, rhs = [], []
-    for f, g, _, be in meas:
+    for (f, g, _, be), wq in zip(meas, wts_b):
         r = np.zeros(n)
-        r[col[f]], r[col[g]] = 1.0, -1.0
+        r[col[f]], r[col[g]] = wq, -wq
         rows.append(r)
-        rhs.append(a[g] * be)
-    rows.append(gauge)
+        rhs.append(wq * a[g] * be)
+    rows.append(np.full(n, float(np.mean(wts_b)) * float(len(rows)) / n))
     rhs.append(0.0)
     y, *_ = np.linalg.lstsq(np.asarray(rows), np.asarray(rhs), rcond=None)
     for f, i in col.items():
