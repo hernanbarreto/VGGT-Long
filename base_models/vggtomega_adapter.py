@@ -95,7 +95,7 @@ class VGGTOmegaAdapter(Base3DModel):
 
         world_points = self._unproject(depth, intr, c2w)        # [1,S,H,W,3]
 
-        return {
+        out = {
             "world_points": world_points,
             "world_points_conf": dconf if dconf is not None else torch.ones_like(depth),
             "extrinsic": c2w,                                   # C2W 4x4
@@ -105,6 +105,16 @@ class VGGTOmegaAdapter(Base3DModel):
             "images": images[None],
             "mask": None,
         }
+        # STAC (claude_stac.txt §4.2.3): the aggregator's camera + register tokens
+        # per frame ([1,S,n_reg,C], ~2 MB per 60-frame chunk). Persisted with the
+        # chunk so the loop verifier can score whether two windows see the same
+        # scene from the backbone itself (config-gated, Model.loops.attention_verify).
+        tok = pred.get("camera_and_register_tokens")
+        if tok is not None:
+            if tok.dim() == 3:
+                tok = tok[None]
+            out["camera_and_register_tokens"] = tok.float()
+        return out
 
     @staticmethod
     def _unproject(depth: torch.Tensor, K: torch.Tensor, c2w: torch.Tensor) -> torch.Tensor:

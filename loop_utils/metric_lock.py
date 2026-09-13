@@ -131,24 +131,35 @@ def seam_relative_scale(depth_a, depth_b, min_px=1000):
 
 
 def solve_scale_graph(s_da3, n_anchors, seam_rel, n_chunks,
-                      sigma_seam=0.003, sigma_anchor=0.08):
-    """Optimal per-chunk metric scales from BOTH sensors, weighted least squares
-    in log-scale space.
+                      sigma_seam=0.003, sigma_anchor=0.08,
+                      loop_rel=None, absolute=None, skip_loop=None):
+    """Optimal per-chunk metric scales from EVERY sensor, weighted least squares
+    in log-scale space — a GRAPH, no longer a chain (claude_stac.txt §5).
 
     The overlap frames measure the RELATIVE scale between neighbours to ~0.1-1%
     (same pixels, a ratio); the DA3 anchors measure each chunk's ABSOLUTE scale
     with ±8-15% monocular noise. Locking chunks to their own noisy DA3 median
     left neighbours disagreeing 5-27% — decimetres-to-metres of seam decoupling
-    an SE(3) glue can never fix (measured, test4). Fusing both:
+    an SE(3) glue can never fix (measured, test4). Fusing all of them:
 
-        minimize  Σ_seams   [(x_{k+1} - x_k) - log r_k]² / σ_seam²
-                + Σ_anchors [x_k - log s_k^DA3]²         / (σ_anchor/√n_k)²
+        minimize  Σ_seams   [(x_{k+1} - x_k) - log r_k]²      / σ_seam²
+                + Σ_anchors [x_k - log s_k^DA3]²              / (σ_anchor/√n_k)²
+                + Σ_loops   [(x_j - x_i) - log r_ij]²         / σ_ij²      (§5.1)
+                + Σ_abs     [x_k - log s_k^src]²              / σ_src²     (§5.2)
 
-    x_k = log s_k. Linear, tiny (one variable per chunk). Seams make the scales
-    CONSISTENT; anchors pin the global metre without dragging neighbours apart.
+    x_k = log s_k. Linear, tiny (one variable per chunk). Seams make neighbours
+    CONSISTENT; loop rows CLOSE the walk (without them the scale random-walks
+    along the chain, P4); absolute rows (VIO, regulated dimensions, a user
+    measurement) pin the metre with their own σ — the most precise source wins,
+    DA3 becomes the cross-check.
 
     s_da3: {k: s} absolute estimates; n_anchors: {k: count}; seam_rel: {k: r}
-    with r = s_{k+1}/s_k (from seam_relative_scale). Returns np.ndarray scales.
+    with r = s_{k+1}/s_k (from seam_relative_scale).
+    loop_rel: {(i, j): (log_r, sigma)} with log_r = log(s_j/s_i) measured by an
+    exact loop bridge (loop_bridges.loop_scale_row); skip_loop: a key of
+    loop_rel to leave out (scale-break diagnosis, §5.3).
+    absolute: iterable of (k, log_s, sigma[, source]) extra absolute rows.
+    Returns np.ndarray scales (len n_chunks).
     """
     rows, rhs, w = [], [], []
     for k, r in seam_rel.items():
@@ -164,12 +175,119 @@ def solve_scale_graph(s_da3, n_anchors, seam_rel, n_chunks,
         row[k] = 1.0
         sig = sigma_anchor / max(np.sqrt(float(n_anchors.get(k, 1))), 1.0)
         rows.append(row); rhs.append(np.log(s)); w.append(1.0 / sig)
+    for key, val in (loop_rel or {}).items():
+        if skip_loop is not None and key == skip_loop:
+            continue
+        i, j = int(key[0]), int(key[1])
+        log_r, sig = float(val[0]), float(val[1])
+        if i == j or not np.isfinite(log_r) or not (sig > 0):
+            continue
+        row = np.zeros(n_chunks)
+        row[i], row[j] = -1.0, 1.0
+        rows.append(row); rhs.append(log_r); w.append(1.0 / sig)
+    for rec in (absolute or ()):
+        k, log_s, sig = int(rec[0]), float(rec[1]), float(rec[2])
+        if not np.isfinite(log_s) or not (sig > 0):
+            continue
+        row = np.zeros(n_chunks)
+        row[k] = 1.0
+        rows.append(row); rhs.append(log_s); w.append(1.0 / sig)
     if not rows:
         raise ValueError("scale graph has no constraints")
     A = np.asarray(rows) * np.asarray(w)[:, None]
     b = np.asarray(rhs) * np.asarray(w)
     x, *_ = np.linalg.lstsq(A, b, rcond=None)
     return np.exp(x)
+
+
+def seam_residuals(scales, seam_rel):
+    """Per-seam |log| residual of a scale solution against the measured seam
+    ratios: {k: |(x_{k+1} - x_k) - log r_k|}."""
+    x = np.log(np.asarray(scales, np.float64))
+    out = {}
+    for k, r in seam_rel.items():
+        if r is None or not np.isfinite(r) or r <= 0 or k + 1 >= len(x):
+            continue
+        out[int(k)] = float(abs((x[k + 1] - x[k]) - np.log(r)))
+    return out
+
+
+def scale_break_diagnosis(s_da3, n_anchors, seam_rel, n_chunks, loop_rel,
+                          break_key, sigma_seam, sigma_anchor, absolute=None,
+                          localisation_gap=2.0):
+    """§5.3: a loop whose measured relative scale contradicts the chain
+    (scale_break) is NOT discarded — the graph is solved WITH and WITHOUT its
+    row, and the seam where the scale jumped is searched for.
+
+    Least squares spreads one bad seam over every seam the loop spans, so the
+    residual pattern alone cannot name it; and a single cycle (seams + one
+    loop row) cannot localise a jump by itself — dropping ANY seam of the
+    cycle makes the rest consistent. The witnesses that break the tie are the
+    ABSOLUTE rows (DA3 anchors, VIO, regulated dims): LEAVE-ONE-SEAM-OUT solves
+    the graph WITH the loop row and without each spanned seam in turn; the
+    seam whose absence lets every remaining measurement — seams, loop AND
+    absolute rows — agree best is the suspect. The verdict is honest about
+    its power: ``localised`` is False when the second-best candidate's cost is
+    within ``localisation_gap`` (Δχ²) of the best, and the ranking is reported
+    so the kit visual can show the ambiguity instead of a false certainty."""
+    i, j = int(break_key[0]), int(break_key[1])
+    lo, hi = min(i, j), max(i, j)
+    with_row = solve_scale_graph(s_da3, n_anchors, seam_rel, n_chunks,
+                                 sigma_seam=sigma_seam, sigma_anchor=sigma_anchor,
+                                 loop_rel=loop_rel, absolute=absolute)
+    without = solve_scale_graph(s_da3, n_anchors, seam_rel, n_chunks,
+                                sigma_seam=sigma_seam, sigma_anchor=sigma_anchor,
+                                loop_rel=loop_rel, absolute=absolute,
+                                skip_loop=break_key)
+    r_with = seam_residuals(with_row, seam_rel)
+    r_without = seam_residuals(without, seam_rel)
+    # Least squares spreads one bad seam over every seam the loop spans, so
+    # the residual pattern alone cannot name it. LEAVE-ONE-SEAM-OUT: drop each
+    # spanned seam in turn and solve WITH the loop row; the seam whose absence
+    # lets every remaining measurement agree (minimum weighted cost of the
+    # rest) is the one that contradicted the loop — the scale jump.
+    loop_log, loop_sig = float(loop_rel[break_key][0]), float(loop_rel[break_key][1])
+    cands = [k for k in seam_rel if lo <= k < hi and seam_rel[k] is not None
+             and np.isfinite(seam_rel[k]) and seam_rel[k] > 0]
+    if not cands:
+        return {"loop": [i, j], "suspect_seam": None, "growth_log": None,
+                "jump_pct": None, "note": "the loop spans no measured seam"}
+    ranking = []
+    for k in cands:
+        seams_k = {kk: v for kk, v in seam_rel.items() if kk != k}
+        x = solve_scale_graph(s_da3, n_anchors, seams_k, n_chunks,
+                              sigma_seam=sigma_seam, sigma_anchor=sigma_anchor,
+                              loop_rel=loop_rel, absolute=absolute)
+        lx = np.log(x)
+        cost = 0.0
+        for kk, v in seams_k.items():
+            if v is None or not np.isfinite(v) or v <= 0:
+                continue
+            cost += ((lx[kk + 1] - lx[kk]) - np.log(v)) ** 2 / sigma_seam ** 2
+        cost += ((lx[j] - lx[i]) - loop_log) ** 2 / loop_sig ** 2
+        for kk, s in s_da3.items():
+            if s is None or not np.isfinite(s) or s <= 0:
+                continue
+            sig = sigma_anchor / max(np.sqrt(float(n_anchors.get(kk, 1))), 1.0)
+            cost += (lx[kk] - np.log(s)) ** 2 / sig ** 2
+        for rec in (absolute or ()):
+            kk, log_s, sig = int(rec[0]), float(rec[1]), float(rec[2])
+            if np.isfinite(log_s) and sig > 0:
+                cost += (lx[kk] - log_s) ** 2 / sig ** 2
+        jump = float(abs((lx[k + 1] - lx[k]) - np.log(seam_rel[k])))
+        ranking.append((float(cost), int(k), jump))
+    ranking.sort()
+    best_cost, best_k, best_jump = ranking[0]
+    localised = len(ranking) == 1 or (ranking[1][0] - best_cost) >= float(localisation_gap)
+    return {"loop": [i, j], "suspect_seam": int(best_k),
+            "localised": bool(localised),
+            "growth_log": float(r_with.get(best_k, 0.0) - r_without.get(best_k, 0.0)),
+            "jump_pct": float((np.exp(best_jump) - 1.0) * 100.0),
+            "leave_one_out_cost": best_cost,
+            "ranking": [{"seam": k_, "cost": c_, "jump_pct": float((np.exp(j_) - 1.0) * 100.0)}
+                        for c_, k_, j_ in ranking],
+            "localisation_gap": float(localisation_gap),
+            "residual_with_row_log": r_with, "residual_without_row_log": r_without}
 
 
 def solve_scale_drift(anchors, seam_obs, n_chunks, prior=None,

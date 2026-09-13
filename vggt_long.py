@@ -171,25 +171,22 @@ class VGGT_Long:
 
         # STAC patch (resume): if loop_closures.txt already exists, load the pairs and
         # SKIP the DINOv2/SALAD feature extraction (~20 min). Pairs are written as
-        # "i, j, sim" lines; "#" lines are headers/the image-path list.
+        # "i, j, sim[, source]" lines; "#" lines are headers/the image-path list.
+        # The optional 4th column is the candidate SOURCE (salad | instance |
+        # manual — claude_stac.txt §4.4): the server appends instance/manual
+        # candidates to this same file, and a resumed run consumes them.
         loop_txt = os.path.join(self.output_dir, "loop_closures.txt")
         if not self.useDBoW and os.path.exists(loop_txt):
-            try:
-                pairs = []
-                with open(loop_txt) as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line or line.startswith("#"):
-                            continue
-                        parts = [p.strip() for p in line.split(",")]
-                        if len(parts) >= 2:
-                            pairs.append((int(parts[0]), int(parts[1])))
-                self.loop_list = pairs
-                print(f"[STAC resume] loop_closures.txt found — {len(pairs)} loops loaded, "
-                      f"DINOv2 extraction skipped")
-                return
-            except Exception as _e:
-                print(f"[STAC resume] loop_closures.txt unreadable ({_e}) — re-detecting")
+            from loop_utils.loop_bridges import load_loop_candidates
+            cands = load_loop_candidates(loop_txt)
+            self.loop_cands = cands
+            self.loop_list = [(c["i"], c["j"]) for c in cands]
+            srcs = {}
+            for c in cands:
+                srcs[c["source"]] = srcs.get(c["source"], 0) + 1
+            print(f"[STAC resume] loop_closures.txt found — {len(cands)} candidate(s) "
+                  f"loaded by source {srcs}, DINOv2 extraction skipped")
+            return
 
         if self.useDBoW: # DBoW2
             for frame_id, img_path in tqdm(enumerate(self.img_list)):
@@ -215,6 +212,8 @@ class VGGT_Long:
         else: # DNIO v2
             self.loop_detector.run()
             self.loop_list = self.loop_detector.get_loop_list()
+            self.loop_cands = [{"i": int(i), "j": int(j), "sim": float(s), "source": "salad"}
+                               for i, j, s in (self.loop_detector.loop_closures or [])]
 
     def _stac_mask_sky(self, predictions, chunk_image_paths):
         """STAC: zero per-pixel confidence at sky regions so the cloud builder's
@@ -270,12 +269,20 @@ class VGGT_Long:
         predictions['world_points_conf'] = wpc
         print(f"[STAC sky] masked sky on {n}/{S} chunk frames")
 
-    def process_single_chunk(self, range_1, chunk_idx=None, range_2=None, is_loop=False):
+    def process_single_chunk(self, range_1, chunk_idx=None, range_2=None, is_loop=False,
+                             extra_1=None, extra_2=None):
         start_idx, end_idx = range_1
-        chunk_image_paths = self.img_list[start_idx:end_idx]
+        chunk_image_paths = list(self.img_list[start_idx:end_idx])
+        # STAC (claude_stac.txt §4.9): a loop bridge may carry NON-keyframe frames
+        # (extra_1 after window 1, extra_2 after window 2) to densify the revisit.
+        # They never enter the chain; the layout records which bridge frame is
+        # which chunk frame so the exact correspondences ignore them.
+        extra_1 = list(extra_1 or [])
+        extra_2 = list(extra_2 or [])
+        chunk_image_paths += extra_1
         if range_2 is not None:
             start_idx, end_idx = range_2
-            chunk_image_paths += self.img_list[start_idx:end_idx]
+            chunk_image_paths += list(self.img_list[start_idx:end_idx]) + extra_2
 
         # Resolve the output path FIRST so we can resume from an existing chunk.
         if is_loop:
@@ -287,6 +294,7 @@ class VGGT_Long:
             save_dir = self.result_unaligned_dir
             filename = f"chunk_{chunk_idx}.npy"
         save_path = os.path.join(save_dir, filename)
+        expected_frames = len(chunk_image_paths)
 
         # STAC patch (resume): if this chunk's .npy already exists (prior run), load it
         # and SKIP the expensive inference. Restore the camera state EXACTLY as the
@@ -295,6 +303,12 @@ class VGGT_Long:
         if os.path.exists(save_path):
             try:
                 predictions = np.load(save_path, allow_pickle=True).item()
+                _n_on_disk = int(np.asarray(predictions['depth']).shape[0]
+                                 if np.asarray(predictions['depth']).ndim == 3
+                                 else np.asarray(predictions['depth']).shape[1])
+                if is_loop and _n_on_disk != expected_frames:
+                    raise ValueError(f"bridge on disk has {_n_on_disk} frames, this run "
+                                     f"needs {expected_frames} (extra-frame policy changed)")
                 if not is_loop and range_2 is None:
                     self.all_camera_poses.append((self.chunk_indices[chunk_idx], predictions['extrinsic']))
                     self.all_camera_intrinsics.append((self.chunk_indices[chunk_idx], predictions['intrinsic']))
@@ -307,6 +321,10 @@ class VGGT_Long:
         for key in predictions.keys():
             if isinstance(predictions[key], torch.Tensor):
                 predictions[key] = predictions[key].cpu().numpy().squeeze(0)
+        if is_loop:
+            predictions['_stac_extra'] = {"n_extra_1": len(extra_1), "n_extra_2": len(extra_2),
+                                          "extra_1": [os.path.basename(p) for p in extra_1],
+                                          "extra_2": [os.path.basename(p) for p in extra_2]}
 
         if not is_loop and range_2 is None:
             extrinsics = predictions['extrinsic']
@@ -460,11 +478,30 @@ class VGGT_Long:
 
         # 2) fuse both sensors: seams make neighbours CONSISTENT (0.1-1% noise),
         # anchors pin the global metre (±8-15% each). Weighted LS in log space.
+        # STAC F1 (§5.2): ABSOLUTE rows from other sources (VIO, regulated
+        # dimensions, a user measurement — Model.metric_lock.absolute_rows,
+        # each {chunk, log_s, sigma, source}) join the same solve; the loop rows
+        # (§5.1) are added by _stac_scale_close once the bridges are measured.
+        _abs_rows = [(int(r["chunk"]), float(r["log_s"]), float(r["sigma"]),
+                      str(r.get("source", "unspecified")))
+                     for r in (ml.get('absolute_rows') or [])]
+        if ml.get('vio') and not already:
+            _abs_rows += self._stac_vio_rows(ml['vio'], report)
+        self._stac_scale_inputs = None
         if scales and seam_rel:
+            _sigma_seam = float(ml.get('sigma_seam', 0.003))
+            _sigma_anchor = float(ml.get('sigma_anchor', 0.08))
+            self._stac_scale_inputs = {"s_da3": dict(scales), "n_anchors": dict(n_anchor_map),
+                                       "seam_rel": dict(seam_rel), "sigma_seam": _sigma_seam,
+                                       "sigma_anchor": _sigma_anchor, "absolute": _abs_rows}
+            if _abs_rows:
+                print(f"[metric-lock] {len(_abs_rows)} absolute scale row(s) from "
+                      f"{sorted({r[3] for r in _abs_rows})} enter the graph")
             s_opt = solve_scale_graph(scales, n_anchor_map, seam_rel,
                                       len(self.chunk_indices),
-                                      sigma_seam=float(ml.get('sigma_seam', 0.003)),
-                                      sigma_anchor=float(ml.get('sigma_anchor', 0.08)))
+                                      sigma_seam=_sigma_seam,
+                                      sigma_anchor=_sigma_anchor,
+                                      absolute=_abs_rows)
             for k in range(len(self.chunk_indices)):
                 if np.isfinite(s_opt[k]) and s_opt[k] > 0:
                     old_s = scales.get(k)
@@ -545,10 +582,20 @@ class VGGT_Long:
                 apply_scale(data, s)
             self._stac_hybrid_da3(data, k, anchor_dir, near_frac)
             np.save(path, data)
+        # STAC F1 bookkeeping for the loop stage (_stac_scale_close): what was
+        # applied per chunk (the drift stage's geometric mean when it ran).
+        self._stac_scales_applied = {int(k): float(v) for k, v in scales.items()}
+        for k in range(len(self.chunk_indices)):
+            self._stac_scales_applied.setdefault(k, fallback)
+        self._stac_drift_frames = drift_frames
         # 2) loop-bridge predictions (in memory) — they are Omega passes with their own
         # arbitrary scale; the SE(3) loop legs need them metric too. Anchors inside the
         # bridge's two ranges when available, else the mean of the two parent chunks.
-        for li, (item, pred) in enumerate(getattr(self, 'loop_predict_list', []) or []):
+        # (Vendor loop path only: the STAC path locks its bridges in _stac_lock_bridges,
+        # after their own anchors were extracted.)
+        for li, (item, pred) in enumerate(
+                [] if self._stac_loops_cfg() is not None
+                else (getattr(self, 'loop_predict_list', []) or [])):
             ka, (a0, a1), kb, (b0, b1) = item[0], item[1], item[2], item[3]
             nums = ([real_frame_number(self.img_list[i]) for i in range(a0, a1)]
                     + [real_frame_number(self.img_list[i]) for i in range(b0, b1)])
@@ -642,6 +689,60 @@ class VGGT_Long:
         else:
             print(f"[health] ✅ all {len(self.chunk_indices)} chunks healthy "
                   f"(parallax + anchor coherence)")
+
+    def _stac_vio_rows(self, vio_cfg, report):
+        """§5.2: one ABSOLUTE scale row per chunk from a VIO trajectory — the
+        per-segment ratio of VIO arc length to the chunk's RAW camera path
+        (reconstruction.vio_scale.estimate_vio_scale, per chunk). A chunk with
+        too few voting segments gets no row and says so in metric_lock.json."""
+        from loop_utils.loop_bridges import cfg_req
+        from loop_utils.metric_lock import real_frame_number
+        scfg = self._stac_scale_cfg()
+        if scfg is None:
+            raise RuntimeError("Model.metric_lock.vio is set but Model.scale is missing — "
+                               "the VIO row σ (scale.sigma_vio) must be configured")
+        vs = self._stac_server_module("reconstruction.vio_scale")
+        if vs is None:
+            raise RuntimeError("Model.metric_lock.vio needs Model.loops.stac_server_dir "
+                               "(reconstruction.vio_scale) — refusing to silently skip VIO")
+        vt, vp, _ = vs.load_vio_trajectory(vio_cfg['path'])
+        fps = float(vio_cfg['fps'])
+        sigma_vio = float(cfg_req(scfg, "sigma_vio", "scale"))
+        seg_s = float(cfg_req(scfg, "vio_segment_s", "scale"))
+        min_seg = int(cfg_req(scfg, "vio_min_segments_chunk", "scale"))
+        min_disp = float(cfg_req(scfg, "vio_min_seg_disp_m", "scale"))
+        min_cov = float(vio_cfg.get('min_coverage', 0.0))
+        rows = []
+        report["vio"] = {}
+        for k, (start, end) in enumerate(self.chunk_indices):
+            path = os.path.join(self.result_unaligned_dir, f"chunk_{k}.npy")
+            if not os.path.exists(path):
+                continue
+            data = np.load(path, allow_pickle=True).item()
+            ext = np.asarray(data['extrinsic'])
+            if ext.ndim == 4:
+                ext = ext[0]
+            kf_c = ext[:, :3, 3].astype(np.float64)
+            kf_t = np.array([real_frame_number(self.img_list[g]) for g in range(start, end)],
+                            np.float64) / fps
+            del data
+            try:
+                info = vs.estimate_vio_scale(vt, vp, kf_t, kf_c, segment_s=seg_s,
+                                             min_seg_disp_m=min_disp, min_segments=min_seg,
+                                             min_coverage=min_cov)
+            except RuntimeError as _e:
+                report["vio"][str(k)] = {"row": False, "reason": str(_e)}
+                print(f"[metric-lock] chunk {k}: no VIO row ({_e})")
+                continue
+            s_k = float(info["s_vio"])
+            sig = max(sigma_vio, float(info.get("mad_rel") or 0.0))
+            rows.append((k, float(np.log(s_k)), sig, "vio"))
+            report["vio"][str(k)] = {"row": True, "s_vio": s_k, "sigma": sig,
+                                     "n_segments": info["n_segments"],
+                                     "coverage_frac": info["coverage_frac"]}
+            print(f"[metric-lock] chunk {k}: VIO absolute row s={s_k:.4f} σ={sig:.3f} "
+                  f"({info['n_segments']} segments)")
+        return rows
 
     def _stac_conf_threshold(self, confs):
         """STAC patch: the ONE confidence threshold for a chunk's PLY + origins.
@@ -1649,6 +1750,605 @@ class VGGT_Long:
             # map_worker deletes _tmp_results_aligned right after the metric
             # scale succeeds.
 
+    # ══════════════════════════════════════════════════════════════════════
+    # STAC F1 — EXACT LOOP BRIDGES, SPATIAL GATE, CLOSED SCALE
+    # (claude_stac.txt §4.1, §4.2, §4.5 step 0, §4.9, §5). Active when the
+    # config carries Model.loops (built by server/workers/map_worker.py from
+    # config.yaml `loops:`/`scale:`); without it the vendor loop path runs.
+    # ══════════════════════════════════════════════════════════════════════
+    def _stac_loops_cfg(self):
+        return self.config['Model'].get('loops')
+
+    def _stac_scale_cfg(self):
+        return self.config['Model'].get('scale')
+
+    def _stac_server_module(self, name):
+        """Import a STAC server module (e.g. reconstruction.loops.spatial_gate)
+        when Model.loops.stac_server_dir is configured. None (logged) when the
+        fork runs standalone — the feature that needs it is then declared OFF
+        in the loop report, never silently skipped."""
+        cfg = self._stac_loops_cfg() or {}
+        sdir = cfg.get('stac_server_dir')
+        if not sdir:
+            return None
+        if sdir not in sys.path:
+            sys.path.insert(0, sdir)
+        import importlib
+        return importlib.import_module(name)
+
+    def _stac_load_chunk(self, k):
+        """Unaligned (metric-locked) chunk k, with a two-entry cache so the
+        gate/bridge stages never hold more than two chunks in memory."""
+        cache = getattr(self, '_stac_chunk_cache', None)
+        if cache is None:
+            cache = self._stac_chunk_cache = {}
+        if k in cache:
+            return cache[k]
+        data = np.load(os.path.join(self.result_unaligned_dir, f"chunk_{k}.npy"),
+                       allow_pickle=True).item()
+        if len(cache) >= 2:
+            cache.pop(next(iter(cache)))
+        cache[k] = data
+        return data
+
+    def _stac_drop_chunk_cache(self):
+        if getattr(self, '_stac_chunk_cache', None):
+            self._stac_chunk_cache.clear()
+
+    def _stac_seam_chain(self, tag):
+        """Exact rigid seams over the CURRENT unaligned chunks → sequential
+        (s=1, R, t) list (chunk k+1 → chunk k). Same fit the vendor path uses
+        (robust_rigid on the shared frames); starved seams fall back to the
+        vendor point-map fit and are recorded as such."""
+        from loop_utils.metric_lock import robust_rigid
+        seq, report = [], {}
+        for chunk_idx in range(len(self.chunk_indices) - 1):
+            d1 = self._stac_load_chunk(chunk_idx)
+            d2 = self._stac_load_chunk(chunk_idx + 1)
+            pm1 = d1['world_points'][-self.overlap:]
+            pm2 = d2['world_points'][:self.overlap]
+            c1 = d1['world_points_conf'][-self.overlap:]
+            c2 = d2['world_points_conf'][:self.overlap]
+            _p1 = np.asarray(pm1, np.float64).reshape(-1, 3)
+            _p2 = np.asarray(pm2, np.float64).reshape(-1, 3)
+            _ok = (np.asarray(c1).reshape(-1) > 1e-5) & (np.asarray(c2).reshape(-1) > 1e-5)
+            fit = robust_rigid(_p2[_ok], _p1[_ok])
+            if fit is not None:
+                R, t, res, n = fit
+                seq.append((1.0, R, t))
+                report[str(chunk_idx)] = {"exact": True, "residual_m": float(res), "n_fit": int(n)}
+            else:
+                conf_threshold = min(np.median(c1), np.median(c2)) * 0.1
+                s, R, t = weighted_align_point_maps(pm1, c1, pm2, c2, None,
+                                                    conf_threshold=conf_threshold,
+                                                    config=self.config)
+                seq.append((1.0, R, t))
+                report[str(chunk_idx)] = {"exact": False, "starved": True}
+                print(f"[exact-seam:{tag}] {chunk_idx}->{chunk_idx+1}: starved — vendor "
+                      f"point-map fit used (recorded)")
+        return seq, report
+
+    class _StacChainView:
+        """Duck-typed TrajectoryView for reconstruction.loops.spatial_gate:
+        per-global-frame c2w + K under the provisional seam chain, and world
+        points of a frame on demand (owner chunk, cumulative transform)."""
+
+        def __init__(self, owner_self, seq):
+            from loop_utils.metric_lock import frame_owner
+            self._o = owner_self
+            N = len(owner_self.img_list)
+            self.n_frames = N
+            self._owner = frame_owner(owner_self.chunk_indices, N)
+            cum = accumulate_sim3_transforms(seq) if seq else []
+            self._cum = {0: (1.0, np.eye(3), np.zeros(3))}
+            for k in range(1, len(owner_self.chunk_indices)):
+                self._cum[k] = cum[k - 1]
+            self._poses, self._Ks = {}, {}
+            self.hw = None
+            for k, (start, end) in enumerate(owner_self.chunk_indices):
+                d = owner_self._stac_load_chunk(k)
+                ext = np.asarray(d['extrinsic'])
+                if ext.ndim == 4:
+                    ext = ext[0]
+                K = np.asarray(d['intrinsic'])
+                if K.ndim == 4:
+                    K = K[0]
+                dep = np.asarray(d['depth'])
+                self.hw = tuple(int(x) for x in (dep.shape[-2], dep.shape[-1]))
+                s, R, t = self._cum[k]
+                S = np.eye(4)
+                S[:3, :3] = float(s) * np.asarray(R)
+                S[:3, 3] = np.asarray(t)
+                for local, g in enumerate(range(start, end)):
+                    if self._owner[g] != k:
+                        continue
+                    M = S @ np.asarray(ext[local], np.float64)
+                    M[:3, :3] /= float(s)
+                    self._poses[g] = M
+                    self._Ks[g] = np.asarray(K[local], np.float64)
+
+        def pose(self, g):
+            return self._poses.get(int(g))
+
+        def K(self, g):
+            return self._Ks.get(int(g))
+
+        def centres(self):
+            out = np.full((self.n_frames, 3), np.nan)
+            for g, M in self._poses.items():
+                out[g] = M[:3, 3]
+            return out
+
+        def depth(self, g):
+            """The frame's own measured depth (camera z, chunk units after the
+            lock) — the occlusion witness of the spatial gate."""
+            k = int(self._owner[int(g)])
+            if k < 0:
+                return None
+            d = self._o._stac_load_chunk(k)
+            dep = np.asarray(d['depth'])
+            if dep.ndim == 4:
+                dep = dep[0]
+            local = int(g) - self._o.chunk_indices[k][0]
+            s = float(self._cum[k][0])
+            return dep[local].astype(np.float64) * s
+
+        def points(self, g, n, seed=0):
+            k = int(self._owner[int(g)])
+            if k < 0:
+                return np.zeros((0, 3))
+            d = self._o._stac_load_chunk(k)
+            wp = np.asarray(d['world_points'])
+            wp = wp[0] if wp.ndim == 5 else wp
+            local = int(g) - self._o.chunk_indices[k][0]
+            cf = np.asarray(d['world_points_conf']).reshape(wp.shape[:3])[local].reshape(-1)
+            p = wp[local].reshape(-1, 3)[cf > 1e-5].astype(np.float64)
+            if len(p) > n:
+                p = p[np.random.default_rng(seed).choice(len(p), int(n), replace=False)]
+            s, R, t = self._cum[k]
+            return float(s) * (p @ np.asarray(R).T) + np.asarray(t)
+
+    def _stac_plan_bridges(self, loop_results):
+        """§4.2 step 0 / §4.5: every candidate passes the spatial-plausibility
+        gate BEFORE a bridge is spent on it. Returns [(item, cand, gate)] for
+        the survivors; rejected candidates go to the loop report."""
+        from loop_utils.loop_bridges import cfg_req
+        lcfg = self._stac_loops_cfg()
+        gate_mod = self._stac_server_module("reconstruction.loops.spatial_gate")
+        by_pair = {}
+        for c in getattr(self, 'loop_cands', []) or []:
+            by_pair[(int(c['i']), int(c['j']))] = c
+        planned, rejected = [], []
+        view = None
+        if gate_mod is not None:
+            seq, seam_rep = self._stac_seam_chain("provisional")
+            self._stac_provisional_seams = seam_rep
+            view = self._StacChainView(self, seq)
+        else:
+            print("[loop-gate] Model.loops.stac_server_dir not configured — spatial "
+                  "gate OFF (declared in loop_edges.json); every candidate gets a bridge")
+        for item in loop_results:
+            i_hi, j_lo = int(item[1][0] + (item[1][1] - item[1][0]) // 2), \
+                int(item[3][0] + (item[3][1] - item[3][0]) // 2)
+            cand = by_pair.get((item[-1][0], item[-1][1])) if len(item) > 4 else None
+            if cand is None:
+                cand = {"i": i_hi, "j": j_lo, "sim": None, "source": "salad"}
+            gate = {"verdict": "off", "rules": {}}
+            if view is not None:
+                gate = gate_mod.gate_frame_pair(int(cand['i']), int(cand['j']), view,
+                                                lcfg['spatial'])
+            if gate.get("verdict") == "reject":
+                rejected.append({"item": [int(item[0]), list(item[1]), int(item[2]), list(item[3])],
+                                 "candidate": cand, "gate": gate, "status": "rejected",
+                                 "stage": "spatial_gate"})
+                print(f"[loop-gate] candidate {cand['i']}<->{cand['j']} ({cand['source']}): "
+                      f"REJECTED by the spatial gate — {gate.get('reason', '')}")
+                continue
+            planned.append((item, cand, gate))
+        self._stac_loops_rejected = rejected
+        self._stac_drop_chunk_cache()
+        return planned
+
+    def _stac_extra_frames(self, range_kf, n_extra, exclude):
+        """§4.9: up to n_extra NON-keyframe frames spread over the real-frame
+        span of a bridge window, blur-valid per frame_quality.json (the same
+        filter the keyframe selector applies), sharpest per slot."""
+        if n_extra <= 0:
+            return []
+        from loop_utils.metric_lock import real_frame_number
+        lo = real_frame_number(self.img_list[range_kf[0]])
+        hi = real_frame_number(self.img_list[range_kf[1] - 1])
+        if hi <= lo:
+            return []
+        all_paths = sorted(glob.glob(os.path.join(self.img_dir, "*.jpg")) +
+                           glob.glob(os.path.join(self.img_dir, "*.png")))
+        quality = {}
+        fq = os.path.join(self.img_dir, "frame_quality.json")
+        if os.path.exists(fq):
+            import json as _json
+            for e in _json.load(open(fq)).get("frames", []):
+                quality[e["file"]] = (float(e.get("fft_score", 0.0)), bool(e.get("valid", True)))
+        pool = []
+        for p in all_paths:
+            b = os.path.basename(p)
+            if p in exclude or b in exclude:
+                continue
+            num = real_frame_number(p)
+            if lo < num < hi:
+                q = quality.get(b, (0.0, True))
+                if q[1]:
+                    pool.append((num, q[0], p))
+        if not pool:
+            return []
+        edges = np.linspace(lo, hi, n_extra + 2)[1:-1]
+        chosen = []
+        for e in edges:
+            near = [x for x in pool if abs(x[0] - e) <= (hi - lo) / (n_extra + 1)]
+            if not near:
+                continue
+            best = max(near, key=lambda x: x[1])
+            if best[2] not in chosen:
+                chosen.append(best[2])
+        return chosen
+
+    def _stac_infer_bridges(self, planned):
+        """One Omega pass per surviving candidate (model still loaded). Stores
+        (item, prediction, meta) in loop_predict_list; the layout maps bridge
+        frames to chunk frames."""
+        from loop_utils.loop_bridges import bridge_layout, cfg_req
+        lcfg = self._stac_loops_cfg()
+        n_extra = int(cfg_req(lcfg, "bridge_extra_frames", "loops"))
+        kf_set = set(self.img_list)
+        for item, cand, gate in planned:
+            ex1 = self._stac_extra_frames(item[1], n_extra, kf_set)
+            ex2 = self._stac_extra_frames(item[3], n_extra, kf_set)
+            pred = self.process_single_chunk(item[1], range_2=item[3], is_loop=True,
+                                             extra_1=ex1, extra_2=ex2)
+            layout = bridge_layout(item, self.chunk_indices, len(ex1), len(ex2))
+            meta = {"candidate": cand, "gate": gate, "layout": layout}
+            self.loop_predict_list.append((item, pred, meta))
+            print(f"[loop-bridge] {cand['source']} {cand['i']}<->{cand['j']}: chunks "
+                  f"{item[0]}<->{item[2]}, windows {item[1]}+{item[3]}, "
+                  f"{len(ex1)}+{len(ex2)} extra frame(s)")
+            torch.cuda.empty_cache()
+
+    def _stac_ensure_bridge_anchors(self):
+        """§4.1: plan `anchors_per_bridge` DA3 anchor frames inside EACH bridge
+        window and extract the missing ones through the server's isolated DA3
+        extractor (Model.metric_lock.anchor_extract, built by map_worker).
+        Runs after the Omega model is released (the extractor needs the GPU)."""
+        from loop_utils.loop_bridges import cfg_req
+        from loop_utils.metric_lock import real_frame_number
+        ml = self.config['Model'].get('metric_lock') or {}
+        ae = ml.get('anchor_extract')
+        lcfg = self._stac_loops_cfg()
+        per = int(cfg_req(lcfg, "anchors_per_bridge", "loops"))
+        anchor_dir = ml.get('anchor_dir')
+        if not ae or not anchor_dir or per <= 0 or not self.loop_predict_list:
+            if self.loop_predict_list:
+                print("[loop-bridge] no anchor extractor configured — bridges take the "
+                      "scale-graph scale of their parent chunks (recorded)")
+            return
+        wanted = []
+        for item, _pred, _meta in self.loop_predict_list:
+            for rng_ in (item[1], item[3]):
+                span = rng_[1] - rng_[0]
+                fr = [0.5] if per == 1 else [0.15 + 0.7 * i / (per - 1) for i in range(per)]
+                for f in fr:
+                    idx = rng_[0] + min(span - 1, int(round(f * (span - 1))))
+                    wanted.append(self.img_list[idx])
+        missing = sorted({os.path.basename(p) for p in wanted
+                          if not os.path.exists(os.path.join(
+                              anchor_dir, f"frame_{real_frame_number(p)}.npz"))})
+        if not missing:
+            print(f"[loop-bridge] bridge anchors: all {len(set(wanted))} planned frames "
+                  f"already have DA3 depth")
+            return
+        mod = self._stac_server_module("reconstruction.da3_anchor")
+        if mod is None:
+            print("[loop-bridge] anchor extractor needs Model.loops.stac_server_dir — "
+                  "bridges take the scale-graph scale (recorded)")
+            return
+        print(f"[loop-bridge] extracting DA3 depth for {len(missing)} bridge anchor frame(s)")
+        mod.extract_anchor_depths(frames_dir=ae['frames_dir'], output_dir=ae['output_dir'],
+                                  anchor_files=missing, model_id=ae['model_id'],
+                                  python=ae['python'], log=print)
+
+    def _stac_lock_bridges(self):
+        """Metric-lock every bridge: own DA3 anchors when present, else the
+        scale graph's value for its parent chunks (never 'the median') — and
+        record which one it got."""
+        from loop_utils.metric_lock import chunk_scale, apply_scale, real_frame_number
+        ml = self.config['Model'].get('metric_lock') or {}
+        anchor_dir = ml.get('anchor_dir')
+        near_frac = float(ml.get('near_frac', 0.25))
+        scales = getattr(self, '_stac_scales_applied', {}) or {}
+        for li, (item, pred, meta) in enumerate(self.loop_predict_list):
+            if pred.get('_stac_bridge_locked'):
+                continue
+            ka, (a0, a1), kb, (b0, b1) = item[0], item[1], item[2], item[3]
+            lay = meta["layout"]
+            nums = [None] * lay["n_frames"]
+            for bl, g in zip(lay["bridge_a"], range(a0, a1)):
+                nums[bl] = real_frame_number(self.img_list[g])
+            for bl, g in zip(lay["bridge_b"], range(b0, b1)):
+                nums[bl] = real_frame_number(self.img_list[g])
+            nums = [n if n is not None else -1 for n in nums]
+            s, n, ratios = (None, 0, [])
+            if anchor_dir:
+                s, n, ratios = chunk_scale(pred, nums, anchor_dir, near_frac=near_frac)
+            if s is None:
+                sa, sb = scales.get(ka), scales.get(kb)
+                if sa is None or sb is None:
+                    raise RuntimeError(f"[loop-bridge] bridge {ka}<->{kb}: no own anchors "
+                                       f"and no graph scale for its parents — the scale "
+                                       f"graph must have run before the bridges are locked")
+                s = float(np.sqrt(sa * sb))
+                src = "scale_graph_parents"
+            else:
+                src = "own_anchors"
+            apply_scale(pred, s)
+            pred['_stac_bridge_locked'] = True
+            meta["lock"] = {"s": float(s), "n_anchors": int(n), "source": src,
+                            "ratios": [float(r) for r in ratios]}
+            print(f"[loop-bridge] {ka}<->{kb}: metric lock s={s:.4f} ({src}, {n} anchor(s))")
+
+    def _stac_measure_loops(self, rigid):
+        """Exact bridge↔chunk fits for every bridge (Sim3 → scale rows;
+        rigid → SE(3) pose edges). Chunks are loaded two at a time."""
+        from loop_utils.loop_bridges import measure_bridge
+        lcfg = self._stac_loops_cfg()
+        out = []
+        for li, (item, pred, meta) in enumerate(self.loop_predict_list):
+            ka, kb = item[0], item[2]
+            da = self._stac_load_chunk(ka)
+            db = self._stac_load_chunk(kb)
+            meas = measure_bridge(pred, meta["layout"], da, db, lcfg, rigid=rigid)
+            out.append(meas)
+        self._stac_drop_chunk_cache()
+        return out
+
+    def _stac_scale_close(self, meas_sim3):
+        """§5.1–5.3: re-solve the scale graph WITH the loop rows and apply the
+        residual factor δ_k = s_v2/s_v1 to every chunk (and to bridges locked
+        from their parents). Scale breaks are diagnosed, everything lands in
+        scale_graph.json. Resume-safe (metric_lock.json + npy stamp)."""
+        import json as _json
+        from loop_utils.loop_bridges import cfg_req, loop_scale_row
+        from loop_utils.metric_lock import (solve_scale_graph, scale_break_diagnosis,
+                                            apply_scale, seam_residuals)
+        scfg = self._stac_scale_cfg() or {}
+        lcfg = self._stac_loops_cfg()
+        ml = self.config['Model'].get('metric_lock') or {}
+        inputs = getattr(self, '_stac_scale_inputs', None)
+        s_v1 = getattr(self, '_stac_scales_applied', None)
+        n_chunks = len(self.chunk_indices)
+        sg_path = os.path.join(self.output_dir, "scale_graph.json")
+        stamp_key = '_stac_loop_scale_applied'
+        if inputs is None or s_v1 is None:
+            print("[scale-graph] metric lock did not run this session (resume) — loop "
+                  "rows cannot be added to a lock that was applied in a previous run; "
+                  "the scale graph stays as locked")
+            return
+        sigma_loop = float(cfg_req(scfg, "sigma_loop", "scale"))
+        tol_log = float(cfg_req(lcfg, "scale_tol_log", "loops"))
+        sb_factor = float(cfg_req(lcfg, "scale_break_sigma_factor", "loops"))
+        loop_rel, loop_rows = {}, []
+        for li, ((item, pred, meta), meas) in enumerate(zip(self.loop_predict_list, meas_sim3)):
+            ka, kb = int(item[0]), int(item[2])
+            if not meas.get("ok") or ka == kb:
+                continue
+            # measured on v1-locked chunks → express in RAW terms for the joint solve
+            log_r_meas = loop_scale_row(meas["s_ab"])
+            log_r_raw = log_r_meas + np.log(s_v1[kb]) - np.log(s_v1[ka])
+            sig = sigma_loop
+            is_break = abs(log_r_meas) > tol_log
+            if is_break:
+                sig *= sb_factor
+            key = (ka, kb)
+            if key in loop_rel:           # several bridges between the same chunks: mean
+                prev = loop_rel[key]
+                loop_rel[key] = ((prev[0] + log_r_raw) / 2.0, min(prev[1], sig))
+            else:
+                loop_rel[key] = (log_r_raw, sig)
+            loop_rows.append({"bridge": li, "chunks": [ka, kb], "s_ab": meas["s_ab"],
+                              "log_r_measured": float(log_r_meas), "sigma": float(sig),
+                              "scale_break": bool(is_break)})
+        absolute = list(inputs.get("absolute") or [])
+        s_v2 = solve_scale_graph(inputs["s_da3"], inputs["n_anchors"], inputs["seam_rel"],
+                                 n_chunks, sigma_seam=inputs["sigma_seam"],
+                                 sigma_anchor=inputs["sigma_anchor"],
+                                 loop_rel=loop_rel, absolute=absolute)
+        breaks = []
+        for row in loop_rows:
+            if row["scale_break"]:
+                d = scale_break_diagnosis(inputs["s_da3"], inputs["n_anchors"], inputs["seam_rel"],
+                                          n_chunks, loop_rel, tuple(row["chunks"]),
+                                          inputs["sigma_seam"], inputs["sigma_anchor"],
+                                          absolute=absolute,
+                                          localisation_gap=float(cfg_req(
+                                              scfg, "break_localisation_gap", "scale")))
+                d["bridge"] = row["bridge"]
+                breaks.append(d)
+                print(f"[scale-graph] SCALE BREAK on loop {row['chunks']}: suspect seam "
+                      f"{d['suspect_seam']}->{(d['suspect_seam'] or 0) + 1}, jump "
+                      f"{d['jump_pct']:.2f}% "
+                      f"({'localised' if d.get('localised') else 'AMBIGUOUS — one cycle, weak absolute witnesses'}; "
+                      f"see scale_graph.json)")
+        delta = {}
+        for k in range(n_chunks):
+            sv1 = s_v1.get(k)
+            if sv1 is None or not np.isfinite(s_v2[k]) or s_v2[k] <= 0:
+                delta[k] = 1.0
+            else:
+                delta[k] = float(s_v2[k] / sv1)
+        # apply δ to the chunks (in place, stamped) and to parent-locked bridges
+        n_moved = 0
+        for k in range(n_chunks):
+            path = os.path.join(self.result_unaligned_dir, f"chunk_{k}.npy")
+            if not os.path.exists(path):
+                continue
+            data = np.load(path, allow_pickle=True).item()
+            if data.get(stamp_key):
+                continue
+            if abs(delta[k] - 1.0) > 1e-12:
+                apply_scale(data, delta[k])
+                n_moved += 1
+            data[stamp_key] = float(delta[k])
+            np.save(path, data)
+        for item, pred, meta in self.loop_predict_list:
+            if meta.get("lock", {}).get("source") == "scale_graph_parents":
+                ka, kb = int(item[0]), int(item[2])
+                f = float(np.sqrt(delta[ka] * delta[kb]))
+                if abs(f - 1.0) > 1e-12:
+                    apply_scale(pred, f)
+                meta["lock"]["delta_parents"] = f
+        self._stac_scales_applied = {k: float(s_v1.get(k, 1.0) * delta[k]) for k in range(n_chunks)}
+        self._stac_scale_delta = delta
+        # verifier bookkeeping: s_frames from the drift stage (when it ran)
+        s_frames = getattr(self, '_stac_drift_frames', None)
+        rep = {"version": 1,
+               "n_chunks": n_chunks,
+               "sigma_seam": inputs["sigma_seam"], "sigma_anchor": inputs["sigma_anchor"],
+               "sigma_loop": sigma_loop,
+               "s_v1_anchors_seams": {str(k): float(v) for k, v in s_v1.items()},
+               "s_v2_with_loops": {str(k): float(s_v2[k]) for k in range(n_chunks)},
+               "delta_applied": {str(k): float(v) for k, v in delta.items()},
+               "loop_rows": loop_rows,
+               "absolute_rows": [{"chunk": int(a[0]), "log_s": float(a[1]), "sigma": float(a[2]),
+                                  "source": (a[3] if len(a) > 3 else "unspecified")}
+                                 for a in absolute],
+               "seam_residuals_log_v1": seam_residuals([s_v1.get(k, 1.0) for k in range(n_chunks)],
+                                                        inputs["seam_rel"]),
+               "seam_residuals_log_v2": seam_residuals(s_v2, inputs["seam_rel"]),
+               "scale_breaks": breaks,
+               "s_frames": ({str(k): [float(x) for x in v] for k, v in s_frames.items()}
+                            if s_frames else None)}
+        with open(sg_path, "w") as f:
+            _json.dump(rep, f, indent=1)
+        dmax = max(abs(np.log(v)) for v in delta.values()) if delta else 0.0
+        print(f"[scale-graph] ✅ {len(loop_rows)} loop row(s) + {len(absolute)} absolute row(s) "
+              f"closed the scale: {n_moved} chunk(s) re-scaled, max |δ| "
+              f"{(np.exp(dmax) - 1) * 100:.2f}% → scale_graph.json")
+        # metric_lock.json: record the loop stage for the resume guard
+        _ml_path = os.path.join(self.output_dir, "metric_lock.json")
+        if os.path.exists(_ml_path):
+            try:
+                _rep = _json.load(open(_ml_path))
+            except Exception as _e:
+                raise RuntimeError(f"metric_lock.json unreadable ({_e}) — cannot record the "
+                                   f"loop scale stage; the lock state must be trustworthy")
+            _rep["loop_stage"] = {"delta": {str(k): float(v) for k, v in delta.items()},
+                                  "n_loop_rows": len(loop_rows)}
+            for k, v in self._stac_scales_applied.items():
+                _rep.setdefault("chunks", {}).setdefault(str(k), {})["s_applied"] = float(v)
+            with open(_ml_path, "w") as f:
+                _json.dump(_rep, f, indent=1)
+
+    def _stac_verify_loops(self, meas_rigid):
+        """§4.2 steps 1–4 on the SE(3) measurements; builds the pose-edge list
+        (every edge carries σ) and the loop report. loop_enable_opt then depends
+        on at least one edge with σ ≤ max_edge_sigma_m — the exact-seam skip is
+        gone (claude_stac.txt DoD)."""
+        import json as _json
+        from loop_utils.loop_bridges import (verify_loop, attention_score, cfg_req,
+                                             save_loop_report)
+        lcfg = self._stac_loops_cfg()
+        max_sig = float(cfg_req(lcfg, "max_edge_sigma_m", "loops"))
+        starved_sig = float(cfg_req(lcfg, "starved_sigma_m", "loops"))
+        sem_path = os.path.join(self.output_dir, "loop_semantics.json")
+        semantics = None
+        if os.path.exists(sem_path):
+            semantics = _json.load(open(sem_path))
+        from loop_utils.metric_lock import real_frame_number
+        edges = list(getattr(self, '_stac_loops_rejected', []) or [])
+        self.loop_sim3_list = []
+        self._stac_loop_edges = []
+        for li, ((item, pred, meta), meas) in enumerate(zip(self.loop_predict_list, meas_rigid)):
+            ka, kb = int(item[0]), int(item[2])
+            cand = meta["candidate"]
+            sem = None
+            if semantics is not None:
+                fr = semantics.get("frames", {})
+                ni, nj = real_frame_number(self.img_list[cand['i']]), \
+                    real_frame_number(self.img_list[cand['j']])
+                sa = fr.get(str(ni), {}).get("structural")
+                sb = fr.get(str(nj), {}).get("structural")
+                sem = {"a": sa, "b": sb}
+            att = None
+            if bool(cfg_req(lcfg, "attention_verify", "loops")):
+                att = attention_score(pred.get("camera_and_register_tokens"), meta["layout"])
+            v = verify_loop(meas, lcfg, semantic=sem, attention=att, spatial=meta.get("gate"))
+            if not meas.get("ok"):
+                # starved exact fit → the VENDOR coarse fit, recorded as low confidence
+                coarse = self._stac_vendor_bridge_fit(item, pred, meta)
+                if coarse is not None:
+                    s_ab, R_ab, t_ab = coarse
+                    v = {"status": "accepted", "sigma_m": starved_sig, "fallback": "vendor_point_map_fit",
+                         "reasons": ["exact correspondences starved — vendor point-map fit, "
+                                     f"σ={starved_sig} m (low confidence)"], "checks": v.get("checks", {})}
+                    meas = dict(meas, ok=True, s_ab=float(s_ab), R_ab=np.asarray(R_ab).tolist(),
+                                t_ab=np.asarray(t_ab).tolist())
+            edge = {"bridge": li, "item": [ka, list(item[1]), kb, list(item[3])],
+                    "candidate": cand, "gate": meta.get("gate"), "lock": meta.get("lock"),
+                    "measurement": {k_: v_ for k_, v_ in meas.items() if k_ != "sides"},
+                    "sides": meas.get("sides"), "verdict": v, "status": v["status"],
+                    "stage": "verification", "intra_chunk": ka == kb}
+            edges.append(edge)
+            if v["status"] in ("accepted", "scale_break") and ka != kb:
+                self._stac_loop_edges.append({"a": ka, "b": kb, "R_ab": np.asarray(meas["R_ab"]),
+                                              "t_ab": np.asarray(meas["t_ab"]),
+                                              "sigma_m": float(v["sigma_m"]),
+                                              "status": v["status"], "bridge": li})
+                if float(v["sigma_m"]) <= max_sig:
+                    self.loop_sim3_list.append((ka, kb, (1.0, np.asarray(meas["R_ab"]),
+                                                         np.asarray(meas["t_ab"]))))
+            tag = ("ACCEPTED" if v["status"] == "accepted" else v["status"].upper())
+            print(f"[loop-verify] bridge {li} chunks {ka}<->{kb} ({cand['source']} "
+                  f"{cand['i']}<->{cand['j']}): {tag} σ={v.get('sigma_m', float('nan')):.4f} m "
+                  f"{'; '.join(v.get('reasons', []))}")
+        n_good = sum(1 for e in self._stac_loop_edges if e["sigma_m"] <= max_sig)
+        self.loop_enable_opt = bool(self.loop_enable and n_good > 0)
+        gate_mod = self._stac_server_module("reconstruction.loops.spatial_gate")
+        save_loop_report(os.path.join(self.output_dir, "loop_edges.json"), edges,
+                         extra={"spatial_gate": "on" if gate_mod is not None else "off",
+                                "attention_verify": bool(cfg_req(lcfg, "attention_verify", "loops")),
+                                "semantics": semantics is not None,
+                                "max_edge_sigma_m": max_sig,
+                                "n_edges_usable": n_good,
+                                "loop_enable_opt": self.loop_enable_opt,
+                                "provisional_seams": getattr(self, '_stac_provisional_seams', None)})
+        print(f"[loop-verify] {n_good} usable edge(s) with σ ≤ {max_sig} m → loop optimizer "
+              f"{'ON' if self.loop_enable_opt else 'OFF (no trustworthy edge)'}; loop_edges.json")
+
+    def _stac_vendor_bridge_fit(self, item, pred, meta):
+        """The vendor's coarse point-map fit for one bridge (used ONLY as the
+        recorded low-confidence fallback when the exact fit starves)."""
+        try:
+            lay = meta["layout"]
+            ka, kb = item[0], item[2]
+            da = self._stac_load_chunk(ka)
+            db = self._stac_load_chunk(kb)
+            wp = np.asarray(pred['world_points']); wp = wp[0] if wp.ndim == 5 else wp
+            cf = np.asarray(pred['world_points_conf']).reshape(wp.shape[:3])
+            fits = []
+            for side, d, bl, cl in (("a", da, lay["bridge_a"], lay["chunk_a_local"]),
+                                    ("b", db, lay["bridge_b"], lay["chunk_b_local"])):
+                wpc = np.asarray(d['world_points']); wpc = wpc[0] if wpc.ndim == 5 else wpc
+                cfc = np.asarray(d['world_points_conf']).reshape(wpc.shape[:3])
+                pm_c, c_c = wpc[cl], cfc[cl]
+                pm_l, c_l = wp[bl], cf[bl]
+                thr = min(np.median(c_c), np.median(c_l)) * 0.1 \
+                    if self.config['Model']['Pointcloud_Save'].get('use_conf_filter', True) else -1.0
+                fits.append(weighted_align_point_maps(pm_c, c_c, pm_l, c_l, None,
+                                                      conf_threshold=thr, config=self.config))
+            return compute_sim3_ab(fits[0], fits[1])
+        except Exception as _e:  # the fallback itself failing is a recorded rejection
+            print(f"[loop-verify] vendor fallback fit failed ({_e}) — edge rejected")
+            return None
+        finally:
+            self._stac_drop_chunk_cache()
+
     def process_long_sequence(self):
         if self.overlap >= self.chunk_size:
             raise ValueError(f"[SETTING ERROR] Overlap ({self.overlap}) must be less than chunk size ({self.chunk_size})")
@@ -1669,20 +2369,43 @@ class VGGT_Long:
             self.process_single_chunk(self.chunk_indices[chunk_idx], chunk_idx=chunk_idx)
             torch.cuda.empty_cache()
 
-
+        _stac_loops = (self._stac_loops_cfg() is not None
+                       and (self.config['Model'].get('metric_lock') or {}).get('enable'))
         if self.loop_enable:
             print('Loop SIM(3) estimating...')
-            loop_results = process_loop_list(self.chunk_indices,
-                                             self.loop_list,
-                                             half_window = int(self.config['Model']['loop_chunk_size'] / 2))
-            loop_results = remove_duplicates(loop_results)
+            half = int(self.config['Model']['loop_chunk_size'] / 2)
+            loop_results = process_loop_list(self.chunk_indices, self.loop_list, half_window=half)
+            if _stac_loops:
+                # STAC: keep the (i, j) candidate attached to its windows and KEEP
+                # intra-chunk candidates (i, j in the same chunk) — they are pose
+                # edges for the keyframe graph even though they carry no scale row.
+                _paired = []
+                _seen = set()
+                for res, (i, j) in zip(loop_results, self.loop_list):
+                    key = (res[0], res[2], res[1], res[3])
+                    if key in _seen:
+                        continue
+                    _seen.add(key)
+                    _paired.append(tuple(res) + ((int(i), int(j)),))
+                _keep_intra = bool((self._stac_loops_cfg() or {}).get('intra_chunk_loops', True))
+                loop_results = [r for r in _paired if _keep_intra or r[0] != r[2]]
+            else:
+                loop_results = remove_duplicates(loop_results)
             print(loop_results)
             # return e.g. (31, (1574, 1594), 2, (129, 149))
-            for item in loop_results:
-                single_chunk_predictions = self.process_single_chunk(item[1], range_2=item[3], is_loop=True)
-
-                self.loop_predict_list.append((item, single_chunk_predictions))
-                print(item)
+            if _stac_loops:
+                # ── STAC F1 ── metric lock (anchors + seams) BEFORE the bridges, so
+                # the spatial gate sees a provisional metric chain and no bridge is
+                # spent on an implausible candidate (§4.2 step 0). The model stays
+                # loaded: the lock is CPU work.
+                self._stac_metric_lock()
+                planned = self._stac_plan_bridges(loop_results)
+                self._stac_infer_bridges(planned)
+            else:
+                for item in loop_results:
+                    single_chunk_predictions = self.process_single_chunk(item[1], range_2=item[3], is_loop=True)
+                    self.loop_predict_list.append((item, single_chunk_predictions))
+                    print(item)
         print(
             f"Processing {len(self.img_list)} images in {num_chunks} chunks of size {self.chunk_size} with {self.overlap} overlap")
 
@@ -1694,7 +2417,18 @@ class VGGT_Long:
         # BEFORE any alignment, so the overlap alignment can run as SE(3)
         # (Model.using_sim3: false) — relative scale stops being a negotiable degree of
         # freedom, which is what chained the ±18-50% per-chunk scale errors ("onion").
-        self._stac_metric_lock()
+        if _stac_loops:
+            if not self.loop_enable:
+                self._stac_metric_lock()
+            else:
+                # bridges: own anchors (extracted now that the GPU is free) → lock →
+                # Sim3 measurement → loop rows close the scale graph (§5)
+                self._stac_ensure_bridge_anchors()
+                self._stac_lock_bridges()
+                meas_sim3 = self._stac_measure_loops(rigid=False)
+                self._stac_scale_close(meas_sim3)
+        else:
+            self._stac_metric_lock()
 
         print("Aligning all the chunks...")
         for chunk_idx in range(len(self.chunk_indices)-1):
@@ -1776,7 +2510,12 @@ class VGGT_Long:
             self.sim3_list.append((s, R, t))
 
 
-        if self.loop_enable:
+        if self.loop_enable and _stac_loops:
+            # ── STAC F1 ── the scale is closed: exact SE(3) edges + verification
+            # (§4.2) on the re-scaled chunks; every edge carries its measured σ.
+            meas_rigid = self._stac_measure_loops(rigid=True)
+            self._stac_verify_loops(meas_rigid)
+        elif self.loop_enable:
             for item in self.loop_predict_list:
                 chunk_idx_a = item[0][0]
                 chunk_idx_b = item[0][2]
@@ -1856,20 +2595,13 @@ class VGGT_Long:
                 print("Estimated Translation:", t_ab)
 
                 self.loop_sim3_list.append((chunk_idx_a, chunk_idx_b, (s_ab, R_ab, t_ab)))
-
-
-        _n_seams = max(len(self.chunk_indices) - 1, 0)
-        if (self.config['Model'].get('exact_seam_align')
-                and getattr(self, '_stac_exact_seams', 0) == _n_seams and _n_seams > 0):
-            # every seam is an exact-correspondence rigid fit (mm-scale). The loop
-            # optimizer's constraints come from the COARSE point-map fits — letting
-            # them redistribute error would degrade the precise chain, not help it.
-            if self.loop_enable:
-                print(f"[exact-seam] all {_n_seams} seams exact — loop optimizer SKIPPED "
-                      f"(coarse loop constraints must not drag a mm-precise chain)")
-            self.loop_enable_opt = False
+            # vendor loop path (no Model.loops): coarse point-map edges, no measured σ
+            # — the optimizer runs as the vendor ships it. The former "all seams
+            # exact → optimizer SKIPPED" rule is gone (claude_stac.txt P1): in the
+            # STAC path the decision is σ-based inside _stac_verify_loops.
+            self.loop_enable_opt = bool(self.loop_enable and len(self.loop_sim3_list) > 0)
         else:
-            self.loop_enable_opt = self.loop_enable
+            self.loop_enable_opt = False
         if self.loop_enable_opt:
             input_abs_poses = self.loop_optimizer.sequential_to_absolute_poses(self.sim3_list)
             self.sim3_list = self.loop_optimizer.optimize(self.sim3_list, self.loop_sim3_list)
