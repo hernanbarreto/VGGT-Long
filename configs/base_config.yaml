@@ -50,7 +50,9 @@ Loop:
     top_k: 5
     use_nms: True
     nms_threshold: 25
-    min_gap: 11 # STAC: pairs closer than this many list indices are odometry (vendor behaviour: > 10)
+    min_gap: 11        # STAC: floor of the non-local band, in list indices (vendor: hard-coded > 10)
+    min_gap_frac: 0.10 # STAC: and this fraction of the list length — the effective band is the
+                       # larger of the two, so it scales with the length of the walk
 
   SIM3_Optimizer:
     lang_version: 'cpp'

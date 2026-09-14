@@ -1,3 +1,4 @@
+import math
 import torch
 import argparse
 import numpy as np
@@ -41,6 +42,14 @@ class LoopDetector:
         # detector's image list, i.e. KEYFRAMES when the list is pinned to the
         # chunks). The vendor hard-coded `> 10` for per-video-frame lists.
         self.min_gap = int(self.config['Loop']['SALAD']['min_gap'])
+        # ...and a FRACTION of the list, because the right band scales with the
+        # walk: 11 keyframes is a tenth of a 110-keyframe survey and a twentieth
+        # of a 216-keyframe one, where it left four of six proposals sitting on
+        # the band edge (pccr 2026-09-14: gaps 11, 11, 11, 13 — near-odometry
+        # pairs that spent the top-k slots). The effective gap is the larger of
+        # the two and is resolved in find_loop_closures, where the list length
+        # is known.
+        self.min_gap_frac = float(self.config['Loop']['SALAD']['min_gap_frac'])
         self.output = output
         
         self.model = None
@@ -199,8 +208,11 @@ class LoopDetector:
         D = D / D.norm(dim=1, keepdim=True).clamp_min(1e-12)
         sims = (D @ D.T).numpy()
         n = sims.shape[0]
+        min_gap = max(int(self.min_gap), int(math.ceil(self.min_gap_frac * n)))
+        print(f"[loops] SALAD non-local band: {min_gap} keyframe(s) "
+              f"(floor {self.min_gap}, {self.min_gap_frac:g} x {n} frames)")
         idx = np.arange(n)
-        local = np.abs(idx[:, None] - idx[None, :]) < self.min_gap      # self + odometry band
+        local = np.abs(idx[:, None] - idx[None, :]) < min_gap           # self + odometry band
         sims_nonlocal = np.where(local, -np.inf, sims)
 
         loop_closures = []
