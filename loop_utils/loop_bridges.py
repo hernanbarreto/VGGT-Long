@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence
 
 import numpy as np
 
@@ -228,34 +228,9 @@ def loop_scale_row(s_ab: float) -> float:
     return float(-np.log(float(s_ab)))
 
 
-# ── attention verification (optional, config-gated) ────────────────────
-
-def attention_score(tokens, layout: dict) -> Optional[float]:
-    """Cosine agreement between the REGISTER tokens of the two windows inside
-    ONE bridge pass (VGGT-SLAM 2.0 idea: the aggregator already knows whether
-    two frames see the same scene). tokens: (S, n_reg, C) from the bridge
-    prediction; the camera token (index 0) is pose-specific and excluded.
-    None when the bridge carries no tokens."""
-    if tokens is None:
-        return None
-    tk = np.asarray(tokens, np.float32)
-    if tk.ndim == 4:
-        tk = tk[0]
-    if tk.ndim != 3 or tk.shape[1] < 2:
-        return None
-    reg = tk[:, 1:, :].reshape(tk.shape[0], -1)
-    reg = reg / (np.linalg.norm(reg, axis=1, keepdims=True) + 1e-9)
-    a = reg[layout["bridge_a"]]
-    b = reg[layout["bridge_b"]]
-    if len(a) == 0 or len(b) == 0:
-        return None
-    return float((a @ b.T).mean())
-
-
 # ── verification (§4.2, steps 1–4; step 0 is the spatial gate, upstream) ──
 
 def verify_loop(meas: dict, loops_cfg: dict, semantic: Optional[dict] = None,
-                attention: Optional[float] = None,
                 spatial: Optional[dict] = None) -> dict:
     """Verdict for one measured bridge. Returns a dict with
     status ∈ {accepted, scale_break, rejected}, sigma_m (pose-edge σ), reasons.
@@ -264,8 +239,7 @@ def verify_loop(meas: dict, loops_cfg: dict, semantic: Optional[dict] = None,
     2. scale: |log s_ab| ≤ scale_tol_log → row + edge; beyond → scale_break
        (edge kept with σ × scale_break_sigma_factor, seams between the two
        chunks flagged suspect);
-    3. attention (optional): score ≥ attention_min_score when enabled;
-    4. semantic: when BOTH frames carry SAM3 instances, ≥ min_shared_structural_labels
+    3. semantic: when BOTH frames carry SAM3 instances, ≥ min_shared_structural_labels
        structural labels in common (movable labels neither help nor hurt).
     A spatial verdict 'ambiguous' inflates σ by ambiguous_sigma_factor; 'reject'
     never reaches this function (no bridge is spent on it)."""
@@ -274,8 +248,6 @@ def verify_loop(meas: dict, loops_cfg: dict, semantic: Optional[dict] = None,
     tol_log = float(cfg_req(loops_cfg, "scale_tol_log", "loops"))
     sb_factor = float(cfg_req(loops_cfg, "scale_break_sigma_factor", "loops"))
     amb_factor = float(cfg_req(loops_cfg, "ambiguous_sigma_factor", "loops"))
-    att_on = bool(cfg_req(loops_cfg, "attention_verify", "loops"))
-    att_min = float(cfg_req(loops_cfg, "attention_min_score", "loops"))
     min_shared = int(cfg_req(loops_cfg, "min_shared_structural_labels", "loops"))
     movable = set(str(x).lower() for x in cfg_req(loops_cfg, "movable_labels", "loops"))
 
@@ -295,12 +267,6 @@ def verify_loop(meas: dict, loops_cfg: dict, semantic: Optional[dict] = None,
     log_s = float(np.log(meas["s_ab"]))
     scale_ok = abs(log_s) <= tol_log
     v["checks"]["scale"] = {"log_s_ab": log_s, "scale_tol_log": tol_log, "passed": bool(scale_ok)}
-    if att_on:
-        att_ok = attention is not None and attention >= att_min
-        v["checks"]["attention"] = {"score": attention, "min": att_min, "passed": bool(att_ok)}
-        if not att_ok:
-            v["reasons"].append(f"attention score {attention} < {att_min}")
-            return v
     if semantic is not None and semantic.get("a") is not None and semantic.get("b") is not None:
         la = {str(x).lower() for x in semantic["a"]} - movable
         lb = {str(x).lower() for x in semantic["b"]} - movable

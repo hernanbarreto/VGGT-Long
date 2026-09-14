@@ -2,8 +2,9 @@
 inside VGGT_Long on synthetic chunks — intra-chunk drift injected along the
 walk (what per-chunk rigid seams cannot remove), one verified exact bridge at
 the revisit; the graph closes the loop within tolerance, held-out surface
-pairs do not degrade, the §4.7 veto removes a false loop demanding more than
-the drift budget, contradictory-only loops leave identity, resume replays."""
+pairs do not degrade; the §4.7 drift budget / authority gates are MEASURED
+and declared: applied under gate_mode advisory (USER 2026-09-09), identity
+under veto; no edge means identity; resume replays."""
 
 import json
 import os
@@ -127,26 +128,39 @@ def test_graph_closes_the_injected_drift(tmp_path, synth_drift):
     assert np.allclose(Ti2, Ti1)
 
 
-def test_false_loop_is_vetoed_by_authority(tmp_path, synth_drift):
+def test_over_budget_loop_is_declared_not_vetoed(tmp_path, synth_drift):
+    """A closure beyond the drift budget is a MEASUREMENT: it is applied and
+    declared (over_budget + gate warning), never silently dropped. Under veto
+    (evaluation) the same edge keeps identity."""
     sess, chunks, ci, errors, D = synth_drift
     r, save_dir = _runner(tmp_path, sess, chunks, ci)
     _run_loop_stage(r, sess, ci, (140, 8))
     _align_and_write(r, save_dir, ci)
-    # a LIAR bypassing the gate: an edge that demands 8 m at the revisit
     honest = dict(r._stac_loop_edges_kf[0])
     Z = np.asarray(honest["Z"], np.float64).copy()
-    Z[:3, 3] += np.array([8.0, 0.0, 0.0])
-    liar = dict(honest, Z=Z.tolist(), bridge=99)
-    r._stac_loop_edges_kf = [honest, liar]
+    Z[:3, 3] += np.array([8.0, 0.0, 0.0])          # 8 m demanded at the revisit
+    big = dict(honest, Z=Z.tolist(), bridge=99)
+    r._stac_loop_edges_kf = [honest, big]
     r._stac_uncertainty()
     r._stac_pose_graph()
     rep = json.loads((save_dir / "pose_graph.json").read_text())
-    assert rep["vetoed"] and rep["vetoed"][0]["bridge"] == 99
-    assert rep["n_loop_edges_active"] == 1
-    assert rep["verdict"] == "APPLY"
+    assert rep["gate_mode"] == "advisory"
+    assert rep["over_budget"] and any(o["bridge"] == 99 for o in rep["over_budget"])
+    assert any("drift budget" in w for w in rep["gate_warnings"])
+    assert rep["n_loop_edges_active"] == 2 and rep["verdict"] == "APPLY"
+    assert "vetoed" not in rep
+    # veto mode: the same evidence keeps identity, declared
+    r2, save2 = _runner(tmp_path / "veto", sess, chunks, ci, graph_over={"gate_mode": "veto"})
+    _run_loop_stage(r2, sess, ci, (140, 8))
+    _align_and_write(r2, save2, ci)
+    r2._stac_loop_edges_kf = [dict(r2._stac_loop_edges_kf[0]), dict(r2._stac_loop_edges_kf[0], Z=Z.tolist(), bridge=99)]
+    r2._stac_uncertainty()
+    r2._stac_pose_graph()
+    rep2 = json.loads((save2 / "pose_graph.json").read_text())
+    assert rep2["gate_mode"] == "veto" and rep2["verdict"] == "IDENTITY" and rep2["gate_warnings"]
 
 
-def test_contradictory_only_loops_keep_identity(tmp_path, synth_drift):
+def test_authority_exceeded_is_declared_advisory_applies_veto_keeps_identity(tmp_path, synth_drift):
     sess, chunks, ci, errors, D = synth_drift
     r, save_dir = _runner(tmp_path, sess, chunks, ci, auth_over={"pose_graph_max_m": 0.05})
     _run_loop_stage(r, sess, ci, (140, 8))
@@ -154,10 +168,23 @@ def test_contradictory_only_loops_keep_identity(tmp_path, synth_drift):
     r._stac_uncertainty()
     r._stac_pose_graph()
     rep = json.loads((save_dir / "pose_graph.json").read_text())
-    # closing 1.2 m of drift needs more than the 5 cm authority → IDENTITY
-    assert rep["verdict"] == "IDENTITY"
+    # closing 1.2 m of drift needs more than the 5 cm authority: declared,
+    # applied anyway (advisory — the user judges in the kit)
     assert rep["authority"]["exceeded"] is True
+    assert any("authority" in w for w in rep["gate_warnings"])
+    assert rep["verdict"] == "APPLY"
     d0 = np.load(save_dir / "_tmp_results_aligned" / "chunk_0.npy", allow_pickle=True).item()
+    assert d0.get("_stac_pose_graph_applied")
+    # veto: identity, nothing stamped
+    r2, save2 = _runner(tmp_path / "veto", sess, chunks, ci, auth_over={"pose_graph_max_m": 0.05},
+                        graph_over={"gate_mode": "veto"})
+    _run_loop_stage(r2, sess, ci, (140, 8))
+    _align_and_write(r2, save2, ci)
+    r2._stac_uncertainty()
+    r2._stac_pose_graph()
+    rep2 = json.loads((save2 / "pose_graph.json").read_text())
+    assert rep2["verdict"] == "IDENTITY" and rep2["authority"]["exceeded"] is True
+    d0 = np.load(save2 / "_tmp_results_aligned" / "chunk_0.npy", allow_pickle=True).item()
     assert not d0.get("_stac_pose_graph_applied")
 
 

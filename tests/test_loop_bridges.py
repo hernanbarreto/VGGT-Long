@@ -7,7 +7,7 @@ import pytest
 
 from loop_utils import loop_bridges as lb
 from loop_utils.metric_lock import (solve_scale_graph, scale_break_diagnosis,
-                                    seam_relative_scale, robust_rigid)
+                                    seam_relative_scale)
 from synth_metric import (make_session, make_chunks, make_bridge, fork_loops_cfg,
                                 yaw_R)
 
@@ -110,7 +110,7 @@ def test_broken_bridge_rejected_by_geometry():
     assert v["checks"]["geometric"]["passed"] is False
 
 
-def test_semantic_and_attention_checks():
+def test_semantic_and_ambiguous_checks():
     sess = session()
     chunks, ci, _ = make_chunks(sess)
     item = _item(ci, 0, 20, len(ci) - 1, ci[-1][0] + 15)
@@ -122,8 +122,6 @@ def test_semantic_and_attention_checks():
     assert ok["status"] == "accepted" and ok["checks"]["semantic"]["shared_structural"] == ["wall"]
     bad = lb.verify_loop(meas, cfg, semantic={"a": ["box"], "b": ["box", "column"]})
     assert bad["status"] == "rejected"                   # movable labels never count
-    att = lb.verify_loop(meas, fork_loops_cfg(attention_verify=True), attention=0.2)
-    assert att["status"] == "rejected" and att["checks"]["attention"]["passed"] is False
     amb = lb.verify_loop(meas, cfg, spatial={"verdict": "ambiguous"})
     assert amb["sigma_m"] == pytest.approx(meas["residual_m"] * cfg["ambiguous_sigma_factor"])
 

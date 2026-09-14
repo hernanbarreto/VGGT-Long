@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from loop_utils import lie
-from loop_utils.pose_graph import PoseGraph, _res_rel, _res_grav, _res_plane, _res_axis
+from loop_utils.pose_graph import PoseGraph, _res_rel, _res_plane, _res_axis
 
 
 def graph_cfg(**over):
@@ -68,7 +68,6 @@ def test_autograd_jacobians_match_finite_differences():
     Zinv = torch.as_tensor(lie.se3_inv(Z).reshape(-1), dtype=torch.float64)
     d0 = torch.zeros(6, dtype=torch.float64)
     for kern, params in ((_res_rel, Zinv),
-                         (_res_grav, torch.tensor([0.0, -1.0, 0.0], dtype=torch.float64)),
                          (_res_plane, torch.tensor([0.0, 0.0, 1.0, 2.0, 0.0, 1.0, 0.0, 0.5],
                                                    dtype=torch.float64)),
                          (_res_axis, torch.tensor([0.0, -1.0, 0.0, 0.0, 1.0, 0.0],
@@ -132,11 +131,10 @@ def test_gauge_invariance():
         for k in range(n - 1):
             pg.add_relative(k, k + 1, lie.se3_inv(T_gt[k]) @ T_gt[k + 1], 0.5, 0.02)
         pg.add_relative(0, n - 1, lie.se3_inv(T_gt[0]) @ T_gt[n - 1], 0.5, 0.02, huber=True, tag="loop")
-        pg.add_gravity(3, T_gt[3][:3, 1], 5.0)
         pg.solve(log=lambda m: None)
         return pg.poses
 
-    G = lie.se3_exp(np.array([0.0, 0.7, 0.0, 3.0, 0.0, -1.0]))     # a yaw + translation (gravity-preserving)
+    G = lie.se3_exp(np.array([0.0, 0.7, 0.0, 3.0, 0.0, -1.0]))     # a yaw + translation
     A = solve(T_init)
     B = solve(np.stack([G @ M for M in T_init]))
     for k in range(n):
@@ -217,9 +215,6 @@ def test_structural_priors_pull_a_tilted_frame():
     pg = PoseGraph(T_init, graph_cfg())
     for k in range(9):
         pg.add_relative(k, k + 1, lie.se3_inv(T_init[k]) @ T_init[k + 1], 5.0, 0.5)   # weak odometry
-    # the synthetic ring's cameras carry world +Y as their +Y axis: the prior
-    # pins that axis (the camera "down" of a real OpenCV rig is the same call)
-    pg.add_gravity(4, T_gt[4][:3, 1], 0.2)
     # a floor patch seen by frame 4: local plane of the world floor y=0 under the GT pose
     Rg, tg = T_gt[4][:3, :3], T_gt[4][:3, 3]
     n_l = Rg.T @ np.array([0.0, 1.0, 0.0])

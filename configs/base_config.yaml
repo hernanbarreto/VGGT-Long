@@ -50,6 +50,7 @@ Loop:
     top_k: 5
     use_nms: True
     nms_threshold: 25
+    min_gap: 11 # STAC: pairs closer than this many list indices are odometry (vendor behaviour: > 10)
 
   SIM3_Optimizer:
     lang_version: 'cpp'

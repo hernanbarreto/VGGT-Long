@@ -3,7 +3,6 @@ import argparse
 
 import os
 import glob
-import threading
 import torch
 from tqdm.auto import tqdm
 import cv2
@@ -580,7 +579,6 @@ class VGGT_Long:
                 apply_scale_drift(data, drift_frames[k])
             else:
                 apply_scale(data, s)
-            self._stac_hybrid_da3(data, k, anchor_dir, near_frac)
             np.save(path, data)
         # STAC F1 bookkeeping for the loop stage (_stac_scale_close): what was
         # applied per chunk (the drift stage's geometric mean when it ran).
@@ -656,12 +654,10 @@ class VGGT_Long:
                         suspect.setdefault(int(k_str), rs)
             except Exception:
                 pass
-        # USER ORDER 2026-09-04: the write-blocking gate is OPT-IN
-        # (Model.metric_lock.health_gate). Default: flags are DIAGNOSTIC ONLY
-        # — every chunk writes; a zoomed chunk's scale is corrected upstream
-        # (zoom_scale_fix) instead of being turned into a declared hole.
-        _gate = bool(ml.get('health_gate', False))
-        self._stac_sick_chunks = set(sick) if _gate else set()
+        # USER ORDER 2026-09-04: the health flags are DIAGNOSTIC ONLY — every
+        # chunk writes; a zoomed chunk's scale is corrected upstream
+        # (zoom_scale_fix) instead of being turned into a declared hole. The
+        # write-blocking gate was DELETED 2026-09-13 (never on since).
         self._stac_suspect_chunks = set(suspect)
         with open(_health_path, "w") as f:
             _json.dump({"tri_angle": {str(k): tri_map.get(k)
@@ -679,13 +675,9 @@ class VGGT_Long:
             for k in sorted(sick):
                 for r in sick[k]:
                     print(f"[health] chunk {k} SICK: {r}")
-            if _gate:
-                print(f"[health] ⛔ {len(sick)} chunk(s) EXCLUDED from the cloud "
-                      f"({sorted(sick)}) — kept as alignment bridges, see chunk_health.json")
-            else:
-                print(f"[health] {len(sick)} chunk(s) FLAGGED ({sorted(sick)}) — "
-                      f"DIAGNOSTIC ONLY (health_gate off): they still write; zoom "
-                      f"chunks got seam-graph scale instead")
+            print(f"[health] {len(sick)} chunk(s) FLAGGED ({sorted(sick)}) — "
+                  f"DIAGNOSTIC ONLY: they still write; zoom chunks got seam-graph "
+                  f"scale instead")
         else:
             print(f"[health] ✅ all {len(self.chunk_indices)} chunks healthy "
                   f"(parallax + anchor coherence)")
@@ -778,13 +770,6 @@ class VGGT_Long:
         Every overlap frame used to be written by BOTH chunks — two displaced copies
         of the same pixels in the cloud (the mechanical half of the duplicated
         objects). One frame → one writer (the chunk whose centre is nearest)."""
-        # HEALTH GATE: a sick chunk (see _stac_metric_lock) writes NOTHING — its
-        # owned frames become a declared hole instead of garbage in the cloud.
-        if chunk_idx in getattr(self, '_stac_sick_chunks', ()):
-            cf = np.asarray(confs, np.float32).reshape(-1).copy()
-            cf[:] = 0.0
-            print(f"[health] chunk {chunk_idx}: sick — all frames dropped from the cloud")
-            return cf
         if (not self.config['Model'].get('frame_ownership')
                 or self.chunk_indices is None or len(self.chunk_indices) <= 1):
             return confs
@@ -862,13 +847,7 @@ class VGGT_Long:
     def _stac_write_chunk_outputs(self, chunk_data, K):
         """PLY + origins for chunk K from its (aligned, possibly elastic-corrected)
         data — ONE ownership mask and ONE conf threshold shared by both writers, so
-        the PLY and {K}_origins.npz stay 1:1 by construction. Sick chunks (health
-        gate) write NO files at all: an absent chunk is a declared hole, while an
-        empty PLY would trip every downstream reader."""
-        if K in getattr(self, '_stac_sick_chunks', ()):
-            print(f"[health] chunk {K}: sick — PLY/origins NOT written "
-                  f"(declared hole, see chunk_health.json)")
-            return
+        the PLY and {K}_origins.npz stay 1:1 by construction."""
         points = chunk_data['world_points'].reshape(-1, 3)
         colors = (chunk_data['images'].transpose(0, 2, 3, 1).reshape(-1, 3) * 255).astype(np.uint8)
         confs = self._stac_owned_confs(chunk_data['world_points_conf'].reshape(-1), K)
@@ -1027,16 +1006,11 @@ class VGGT_Long:
         # on the SAME consensus, so the fused cloud (one writer per frame) is
         # continuous through the ownership switch in the middle of each overlap.
         self._stac_elastic_corr = {}
-        _sick = getattr(self, '_stac_sick_chunks', set())
         _suspect = getattr(self, '_stac_suspect_chunks', set())
         for k in range(len(self.chunk_indices)):
-            # sick chunks: healthy neighbours never bend toward them (alpha pinned
-            # inside elastic_corrections); their own npy still gets corrected —
-            # harmless, and it keeps every seam's two copies coincident — but they
-            # write no outputs later (declared hole). Suspect chunks (soft tier):
-            # the consensus is BIASED toward the trusted side, not pinned.
-            corr = elastic_corrections(self.chunk_indices, k, fits, sick=_sick,
-                                       suspect=_suspect)
+            # suspect chunks (soft health tier): the consensus is BIASED toward
+            # the trusted side, not pinned
+            corr = elastic_corrections(self.chunk_indices, k, fits, suspect=_suspect)
             self._stac_elastic_corr[k] = corr
             path = os.path.join(self.result_aligned_dir, f"chunk_{k}.npy")
             data = np.load(path, allow_pickle=True).item()
@@ -1114,7 +1088,6 @@ class VGGT_Long:
                                             robust_rigid, filter_pair_fits,
                                             solve_chunk_field, blend_chunk_fields,
                                             chunk_field_verdict, se3_matrices)
-        _sick = getattr(self, '_stac_sick_chunks', set())
         N = len(self.img_list)
 
         ic_path = os.path.join(self.output_dir, "intra_chunk.json")
@@ -1134,8 +1107,8 @@ class VGGT_Long:
             fields, report = {}, {}
             for k, (start, end) in enumerate(self.chunk_indices):
                 S = end - start
-                if k in _sick or S < 8:
-                    report[str(k)] = {"verdict": "SKIP", "reason": "sick or tiny"}
+                if S < 8:
+                    report[str(k)] = {"verdict": "SKIP", "reason": "tiny chunk"}
                     continue
                 data = np.load(os.path.join(self.result_aligned_dir, f"chunk_{k}.npy"),
                                allow_pickle=True).item()
@@ -1279,10 +1252,8 @@ class VGGT_Long:
         from loop_utils.metric_lock import (depth_pair_samples, pair_depth_relation,
                                             solve_depth_graph, apply_depth_correction,
                                             frame_owner)
-        _sick = getattr(self, '_stac_sick_chunks', set())
         N = len(self.img_list)
         owner = frame_owner(self.chunk_indices, N)
-        sick_frames = {g for g in range(N) if owner[g] in _sick}
 
         dg_path = os.path.join(self.output_dir, "depth_graph.json")
         sol = None
@@ -1313,7 +1284,7 @@ class VGGT_Long:
                 ext = np.asarray(data['extrinsic'])
                 K = np.asarray(data['intrinsic'])
                 for local, g in enumerate(range(start, end)):
-                    if owner[g] == k and g not in sick_frames:
+                    if owner[g] == k:
                         c2w = self._stac_aligned_pose(k, local, ext[local])
                         cache[g] = (wp[local].astype(np.float32), cf[local].astype(np.float32),
                                     np.linalg.inv(c2w), K[local])
@@ -1369,7 +1340,7 @@ class VGGT_Long:
             b = np.zeros(N)
             verdict, model = "SKIP", None
             for rung, kw in (("affine", {}), ("scale-only", {"scale_only": True})):
-                a_r, b_r = solve_depth_graph(meas, N, sick_frames=sick_frames, **kw)
+                a_r, b_r = solve_depth_graph(meas, N, **kw)
                 v = depth_graph_verdict(a_r, b_r, meas, held)
                 ladder.append(dict(v, model=rung))
                 print(f"[depth-graph] {rung}: held-out {v['med_before'] * 100:.2f}% -> "
@@ -1422,7 +1393,7 @@ class VGGT_Long:
             ext = np.asarray(data['extrinsic'])
             moved = 0
             for local, g in enumerate(range(start, end)):
-                if g in sick_frames or (abs(a[g] - 1.0) < 1e-9 and abs(b[g]) < 1e-12):
+                if abs(a[g] - 1.0) < 1e-9 and abs(b[g]) < 1e-12:
                     continue
                 c2w = self._stac_aligned_pose(k, local, ext[local])
                 wp[local], dep[local] = apply_depth_correction(
@@ -1443,8 +1414,7 @@ class VGGT_Long:
         measured on test4: cross-owner depth disagreement 1.51% -> 1.01%, the
         ownership-switch step halves; same-owner pairs unchanged). Runs AFTER the
         elastic consensus (copies rigidly coincide) and depth graph, BEFORE the
-        outputs. Seams touching a sick chunk are skipped — a healthy field never
-        averages with garbage. Both copies are written back, so every downstream
+        outputs. Both copies are written back, so every downstream
         reader (PLY via ownership, TSDF, omega-depth) sees the same consensus;
         the operation is idempotent (blending identical copies is a no-op), so
         resume needs no special casing beyond the skip stamp.
@@ -1468,12 +1438,8 @@ class VGGT_Long:
         if not self.config['Model'].get('blend_copies') or len(self.chunk_indices) < 2:
             return
         from loop_utils.metric_lock import blend_two_copies
-        _sick = getattr(self, '_stac_sick_chunks', set())
         prev = None            # (k, data, dirty)
         for k in range(len(self.chunk_indices) - 1):
-            if k in _sick or (k + 1) in _sick:
-                print(f"[blend] seam {k}->{k + 1}: touches a sick chunk — skipped")
-                continue
             if prev is not None and prev[0] == k:
                 data_a, dirty_a = prev[1], prev[2]
             else:
@@ -1593,11 +1559,8 @@ class VGGT_Long:
         from loop_utils.metric_lock import frame_owner, classify_far_points
         floor, rate = stats
         owner = frame_owner(self.chunk_indices, len(self.img_list))
-        _sick = getattr(self, '_stac_sick_chunks', set())
         cache = {}          # g -> (wp, conf, depth, w2c, K, cam)
         for k, (start, end) in enumerate(self.chunk_indices):
-            if k in _sick:
-                continue
             data = np.load(os.path.join(self.result_aligned_dir, f"chunk_{k}.npy"),
                            allow_pickle=True).item()
             wp = np.asarray(data['world_points']); wp = wp[0] if wp.ndim == 5 else wp
@@ -1644,72 +1607,6 @@ class VGGT_Long:
                   f"far coverage → KEPT")
         return masks
 
-    def _stac_hybrid_da3(self, data, k, anchor_dir, near_frac):
-        """HYBRID WRITE driver for one metric-scaled chunk (in place, BEFORE the
-        Sim3 chain and every consensus stage, while world_points ↔ depth ↔
-        extrinsic are still one coherent chunk-local system): each frame with an
-        isolated DA3 depth map adopts DA3's depth SHAPE at omega's scale and
-        pose (loop_utils.metric_lock.hybrid_substitute). Downstream stages
-        (exact seams, elastic, depth graph, writers) then consume the straighter
-        geometry with zero pose bookkeeping. Frames without a DA3 map keep omega
-        (log the count — the server extracts DA3 for every keyframe when
-        Model.hybrid_da3 is on)."""
-        if not self.config['Model'].get('hybrid_da3'):
-            return
-        from loop_utils.metric_lock import (anchor_ratio, hybrid_substitute,
-                                            real_frame_number)
-        far_m = self.config['Model'].get('hybrid_da3_far_m', 15.0)
-        far_m = float(far_m) if far_m else None
-        start, end = self.chunk_indices[k]
-        wp = np.asarray(data['world_points'])
-        lead = wp.ndim == 5
-        if lead:
-            wp = wp[0]
-        S = wp.shape[0]
-        depth = np.asarray(data['depth'])
-        dlead = depth.ndim == 4 and depth.shape[0] == 1
-        if dlead:
-            depth = depth[0]
-        conf = np.asarray(data['world_points_conf'])
-        ext = np.asarray(data['extrinsic'])
-        if ext.ndim == 4:
-            ext = ext[0]
-        n_sub_frames, n_missing, n_starved, px_total, deltas = 0, 0, 0, 0, []
-        for local in range(S):
-            num = real_frame_number(self.img_list[start + local])
-            npz_path = os.path.join(str(anchor_dir), f"frame_{int(num)}.npz")
-            if not os.path.exists(npz_path):
-                n_missing += 1
-                continue
-            z = np.load(npz_path)
-            if "depth" not in z:
-                n_missing += 1
-                continue
-            r = anchor_ratio(depth[local], z["depth"], conf=conf[local],
-                             near_frac=near_frac)
-            if r is None or not np.isfinite(r) or r <= 0:
-                n_starved += 1
-                continue
-            wp_new, d_new, n_px, med = hybrid_substitute(
-                wp[local], conf[local], depth[local], ext[local],
-                z["depth"], r, far_m=far_m)
-            if n_px == 0:
-                n_starved += 1
-                continue
-            wp[local] = wp_new
-            depth[local] = d_new
-            n_sub_frames += 1
-            px_total += n_px
-            deltas.append(med)
-        data['world_points'] = wp[None] if lead else wp
-        data['depth'] = depth[None] if dlead else depth
-        med_all = float(np.median(deltas)) * 100 if deltas else 0.0
-        print(f"[hybrid-da3] chunk {k}: {n_sub_frames}/{S} frames re-shaped on DA3 "
-              f"depth at omega scale/pose ({px_total:,} px, median shape "
-              f"correction {med_all:.1f}%)"
-              + (f"; {n_missing} frame(s) without DA3 map" if n_missing else "")
-              + (f"; {n_starved} starved/gated" if n_starved else ""))
-
     def _stac_prepare_backfill(self):
         """One sequential pass over the aligned chunks BEFORE any output is
         written: freeze every chunk's write threshold on its OWNED confidences,
@@ -1717,8 +1614,7 @@ class VGGT_Long:
         non-owner can backfill exactly the pixels the owner will drop
         (loop_utils.metric_lock.backfill_mask). Frozen thresholds make the
         owner-writes prediction exact: owner-writes and backfill stay disjoint,
-        so no pixel enters the cloud twice. A sick owner writes nothing → its
-        healthy neighbour may backfill everything valid."""
+        so no pixel enters the cloud twice."""
         self._stac_write_thr = {}
         self._stac_backfill = {}
         if (not self.config['Model'].get('ownership_backfill')
@@ -1727,7 +1623,6 @@ class VGGT_Long:
             return
         from loop_utils.metric_lock import frame_owner
         owner = frame_owner(self.chunk_indices, len(self.img_list))
-        sick = getattr(self, '_stac_sick_chunks', set())
         prev_tail = None       # (k-1, {g: conf_row}) for the shared frames
         for k, (start, end) in enumerate(self.chunk_indices):
             path = os.path.join(self.result_aligned_dir, f"chunk_{k}.npy")
@@ -1742,23 +1637,20 @@ class VGGT_Long:
             del data
             owned_rows = [l for l in range(S) if owner[start + l] == k]
             self._stac_write_thr[k] = (
-                None if k in sick or not owned_rows
+                None if not owned_rows
                 else self._stac_conf_threshold(cf[owned_rows].reshape(-1)))
             if prev_tail is not None and prev_tail[0] == k - 1:
                 j = k - 1
                 s_j, e_j = self.chunk_indices[j]
                 for g in range(start, min(e_j, end)):
-                    if owner[g] == j and j not in sick:
+                    if owner[g] == j:
                         # k is the non-owner: it backfills what j drops
                         self._stac_backfill[(k, g - start)] = (
                             prev_tail[1][g], self._stac_write_thr[j])
-                    elif owner[g] == j and j in sick:
-                        self._stac_backfill[(k, g - start)] = (None, None)
                     elif owner[g] == k:
                         # j is the non-owner (thr_k already frozen above)
                         self._stac_backfill[(j, g - s_j)] = (
-                            cf[g - start].copy(),
-                            None if k in sick else self._stac_write_thr[k])
+                            cf[g - start].copy(), self._stac_write_thr[k])
             if k + 1 < len(self.chunk_indices):
                 nxt0 = self.chunk_indices[k + 1][0]
                 prev_tail = (k, {g: cf[g - start].copy()
@@ -2203,6 +2095,18 @@ class VGGT_Long:
                                  n_chunks, sigma_seam=inputs["sigma_seam"],
                                  sigma_anchor=inputs["sigma_anchor"],
                                  loop_rel=loop_rel, absolute=absolute)
+        # The residual factor is what the LOOP/ABSOLUTE rows change: the same
+        # graph solved without them is the reference. It is NOT s_v1: when the
+        # drift stage ran, s_v1 is the geometric mean of a per-frame scale
+        # ramp the metric lock chose over the constant solution, and dividing
+        # the constant solution by it re-scaled every chunk (pccr 2026-09-13:
+        # 0 loop rows, yet chunks 0/1 got ×0.83/×0.90 → the 0->1 seam went
+        # from 9 to 14 cm and the stage burnt 188 % of its authority). With
+        # no loop and no absolute row δ is exactly 1 for every chunk.
+        s_ref = solve_scale_graph(inputs["s_da3"], inputs["n_anchors"], inputs["seam_rel"],
+                                  n_chunks, sigma_seam=inputs["sigma_seam"],
+                                  sigma_anchor=inputs["sigma_anchor"],
+                                  loop_rel={}, absolute=[])
         breaks = []
         for row in loop_rows:
             if row["scale_break"]:
@@ -2221,11 +2125,14 @@ class VGGT_Long:
                       f"see scale_graph.json)")
         delta = {}
         for k in range(n_chunks):
-            sv1 = s_v1.get(k)
-            if sv1 is None or not np.isfinite(s_v2[k]) or s_v2[k] <= 0:
+            if (s_v1.get(k) is None or not np.isfinite(s_v2[k]) or s_v2[k] <= 0
+                    or not np.isfinite(s_ref[k]) or s_ref[k] <= 0):
                 delta[k] = 1.0
             else:
-                delta[k] = float(s_v2[k] / sv1)
+                delta[k] = float(s_v2[k] / s_ref[k])
+        if not loop_rows and not absolute:
+            # nothing new entered the graph — the lock stands, bit for bit
+            delta = {k: 1.0 for k in range(n_chunks)}
         # apply δ to the chunks (in place, stamped) and to parent-locked bridges
         n_moved = 0
         for k in range(n_chunks):
@@ -2264,6 +2171,7 @@ class VGGT_Long:
                "sigma_seam": inputs["sigma_seam"], "sigma_anchor": inputs["sigma_anchor"],
                "sigma_loop": sigma_loop,
                "s_v1_anchors_seams": {str(k): float(v) for k, v in s_v1.items()},
+               "s_ref_no_loops": {str(k): float(s_ref[k]) for k in range(n_chunks)},
                "s_v2_with_loops": {str(k): float(s_v2[k]) for k in range(n_chunks)},
                "delta_applied": {str(k): float(v) for k, v in delta.items()},
                "loop_rows": loop_rows,
@@ -2303,8 +2211,7 @@ class VGGT_Long:
         on at least one edge with σ ≤ max_edge_sigma_m — the exact-seam skip is
         gone (claude_stac.txt DoD)."""
         import json as _json
-        from loop_utils.loop_bridges import (verify_loop, attention_score, cfg_req,
-                                             save_loop_report)
+        from loop_utils.loop_bridges import verify_loop, cfg_req, save_loop_report
         lcfg = self._stac_loops_cfg()
         max_sig = float(cfg_req(lcfg, "max_edge_sigma_m", "loops"))
         starved_sig = float(cfg_req(lcfg, "starved_sigma_m", "loops"))
@@ -2329,10 +2236,7 @@ class VGGT_Long:
                 sa = fr.get(str(ni), {}).get("structural")
                 sb = fr.get(str(nj), {}).get("structural")
                 sem = {"a": sa, "b": sb}
-            att = None
-            if bool(cfg_req(lcfg, "attention_verify", "loops")):
-                att = attention_score(pred.get("camera_and_register_tokens"), meta["layout"])
-            v = verify_loop(meas, lcfg, semantic=sem, attention=att, spatial=meta.get("gate"))
+            v = verify_loop(meas, lcfg, semantic=sem, spatial=meta.get("gate"))
             if not meas.get("ok"):
                 # starved exact fit → the VENDOR coarse fit, recorded as low confidence
                 coarse = self._stac_vendor_bridge_fit(item, pred, meta)
@@ -2343,6 +2247,17 @@ class VGGT_Long:
                                      f"σ={starved_sig} m (low confidence)"], "checks": v.get("checks", {})}
                     meas = dict(meas, ok=True, s_ab=float(s_ab), R_ab=np.asarray(R_ab).tolist(),
                                 t_ab=np.asarray(t_ab).tolist())
+            src = str(cand.get('source', 'salad'))
+            if src.startswith("instance:") and v.get("sigma_m") is not None:
+                # STAC (USER 2026-09-13): a SAM3 candidate is never dropped for
+                # its VLM class — a movable proposer (it may have moved between
+                # the visits) argues with an inflated σ, declared on the edge
+                nsf = float(cfg_req(lcfg, "nonstructural_sigma_factor", "loops"))
+                v["sigma_m"] = float(v["sigma_m"]) * nsf
+                v.setdefault("reasons", []).append(
+                    f"proposed by a {src.split(':', 1)[1]} instance — σ×{nsf:g}")
+                v.setdefault("checks", {})["semantic_class"] = {"class": src.split(':', 1)[1],
+                                                                "sigma_factor": nsf}
             edge = {"bridge": li, "item": [ka, list(item[1]), kb, list(item[3])],
                     "candidate": cand, "gate": meta.get("gate"), "lock": meta.get("lock"),
                     "measurement": {k_: v_ for k_, v_ in meas.items() if k_ != "sides"},
@@ -2388,7 +2303,6 @@ class VGGT_Long:
         gate_mod = self._stac_server_module("reconstruction.loops.spatial_gate")
         save_loop_report(os.path.join(self.output_dir, "loop_edges.json"), edges,
                          extra={"spatial_gate": "on" if gate_mod is not None else "off",
-                                "attention_verify": bool(cfg_req(lcfg, "attention_verify", "loops")),
                                 "semantics": semantics is not None,
                                 "max_edge_sigma_m": max_sig,
                                 "n_edges_usable": n_good,
@@ -2656,13 +2570,19 @@ class VGGT_Long:
 
     def _stac_pose_graph(self):
         """§4.3: the keyframe SE(3) graph over the ALIGNED chunks — odometry
-        from the chain (σ from seam residuals + §4.8 uncertainty), the verified
-        loop edges (σ measured), a weak gravity prior; solved by
-        loop_utils.pose_graph; §4.7 authority (veto of loop edges demanding
-        more than the drift budget, saturation report); gated by loop gain and
-        held-out surface pairs; applied as a RIGID move per frame (points and
-        camera together, both copies of a shared frame) — depth per ray and
-        provenance invariant. Resume-safe (pose_graph.json + npy stamp)."""
+        from the chain (σ from seam residuals + §4.8 uncertainty) and the
+        verified loop edges (σ measured); solved by loop_utils.pose_graph.
+        No gravity prior (a handheld camera pitches — "camera down = consensus
+        down" bent the chain, pccr 2026-09-13). The §4.7 drift budget, the loop
+        gain, the held-out surface pairs and the authority are MEASURED and
+        declared in pose_graph.json; under ``Model.graph.gate_mode`` =
+        ``advisory`` (USER 2026-09-09: "siempre debe aplicarse la corrección
+        de duplicados, no importa lo mucho que haya que corregir") the
+        measured closure is applied whenever a verified edge exists — under
+        ``veto`` (evaluation) any failed gate keeps identity. Applied as a
+        RIGID move per frame (points and camera together, both copies of a
+        shared frame) — depth per ray and provenance invariant. Resume-safe
+        (pose_graph.json + npy stamp)."""
         gcfg = self._stac_graph_cfg()
         if gcfg is None or self._stac_loops_cfg() is None or len(self.chunk_indices) < 1:
             return
@@ -2689,7 +2609,7 @@ class VGGT_Long:
                 print(f"[pose-graph] pose_graph.json unreadable ({_e}) — re-solving")
         if X is None:
             edges_kf = list(getattr(self, '_stac_loop_edges_kf', []) or [])
-            if not edges_kf and not bool(cfg_req(gcfg, "run_without_loops", "graph")):
+            if not edges_kf:
                 report = {"verdict": "IDENTITY", "reason": "no verified loop edge — nothing "
                                                             "closes; odometry alone would only "
                                                             "smooth what the seams already fixed",
@@ -2732,55 +2652,43 @@ class VGGT_Long:
                                       float(e["sigma_deg"]), float(e["sigma_m"]), huber=True,
                                       tag=f"loop:{e['bridge']}")
                 loop_ids.append((eid, e))
-            # 3) gravity prior: the consensus camera-down of the chain (orient's estimator)
-            downs = T0[:, :3, 1] / (np.linalg.norm(T0[:, :3, 1], axis=1, keepdims=True) + 1e-12)
-            g_down = downs.mean(0); g_down /= (np.linalg.norm(g_down) + 1e-12)
-            s_grav = float(cfg_req(gcfg, "sigma_gravity_deg", "graph"))
-            for g in range(N):
-                pg.add_gravity(g, g_down, s_grav)
             # held-out judge BEFORE
             held = self._stac_holdout_pairs(gcfg)
             before_loop = pg.edge_residuals("loop")
             loop_before = float(np.sum([r["t_m"] for r in before_loop.values()])) if before_loop else 0.0
-            # 4) solve with the §4.7 veto loop
-            vetoed = []
+            # 3) ONE solve; the §4.7 drift budget δ(L) = max(floor, rate·L) per
+            # loop is DECLARED, never a veto: a closure is a measurement (the
+            # exact bridge, per-pixel correspondences), the budget a prior on
+            # how much Omega usually drifts — when they disagree the
+            # measurement stands and the report says by how much (pccr
+            # 2026-09-13: four real start↔end closures of 36–57 cm over an
+            # 18 m walk were vetoed one by one and the duplicates stayed).
+            gate_mode = str(cfg_req(gcfg, "gate_mode", "graph"))
             budget_cfg = (self._stac_loops_cfg() or {}).get("spatial") or {}
             centres = T0[:, :3, 3]
-            for _round in range(len(loop_ids) + 1):
-                pg.solve(log=print)
-                Xc = pg.corrections()
-                edge_res = pg.edge_residuals("loop")
-                offenders = []
-                for eid, e in loop_ids:
-                    if not pg._edges[eid]["active"]:
-                        continue
-                    i, j = int(e["i"]), int(e["j"])
-                    lo, hi = min(i, j), max(i, j)
-                    L = float(np.linalg.norm(np.diff(centres[lo:hi + 1], axis=0), axis=1).sum())
-                    delta = max(float(budget_cfg["drift_floor_m"]),
-                                float(budget_cfg["drift_rate_m_per_m"]) * L)
-                    # what the edge DEMANDS: the correction it obtained at its
-                    # endpoints plus what it still asks for (its residual —
-                    # Huber lets a liar keep asking without being obeyed)
-                    need = max(float(np.linalg.norm(Xc[i][:3, 3])), float(np.linalg.norm(Xc[j][:3, 3])),
-                               float(edge_res.get(eid, {}).get("t_m", 0.0)))
-                    if need > delta:
-                        offenders.append((need - delta, eid, e, need, delta))
-                if not offenders:
-                    break
-                offenders.sort(reverse=True)
-                _, eid, e, need, delta = offenders[0]
-                pg.deactivate(eid)
-                vetoed.append({"bridge": e["bridge"], "i": e["i"], "j": e["j"],
-                               "correction_m": need, "budget_m": delta,
-                               "reason": "loop edge demands a correction beyond the drift "
-                                         "budget — not drift, a false loop (§4.7)"})
-                print(f"[pose-graph] VETO loop edge {e['i']}<->{e['j']} (bridge {e['bridge']}): "
-                      f"{need * 100:.0f} cm demanded > budget {delta * 100:.0f} cm — re-solving")
+            pg.solve(log=print)
             Xc = pg.corrections()
-            after_loop_res = pg.edge_residuals("loop")
+            edge_res = pg.edge_residuals("loop")
+            over_budget = []
+            for eid, e in loop_ids:
+                i, j = int(e["i"]), int(e["j"])
+                lo, hi = min(i, j), max(i, j)
+                L = float(np.linalg.norm(np.diff(centres[lo:hi + 1], axis=0), axis=1).sum())
+                delta = max(float(budget_cfg["drift_floor_m"]),
+                            float(budget_cfg["drift_rate_m_per_m"]) * L)
+                # what the edge DEMANDS: the correction it obtained at its
+                # endpoints plus what it still asks for (its residual)
+                need = max(float(np.linalg.norm(Xc[i][:3, 3])), float(np.linalg.norm(Xc[j][:3, 3])),
+                           float(edge_res.get(eid, {}).get("t_m", 0.0)))
+                if need > delta:
+                    over_budget.append({"bridge": e["bridge"], "i": i, "j": j, "correction_m": need,
+                                        "budget_m": delta, "walk_m": L,
+                                        "reason": "closure beyond the drift budget (§4.7) — declared"})
+                    print(f"[pose-graph] loop edge {i}<->{j} (bridge {e['bridge']}): {need * 100:.0f} cm "
+                          f"> drift budget {delta * 100:.0f} cm (walk {L:.1f} m) — declared")
+            after_loop_res = edge_res
             loop_after = float(np.sum([r["t_m"] for r in after_loop_res.values()])) if after_loop_res else 0.0
-            # 5) gates
+            # 4) gates — measured; advisory or veto per Model.graph.gate_mode
             def _held_median(Xm):
                 vals = []
                 for f_, g_, p, q in held:
@@ -2796,7 +2704,6 @@ class VGGT_Long:
             n_active = sum(1 for eid, _ in loop_ids if pg._edges[eid]["active"])
             ok_gain = (gain >= min_gain) if n_active > 0 else False
             ok_held = (not np.isfinite(held_before)) or (held_after <= held_before + max_deg)
-            verdict = "APPLY" if (ok_gain and ok_held) else "IDENTITY"
             # §4.7 authority: fraction used vs the declared maximum
             t_mag = np.linalg.norm(Xc[:, :3, 3], axis=1)
             r_mag = np.array([np.degrees(np.linalg.norm(se3_log(M)[:3])) for M in Xc])
@@ -2805,11 +2712,27 @@ class VGGT_Long:
             frac = max(float(t_mag.max()) / a_max_m if a_max_m > 0 else 0.0,
                        float(r_mag.max()) / a_max_deg if a_max_deg > 0 else 0.0)
             saturated = frac > float(cfg_req(acfg, "saturation_warn", "authority"))
+            gate_warnings = []
+            if not ok_gain:
+                gate_warnings.append(f"loop gain {gain * 100:.0f}% < {min_gain * 100:.0f}%")
+            if not ok_held:
+                gate_warnings.append(f"held-out {held_before * 100:.2f}→{held_after * 100:.2f} cm "
+                                     f"(> +{max_deg * 100:.1f} cm)")
             if frac > 1.0:
-                verdict = "IDENTITY"
+                gate_warnings.append(f"authority {frac * 100:.0f}% (max {a_max_m} m / {a_max_deg}°)")
+            for ob in over_budget:
+                gate_warnings.append(f"loop {ob['i']}<->{ob['j']} closure {ob['correction_m'] * 100:.0f} cm "
+                                     f"> drift budget {ob['budget_m'] * 100:.0f} cm")
+            if gate_mode == "veto":
+                verdict = "APPLY" if (n_active > 0 and not gate_warnings) else "IDENTITY"
+            else:
+                verdict = "APPLY" if n_active > 0 else "IDENTITY"
+            for w in gate_warnings:
+                print(f"[pose-graph] ⚠ gate: {w} — "
+                      f"{'declared, closure applied' if gate_mode == 'advisory' else 'veto'}")
             xi = np.array([se3_log(M) for M in Xc])
             report = {"chunk_indices": [list(ci) for ci in self.chunk_indices],
-                      "verdict": verdict,
+                      "verdict": verdict, "gate_mode": gate_mode, "gate_warnings": gate_warnings,
                       "gates": {"loop_gain": {"value": gain, "min": min_gain, "passed": ok_gain,
                                               "loop_residual_before_m": loop_before,
                                               "loop_residual_after_m": loop_after},
@@ -2823,7 +2746,7 @@ class VGGT_Long:
                                     "fraction_used": frac, "saturated": bool(saturated),
                                     "exceeded": bool(frac > 1.0)},
                       "n_loop_edges": len(loop_ids), "n_loop_edges_active": n_active,
-                      "vetoed": vetoed, "gravity_down": g_down.tolist(),
+                      "over_budget": over_budget,
                       "solver": {k: v for k, v in pg.report.items() if k != "per_edge"},
                       "loop_edges_after": {str(k): v for k, v in after_loop_res.items()},
                       "xi": xi.tolist() if verdict == "APPLY" else None}
@@ -2833,7 +2756,7 @@ class VGGT_Long:
                   f"(gain {gain * 100:.0f}%, min {min_gain * 100:.0f}%) | held-out pairs "
                   f"{held_before * 100:.2f} → {held_after * 100:.2f} cm | authority "
                   f"{frac * 100:.0f}% of {a_max_m * 100:.0f} cm / {a_max_deg:.1f}° "
-                  f"{'SATURATED ' if saturated else ''}→ {verdict}")
+                  f"{'SATURATED ' if saturated else ''}→ {verdict} ({gate_mode})")
             X = Xc if verdict == "APPLY" else np.tile(np.eye(4), (N, 1, 1))
             self._stac_authority_record("pose_graph", frac, saturated)
         if not np.any([not np.allclose(M, np.eye(4), atol=1e-12) for M in X]):

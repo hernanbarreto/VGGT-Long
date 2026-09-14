@@ -502,56 +502,6 @@ def rigid_mat(R, t):
     return M
 
 
-def hybrid_substitute(wp_frame, conf_frame, depth_frame, c2w, da3_depth,
-                      ratio, far_m=None, max_shape_delta=0.35):
-    """HYBRID WRITE (best of both worlds): adopt DA3's per-pixel depth SHAPE for
-    one frame while keeping omega's SCALE and POSE.
-
-    Omega's feed-forward output serpentines straight surfaces (per-frame depth/
-    pose noise, no BA); isolated DA3 depth is locally straight but its absolute
-    per-frame metric scale jitters. So: ``ratio`` = median(da3/omega) of this
-    frame (anchor_ratio) — dividing DA3 by it pins the frame's median depth to
-    omega's, leaving ONLY the relative shape correction. Every surviving point
-    moves along its own camera ray:
-
-        z_new = da3 / ratio
-        P'    = C + (P - C) * (z_new / z_omega)
-
-    Pixels keep omega when: invalid in either map, omega says the surface is
-    beyond ``far_m`` (isolated DA3 degrades at range), or the shape correction
-    exceeds ``max_shape_delta`` relative (occlusion mismatch / moving object /
-    DA3 gross error — an unearned correction is a warp, not a fix).
-
-    Returns (wp_new, depth_new, n_substituted, median_abs_shape_delta)."""
-    wp = np.asarray(wp_frame, np.float64)
-    H, W = wp.shape[:2]
-    zo = np.asarray(depth_frame, np.float32).reshape(H, W)
-    da = np.asarray(da3_depth, np.float32).squeeze()
-    if da.shape != (H, W):
-        da = cv2.resize(da, (W, H), interpolation=cv2.INTER_LINEAR)
-    cf = np.asarray(conf_frame, np.float32).reshape(H, W)
-    zn = da / float(ratio)
-    with np.errstate(divide='ignore', invalid='ignore'):
-        factor = zn / zo
-    ok = (np.isfinite(factor) & (zo > 1e-6) & (zn > 1e-6) & (cf > 1e-5)
-          & (np.abs(factor - 1.0) <= float(max_shape_delta)))
-    if far_m:
-        ok &= zo <= float(far_m)
-    if not ok.any():
-        return np.asarray(wp_frame), np.asarray(depth_frame), 0, 0.0
-    C = np.asarray(c2w, np.float64)[:3, 3]
-    wp_new = wp.copy()
-    f3 = factor[..., None]
-    wp_new[ok] = C + (wp[ok] - C) * f3[ok]
-    z_out = zo.copy()
-    z_out[ok] = zn[ok]
-    med = float(np.median(np.abs(factor[ok] - 1.0)))
-    return (wp_new.astype(np.asarray(wp_frame).dtype),
-            z_out.reshape(np.asarray(depth_frame).shape).astype(
-                np.asarray(depth_frame).dtype),
-            int(ok.sum()), med)
-
-
 def backfill_mask(conf_owner, thr_owner):
     """OWNERSHIP BACKFILL: pixels of a shared frame that the OWNER chunk will NOT
     write — below its frozen write threshold, or invalid (sky/masked). The
@@ -559,7 +509,7 @@ def backfill_mask(conf_owner, thr_owner):
     frame ownership discarded pays for HOLES instead of re-creating duplicates
     (a pixel is never written twice: owner-writes and backfill are complements
     by construction). ``thr_owner=None`` means the owner writes nothing at all
-    (sick chunk) — everything may be backfilled."""
+    (it owns no frame rows) — everything may be backfilled."""
     c = np.asarray(conf_owner, np.float32).reshape(-1)
     if thr_owner is None:
         return np.ones(c.shape, bool)
@@ -615,7 +565,7 @@ def smooth_seam_fits(seam_fits, window=5, max_t=None):
     return out, n_capped
 
 
-def elastic_corrections(chunk_indices, k, seam_fits, sick=None, suspect=None):
+def elastic_corrections(chunk_indices, k, seam_fits, suspect=None):
     """Per-frame ELASTIC seam corrections for chunk k: [S, 4, 4] world-space rigid
     moves, one per local frame (identity where nothing constrains the frame).
 
@@ -647,11 +597,6 @@ def elastic_corrections(chunk_indices, k, seam_fits, sick=None, suspect=None):
     seam (the seam is already rigid-glued, so per-frame residuals are small and
     smooth); a seam with no fits at all contributes identity.
 
-    `sick`: chunk indices flagged by the health gate (flag_sick_chunks). A healthy
-    chunk must NEVER bend toward a sick neighbour's garbage, so on a mixed seam
-    alpha is pinned to keep the consensus entirely at the healthy side's copy (the
-    sick side adopts it fully — harmless, its frames don't write points anyway).
-
     `suspect`: the SOFT tier (flag_suspect_chunks). On a seam where exactly one
     side is suspect the consensus is BIASED toward the trusted side (alpha warped
     quadratically) instead of pinned — endpoints stay exact (1→0), so interiors
@@ -661,8 +606,7 @@ def elastic_corrections(chunk_indices, k, seam_fits, sick=None, suspect=None):
     start, end = chunk_indices[k]
     S = end - start
     corr = np.tile(np.eye(4), (S, 1, 1))
-    sick = frozenset(sick or ())
-    suspect = frozenset(suspect or ()) - sick
+    suspect = frozenset(suspect or ())
 
     def _fit_for(j, g, shared):
         d = seam_fits.get(j) or {}
@@ -675,8 +619,6 @@ def elastic_corrections(chunk_indices, k, seam_fits, sick=None, suspect=None):
 
     def _alpha(j, i, L):
         # weight of chunk j's (dst-side) opinion; pinned on mixed-health seams
-        if (j in sick) != (j + 1 in sick):
-            return 0.0 if j in sick else 1.0
         a = 1.0 - (i / (L - 1.0)) if L > 1 else 0.5
         # soft tier: bias toward the trusted side, endpoints kept exact
         if (j in suspect) != (j + 1 in suspect):
@@ -776,8 +718,7 @@ def pair_depth_relation(z_src, z_dst, iters=6):
     return float(a), float(b), before, int(len(zs))
 
 
-def solve_depth_graph(measurements, n_frames, sick_frames=(), scale_only=False, weights=None,
-                      weights_b=None):
+def solve_depth_graph(measurements, n_frames, scale_only=False, weights=None, weights_b=None):
     """Per-frame depth corrections z' = a_f*z + b_f from pairwise affine relations,
     the frame-level analogue of solve_scale_graph. For a pair (f, g) with measured
     z_g = alpha*z_f + beta, corrected consistency (a_f z + b_f == a_g(alpha z +
@@ -788,8 +729,7 @@ def solve_depth_graph(measurements, n_frames, sick_frames=(), scale_only=False, 
 
     The gauges preserve the session's global metre (set by the metric lock +
     scale_align) — the graph only REDISTRIBUTES depth so every frame agrees on
-    every shared surface. Sick frames get identity (a=1, b=0) and their
-    measurements must not be fed in. Returns (a[n], b[n]).
+    every shared surface. Returns (a[n], b[n]).
 
     ``scale_only``: skip the offset system entirely (b stays 0) — the fallback
     rung of the model ladder. After the metric lock + scale drift the residual
@@ -807,8 +747,7 @@ def solve_depth_graph(measurements, n_frames, sick_frames=(), scale_only=False, 
     the scale system's are log units — one 1/σ does not fit both); defaults
     to ``weights``."""
     idx = [q for q, (f, g, al, be) in enumerate(measurements)
-           if f not in sick_frames and g not in sick_frames
-           and np.isfinite(al) and al > 0 and np.isfinite(be)]
+           if np.isfinite(al) and al > 0 and np.isfinite(be)]
     meas = [tuple(measurements[q])[:4] for q in idx]
     wts = (np.ones(len(meas)) if weights is None
            else np.asarray([float(weights[q]) for q in idx], np.float64))

@@ -1,5 +1,6 @@
 import torch
 import argparse
+import numpy as np
 from PIL import Image
 import torchvision.transforms as T
 from tqdm import tqdm
@@ -35,6 +36,11 @@ class LoopDetector:
         self.top_k = self.config['Loop']['SALAD']['top_k']
         self.use_nms = self.config['Loop']['SALAD']['use_nms']
         self.nms_threshold = self.config['Loop']['SALAD']['nms_threshold']
+        # STAC patch: the temporal gap below which a retrieved pair is odometry,
+        # not a revisit — a config key (Loop.SALAD.min_gap, in indices of the
+        # detector's image list, i.e. KEYFRAMES when the list is pinned to the
+        # chunks). The vendor hard-coded `> 10` for per-video-frame lists.
+        self.min_gap = int(self.config['Loop']['SALAD']['min_gap'])
         self.output = output
         
         self.model = None
@@ -175,32 +181,44 @@ class LoopDetector:
         return [(max(a, b), min(a, b), score) for a, b, score in tuples_list]
     
     def find_loop_closures(self):
-        """Find loop closures"""
+        """Find loop closures.
+
+        STAC patch: the top-k neighbours are taken AMONG THE NON-LOCAL frames
+        (|i - j| >= min_gap). The vendor searched the k nearest over ALL frames
+        and only then dropped the local ones — on a keyframe list every slot
+        of the top-5 is an adjacent keyframe (cosine ~0.9), so a revisit at
+        0.7 never entered the list and the detector proposed nothing (pccr
+        2026-09-13: 0 pairs with the threshold at 0.65 while the full
+        similarity matrix held 62 non-local pairs above it). The list is a
+        few hundred to a few thousand keyframes: the full cosine matrix is
+        cheap and exact, no ANN index needed."""
         if self.descriptors is None:
             self.extract_descriptors()
-            
-        import faiss
-        
-        embed_size = self.descriptors.shape[1]
-        faiss_index = faiss.IndexFlatIP(embed_size)
-        
-        normalized_descriptors = self.descriptors.numpy()
-        faiss_index.add(normalized_descriptors)
-        
-        similarities, indices = faiss_index.search(normalized_descriptors, self.top_k + 1)  # +1 because self is most similar
-        
-        loop_closures = []
-        for i in range(len(self.descriptors)):
-            # Skip first result (self)
-            for j in range(1, self.top_k + 1):
-                neighbor_idx = indices[i, j]
-                similarity = similarities[i, j]
 
-                if similarity > self.similarity_threshold and abs(i - neighbor_idx) > 10:
-                    if i < neighbor_idx:
-                        loop_closures.append((i, neighbor_idx, similarity))
-                    else:
-                        loop_closures.append((neighbor_idx, i, similarity))
+        D = self.descriptors.float()
+        D = D / D.norm(dim=1, keepdim=True).clamp_min(1e-12)
+        sims = (D @ D.T).numpy()
+        n = sims.shape[0]
+        idx = np.arange(n)
+        local = np.abs(idx[:, None] - idx[None, :]) < self.min_gap      # self + odometry band
+        sims_nonlocal = np.where(local, -np.inf, sims)
+
+        loop_closures = []
+        k = min(self.top_k, n)
+        for i in range(n):
+            row = sims_nonlocal[i]
+            if k <= 0 or not np.isfinite(row).any():
+                continue
+            order = np.argsort(-row)[:k]
+            for neighbor_idx in order:
+                similarity = float(row[neighbor_idx])
+                if not np.isfinite(similarity) or similarity <= self.similarity_threshold:
+                    continue
+                neighbor_idx = int(neighbor_idx)
+                if i < neighbor_idx:
+                    loop_closures.append((i, neighbor_idx, similarity))
+                else:
+                    loop_closures.append((neighbor_idx, i, similarity))
 
         loop_closures = list(set(loop_closures))
         loop_closures.sort(key=lambda x: x[2], reverse=True)

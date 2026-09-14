@@ -4,10 +4,10 @@
 #   update     LEFT perturbation in the algebra: T_i ← Exp(δ_i)·T_i, δ_i ∈ ℝ⁶ (ω, ν)
 #   edges      relative (odometry / loop): measurement Z_ij, residual
 #              r_ij = Log(Z_ij⁻¹ · T_i⁻¹ · T_j) ∈ ℝ⁶, weighted by Σ_ij⁻¹ (σ_rot, σ_t)
-#              unary structural priors: gravity (camera down vs world down),
+#              unary structural priors:
 #              plane datum (a local plane must land on a FIXED target plane),
 #              axis vertical (a local axis must be vertical);
-#              PLANE NODES: a plane (wall, floor datum) can be a node itself — a
+#              PLANE NODES: a plane (a wall) can be a node itself — a
 #              frame whose z axis is the normal — and every keyframe patch of
 #              it is a binary edge pose→plane, so the plane is solved JOINTLY
 #              with the poses (an alternation has a continuum of fixed points)
@@ -38,7 +38,6 @@ from loop_utils.lie import (t_se3_exp, t_se3_log, t_se3_inv, se3_log, se3_exp,
                             se3_inv)
 
 _REL = 0      # relative SE(3) edge (odometry / loop)
-_GRAV = 1     # gravity prior (unary)
 _PLANE = 2    # plane datum (unary, fixed target plane)
 _AXIS = 3     # axis vertical (unary)
 _PLANE_NODE = 4   # pose i's local plane must lie on the plane carried by NODE j (binary)
@@ -59,11 +58,6 @@ def _res_rel(di, dj, Ti, Tj, Zinv):
     Ti2 = t_se3_exp(di) @ Ti
     Tj2 = t_se3_exp(dj) @ Tj
     return t_se3_log(Zinv.reshape(4, 4) @ t_se3_inv(Ti2) @ Tj2)
-
-
-def _res_grav(di, dj, Ti, Tj, down):
-    R = (t_se3_exp(di) @ Ti)[:3, :3]
-    return R[:, 1] - down                  # OpenCV camera +Y is "down"
 
 
 def _res_plane(di, dj, Ti, Tj, params):
@@ -97,12 +91,12 @@ def _res_plane_node(di, dj, Ti, Tj, params):
     return torch.cat([n_w - n_p, (d_w - d_p).reshape(1)])
 
 
-_KERNELS = {_REL: _res_rel, _GRAV: _res_grav, _PLANE: _res_plane, _AXIS: _res_axis,
+_KERNELS = {_REL: _res_rel, _PLANE: _res_plane, _AXIS: _res_axis,
             _PLANE_NODE: _res_plane_node}
-_RES_DIM = {_REL: 6, _GRAV: 3, _PLANE: 4, _AXIS: 3, _PLANE_NODE: 4}
+_RES_DIM = {_REL: 6, _PLANE: 4, _AXIS: 3, _PLANE_NODE: 4}
 # residual layout per kind: (n angular components, n metric components) — the
 # Huber δ of an angular component is huber_delta_deg, of a metric one huber_delta_m
-_HUBER_LAYOUT = {_REL: (3, 3), _GRAV: (3, 0), _PLANE: (3, 1), _AXIS: (3, 0), _PLANE_NODE: (3, 1)}
+_HUBER_LAYOUT = {_REL: (3, 3), _PLANE: (3, 1), _AXIS: (3, 0), _PLANE_NODE: (3, 1)}
 
 
 class PoseGraph:
@@ -161,12 +155,6 @@ class PoseGraph:
             # the diagonal reference of a general L: the per-axis σ it implies
             w = np.sqrt(np.clip(np.diag(W @ W.T), 1e-18, None))
         return self._add(_REL, i, j, Zinv, w, huber, tag, huber_delta_m, huber_delta_deg, W)
-
-    def add_gravity(self, i, down_world, sigma_deg, tag="gravity"):
-        d = np.asarray(down_world, np.float64)
-        d = d / (np.linalg.norm(d) + 1e-12)
-        w = np.full(3, 1.0 / max(math.sin(math.radians(float(sigma_deg))), 1e-9))
-        return self._add(_GRAV, i, i, d, w, False, tag)
 
     def add_plane_datum(self, i, n_local, d_local, n_target, d_target,
                         sigma_angle_deg, sigma_offset_m, huber=True, tag="plane",

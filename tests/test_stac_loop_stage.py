@@ -6,8 +6,6 @@ exact seams → SE(3) edges → verification → loop_enable_opt. Also checks th
 the pre-F1 skip ("all seams exact → optimizer SKIPPED") no longer exists."""
 
 import json
-import os
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -44,7 +42,7 @@ def _make_runner(tmp_path, sess, chunks, ci, loops_over=None, scale_over=None):
                                               "sample_ratio": 1.0},
                           "metric_lock": {"enable": True, "anchor_dir": str(anchor_dir),
                                           "near_frac": 0.25, "scale_drift": False,
-                                          "zoom_scale_fix": True, "health_gate": False,
+                                          "zoom_scale_fix": True,
                                           "sigma_seam": 0.003, "sigma_anchor": 0.08},
                           "loops": fork_loops_cfg(stac_server_dir=str(_SERVER),
                                                   **(loops_over or {})),
@@ -182,3 +180,30 @@ def test_exact_seam_skip_is_gone():
     src = (_FORK / "vggt_long.py").read_text()
     assert "loop optimizer SKIPPED" not in src
     assert "self.loop_enable_opt = False\n        else:\n            self.loop_enable_opt = self.loop_enable" not in src
+
+
+def test_scale_close_is_identity_without_loop_rows(tmp_path, synth):
+    """pccr 2026-09-13 regression: the metric lock's drift stage leaves
+    ``_stac_scales_applied`` at the ramp's geometric mean, which differs from
+    the constant anchors+seams solution; the scale close divided the constant
+    solution by it and re-scaled every chunk with ZERO loop rows (chunk 0
+    ×0.83 → the 0->1 seam went 9 → 14 cm). The residual factor is
+    s_v2 / s_ref (the same graph without the loop rows): with no loop and no
+    absolute row every δ is exactly 1 whatever s_v1 holds."""
+    sess, chunks, ci, errors = synth
+    r, save_dir = _make_runner(tmp_path, sess, chunks, ci)
+    r._stac_metric_lock()
+    # simulate the drift stage's bookkeeping: applied scales off the constant solve
+    r._stac_scales_applied = {k: v * (1.0 + 0.1 * (k + 1)) for k, v in r._stac_scales_applied.items()}
+    before = {k: np.load(save_dir / "_tmp_results_unaligned" / f"chunk_{k}.npy",
+                         allow_pickle=True).item()["world_points"].copy() for k in range(len(ci))}
+    r._stac_scale_close([])                       # no bridge measured → no loop row
+    sg = json.loads((save_dir / "scale_graph.json").read_text())
+    assert sg["loop_rows"] == [] and sg["absolute_rows"] == []
+    assert all(abs(v - 1.0) < 1e-12 for v in sg["delta_applied"].values()), sg["delta_applied"]
+    for k in range(len(ci)):
+        d = np.load(save_dir / "_tmp_results_unaligned" / f"chunk_{k}.npy", allow_pickle=True).item()
+        assert d["_stac_loop_scale_applied"] == 1.0
+        assert np.array_equal(d["world_points"], before[k]), f"chunk {k} geometry moved with no loop row"
+    # s_ref (no loops) is recorded and equals s_v2 here
+    assert all(abs(sg["s_ref_no_loops"][k] - sg["s_v2_with_loops"][k]) < 1e-12 for k in sg["s_ref_no_loops"])
