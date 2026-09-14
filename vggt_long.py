@@ -1379,6 +1379,7 @@ class VGGT_Long:
                                          "max_b_m": float(_acfg["depth_graph_max_b_m"]),
                                          "used_max_log_a": float(np.max(np.abs(np.log(np.asarray(a))))),
                                          "used_max_b_m": float(np.max(np.abs(np.asarray(b))))})
+        n_moved_total = 0
         for k, (start, end) in enumerate(self.chunk_indices):
             path = os.path.join(self.result_aligned_dir, f"chunk_{k}.npy")
             data = np.load(path, allow_pickle=True).item()
@@ -1404,8 +1405,19 @@ class VGGT_Long:
             data['_stac_depth_graph_applied'] = True
             np.save(path, data)
             print(f"[depth-graph] chunk {k}: {moved}/{end - start} frames re-depthed")
-        print(f"[depth-graph] ✅ every frame now agrees with its neighbours on the "
-              f"depth of shared surfaces (per-frame z' = a*z + b along rays)")
+            n_moved_total += moved
+        # Says what happened, not what was hoped for. This used to announce
+        # success unconditionally — printed right under the ⛔ of a ladder that
+        # had just declined to touch anything, and under "0/59 frames
+        # re-depthed" on every chunk. A stage that corrected nothing has to say
+        # so, or the log asserts the opposite of the artifact.
+        if n_moved_total:
+            print(f"[depth-graph] ✅ {n_moved_total} frame(s) re-depthed — they now agree "
+                  f"with their neighbours on the depth of shared surfaces "
+                  f"(per-frame z' = a*z + b along rays)")
+        else:
+            print(f"[depth-graph] no frame needed re-depthing — the correction was "
+                  f"identity everywhere, geometry untouched")
 
     def _stac_blend_copies(self):
         """STAC patch: TWO-COPY CONSENSUS — every overlap frame is predicted by
