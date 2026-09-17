@@ -166,6 +166,52 @@ def bridge_layout(item, chunk_indices, n_extra_a: int = 0, n_extra_b: int = 0) -
     }
 
 
+def _apply(fit, src):
+    """s·R·src + t for a (s, R, t) fit."""
+    s_, R_, t_ = fit
+    return float(s_) * (np.asarray(src, np.float64) @ np.asarray(R_).T) + np.asarray(t_)
+
+
+def split_half_residual(p, q, rigid: bool, sample: int, min_pts: int,
+                        seed: int = 0) -> Optional[dict]:
+    """Fit on half the correspondences, MEASURE on the other half.
+
+    This is what tells a real association from a lucky one, and it replaces
+    judging a fit by the SIZE of its residual (USER 2026-09-16: *"podría haber
+    una corrección de más de 30 cm y ser perfectamente correcta"*). A fit that
+    describes the geometry predicts correspondences it never saw just as well:
+    held-out ≈ fit. One that latched onto the wrong structure does not.
+
+    Returns {fit_residual_m, holdout_residual_m, ratio, n_fit, n_held} or None
+    when either half starves (the caller keeps the full-sample verdict then).
+    """
+    p = np.asarray(p, np.float64)
+    q = np.asarray(q, np.float64)
+    n = len(p)
+    if n < 2 * int(min_pts):
+        return None
+    idx = np.random.default_rng(int(seed) + 9176).permutation(n)
+    a, b = idx[: n // 2], idx[n // 2:]
+    if rigid:
+        f = robust_rigid(p[a], q[a], sample=sample, seed=seed)
+        fit = None if f is None else (1.0, f[0], f[1])
+        res_fit = None if f is None else float(f[2])
+    else:
+        f = robust_sim3(p[a], q[a], sample=sample, seed=seed, min_points=min_pts)
+        fit = None if f is None else (f[0], f[1], f[2])
+        res_fit = None if f is None else float(f[3])
+    if fit is None:
+        return None
+    held = np.linalg.norm(q[b] - _apply(fit, p[b]), axis=1)
+    held = held[np.isfinite(held)]
+    if not len(held):
+        return None
+    res_held = float(np.median(held))
+    return {"fit_residual_m": res_fit, "holdout_residual_m": res_held,
+            "ratio": float(res_held / max(res_fit, 1e-9)),
+            "n_fit": int(len(a)), "n_held": int(len(held))}
+
+
 # ── the measurement ─────────────────────────────────────────────────────
 
 def measure_bridge(bridge, layout: dict, chunk_a, chunk_b, loops_cfg: dict,
@@ -205,16 +251,27 @@ def measure_bridge(bridge, layout: dict, chunk_a, chunk_b, loops_cfg: dict,
         else:
             rec["R"] = np.asarray(fit[1]).tolist()
             rec["t"] = np.asarray(fit[2]).tolist()
+            # does the fit describe the geometry, or only the points it saw?
+            sh = split_half_residual(p, q, rigid, sample, min_pts, seed=seed)
+            if sh is not None:
+                rec["split_half"] = sh
         fits[side] = fit
         out["sides"][side] = rec
     if fits["a"] is not None and fits["b"] is not None:
         s_ab, R_ab, t_ab = compose_ab(fits["a"], fits["b"])
+        sh_a = out["sides"]["a"].get("split_half")
+        sh_b = out["sides"]["b"].get("split_half")
         out.update({"ok": True, "s_ab": float(s_ab), "R_ab": R_ab.tolist(),
                     "t_ab": t_ab.tolist(),
                     "residual_m": float(max(out["sides"]["a"]["residual_m"],
                                             out["sides"]["b"]["residual_m"])),
                     "n_corr": int(min(out["sides"]["a"]["n_corr"],
                                       out["sides"]["b"]["n_corr"]))})
+        if sh_a is not None and sh_b is not None:
+            # the worse side decides: an edge is as good as its weaker half
+            out["holdout_residual_m"] = float(max(sh_a["holdout_residual_m"],
+                                                  sh_b["holdout_residual_m"]))
+            out["holdout_ratio"] = float(max(sh_a["ratio"], sh_b["ratio"]))
     else:
         out["ok"] = False
     return out
@@ -231,19 +288,37 @@ def loop_scale_row(s_ab: float) -> float:
 # ── verification (§4.2, steps 1–4; step 0 is the spatial gate, upstream) ──
 
 def verify_loop(meas: dict, loops_cfg: dict, semantic: Optional[dict] = None,
-                spatial: Optional[dict] = None) -> dict:
-    """Verdict for one measured bridge. Returns a dict with
-    status ∈ {accepted, scale_break, rejected}, sigma_m (pose-edge σ), reasons.
+                spatial: Optional[dict] = None,
+                reference_m: Optional[float] = None) -> dict:
+    """Verdict for one measured bridge: σ is MEASURED, magnitude never vetoes.
 
-    1. geometric: residual ≤ max_residual_m and ≥ min_correspondences;
-    2. scale: |log s_ab| ≤ scale_tol_log → row + edge; beyond → scale_break
-       (edge kept with σ × scale_break_sigma_factor, seams between the two
-       chunks flagged suspect);
-    3. semantic: when BOTH frames carry SAM3 instances, ≥ min_shared_structural_labels
+    USER 2026-09-16, after pccr closed nothing: *"no debes rechazar correcciones
+    por umbrales arbitrarios"*. The old rule dropped any bridge whose residual
+    exceeded `max_residual_m` (0.10), so the only two edges that could close a
+    44 m walk vanished at 17 cm and the pose graph fell back to IDENTITY. A big
+    residual is not evidence of a wrong measurement — it is a measurement with
+    a wide error bar, and a pose graph already knows what to do with that.
+
+    What decides now, all of it measured:
+    1. the fit must EXIST (≥ min_correspondences on both sides) — starvation is
+       the only geometric rejection left;
+    2. σ = the SPLIT-HALF held-out residual: fit on half the correspondences,
+       measure on the other half. A fit that describes the geometry predicts
+       what it never saw (held-out ≈ fit); one that latched onto the wrong
+       structure does not, and pays for it in σ — automatically, with no
+       threshold to invent;
+    3. the residual is compared against what THIS session achieves where the
+       geometry is known to be the same (`reference_m`, the median exact-seam
+       residual of its own chain; `max_residual_m` is only the fallback when
+       the caller has nothing measured yet). Worse than the session's own
+       overlaps → σ is inflated by the measured ratio and the edge is declared
+       `weak_evidence` in the report. It still enters the graph, weighted.
+    4. scale: |log s_ab| ≤ scale_tol_log → row + edge; beyond → scale_break;
+    5. semantic: when BOTH frames carry SAM3 instances, ≥ min_shared_structural_labels
        structural labels in common (movable labels neither help nor hurt).
     A spatial verdict 'ambiguous' inflates σ by ambiguous_sigma_factor; 'reject'
     never reaches this function (no bridge is spent on it)."""
-    max_res = float(cfg_req(loops_cfg, "max_residual_m", "loops"))
+    fallback_ref = float(cfg_req(loops_cfg, "max_residual_m", "loops"))
     min_corr = int(cfg_req(loops_cfg, "min_correspondences", "loops"))
     tol_log = float(cfg_req(loops_cfg, "scale_tol_log", "loops"))
     sb_factor = float(cfg_req(loops_cfg, "scale_break_sigma_factor", "loops"))
@@ -256,13 +331,22 @@ def verify_loop(meas: dict, loops_cfg: dict, semantic: Optional[dict] = None,
         v["reasons"].append("exact fit starved on at least one side")
         v["checks"]["geometric"] = False
         return v
-    geo_ok = (meas["residual_m"] <= max_res) and (meas["n_corr"] >= min_corr)
-    v["checks"]["geometric"] = {"residual_m": meas["residual_m"], "max_residual_m": max_res,
+    # 1. starvation is the only geometric rejection: a fit that does not exist
+    ref = float(reference_m) if (reference_m is not None
+                                 and np.isfinite(reference_m)
+                                 and reference_m > 0) else fallback_ref
+    enough = meas["n_corr"] >= min_corr
+    v["checks"]["geometric"] = {"residual_m": meas["residual_m"],
+                                "reference_m": ref,
+                                "reference_source": ("session_seams"
+                                                     if reference_m else "config_fallback"),
+                                "holdout_residual_m": meas.get("holdout_residual_m"),
+                                "holdout_ratio": meas.get("holdout_ratio"),
                                 "n_corr": meas["n_corr"], "min_correspondences": min_corr,
-                                "passed": bool(geo_ok)}
-    if not geo_ok:
-        v["reasons"].append(f"geometric: residual {meas['residual_m']*100:.1f} cm / "
-                            f"{meas['n_corr']} corr (limits {max_res*100:.1f} cm, {min_corr})")
+                                "passed": bool(enough)}
+    if not enough:
+        v["reasons"].append(f"starved: {meas['n_corr']} exact correspondence(s) < "
+                            f"{min_corr} — no fit to trust or distrust")
         return v
     log_s = float(np.log(meas["s_ab"]))
     scale_ok = abs(log_s) <= tol_log
@@ -279,7 +363,21 @@ def verify_loop(meas: dict, loops_cfg: dict, semantic: Optional[dict] = None,
             return v
     else:
         v["checks"]["semantic"] = {"passed": None, "note": "no instances on both frames"}
-    sigma = float(meas["residual_m"])
+    # 2. σ IS the held-out error — what the fit failed to predict, in metres.
+    #    No extra widening: the error bar already says how much to believe it,
+    #    and inflating it again for being large would count the same fact twice.
+    sigma = float(meas.get("holdout_residual_m") or meas["residual_m"])
+    # 3. …and it is DECLARED against what this session achieves where the
+    #    geometry is known to be the same. A ratio, not a verdict.
+    worse = sigma / max(ref, 1e-9)
+    v["checks"]["evidence"] = {"sigma_m": sigma, "reference_m": ref,
+                               "ratio_vs_session": float(worse)}
+    if worse > 1.0:
+        v["evidence"] = "weak"
+        v["reasons"].append(
+            f"weak evidence: held-out {sigma * 100:.1f} cm vs this session's own "
+            f"overlap agreement {ref * 100:.1f} cm (×{worse:.1f}) — edge kept, "
+            f"the graph weighs it by σ")
     if spatial is not None and spatial.get("verdict") == "ambiguous":
         sigma *= amb_factor
         v["checks"]["spatial"] = {"verdict": "ambiguous", "sigma_factor": amb_factor}

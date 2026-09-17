@@ -516,6 +516,100 @@ def backfill_mask(conf_owner, thr_owner):
     return ~((c >= max(float(thr_owner), 0.0)) & (c > 1e-5))
 
 
+def demote_disproportionate_fits(seam_fits, report, log=print):
+    """Scale down the fits that move the points FURTHER than the disagreement
+    they remove. No absolute ceiling — the allowance is measured per frame.
+
+    USER 2026-09-16: *"podría haber una corrección de más de 30 cm y ser
+    perfectamente correcta"*. True: what made the old `elastic_max_t_m` cap
+    necessary was never the size. It was disproportion — the pathology its own
+    comment recorded, "seam 7->8 fitted up to 1.59 m to close an 8 cm gap": a
+    degenerate pair on a flat cost surface, where the solver wanders far and
+    explains nothing. A correction of 50 cm that removes 48 cm of disagreement
+    is right, and the cap used to shrink it for no reason.
+
+    The two copies of a shared frame are the SAME frame, so a fit that puts one
+    onto the other moves the points by about how far apart they were. The
+    allowance for each frame is therefore its OWN measurement:
+
+        allowed = before_m + residual_m          (the gap, plus this seam's
+                                                  own non-rigid noise floor)
+
+    A fit whose median point motion exceeds it is scaled as a whole twist down
+    to that allowance — direction preserved, authority bounded by what the data
+    shows. Frames whose report lacks the measurement (an older
+    elastic_seams.json) are left exactly as they are.
+
+    Returns (fits, n_demoted, stats).
+    """
+    seams = (report or {}).get("seams") or {}
+    out, n_dem = {}, 0
+    worst = {"ratio": 0.0, "seam": None}
+    allowances = []
+    for j, d in seam_fits.items():
+        rep_j = seams.get(str(j)) or seams.get(j) or {}
+        sd = {}
+        for g, (R_, t_) in d.items():
+            entry = rep_j.get(str(g)) or rep_j.get(g) or {}
+            motion = entry.get("motion_m")
+            before = entry.get("before_m")
+            resid = entry.get("residual_m")
+            if motion is None or before is None or resid is None:
+                sd[g] = (R_, t_)
+                continue
+            allowed = float(before) + float(resid)
+            allowances.append(allowed)
+            motion = float(motion)
+            if allowed > 0 and motion > allowed:
+                ratio = motion / allowed
+                M = rigid_fraction(np.asarray(R_, np.float64),
+                                   np.asarray(t_, np.float64), allowed / motion)
+                sd[g] = (M[:3, :3], M[:3, 3])
+                n_dem += 1
+                if ratio > worst["ratio"]:
+                    worst = {"ratio": float(ratio), "seam": int(j)}
+            else:
+                sd[g] = (R_, t_)
+        out[j] = sd
+    stats = {"worst_ratio": worst["ratio"], "worst_seam": worst["seam"],
+             "allowance_max_m": float(max(allowances)) if allowances else None,
+             "allowance_median_m": float(np.median(allowances)) if allowances else None}
+    return out, n_dem, stats
+
+
+def compose_frame_fields(prev, new):
+    """Compose a new per-frame correction field ON TOP of whatever a previous
+    stage already put there: result[k][i] = new[k][i] @ prev[k][i].
+
+    Why this exists (bug found on pccr 2026-09-16, the first run where a loop
+    actually closed): the per-frame field `_stac_elastic_corr` is not the
+    elastic stage's private variable — it is where EVERY stage that moves
+    frames accumulates its correction, and it is what the camera poses are
+    built from (`_stac_aligned_pose`, `save_camera_poses`). The pose graph
+    composes its closure into it and moves the POINTS in the npy directly; the
+    elastic stage then rebuilt the field from scratch and the closure vanished
+    from the camera side while staying in the points.
+
+    The damage was silent and large: points and cameras drifted apart by the
+    size of the closure (29 cm median, 38 cm max on that run), so `intra_chunk`
+    — which compares one against the other — measured a disagreement that did
+    not exist (held-out 2-5 cm historically → 8-53 cm), "repaired" it with
+    corrections up to 129 cm, and the warped depth failed the global scale
+    verification by 18%. It never showed before because every previous run
+    rejected its loop edges: the closure was identity, and overwriting identity
+    loses nothing.
+    """
+    prev = prev or {}
+    out = {}
+    for k, cur in new.items():
+        cur = np.asarray(cur, np.float64)
+        before = prev.get(k)
+        out[k] = cur if before is None else (cur @ np.asarray(before, np.float64))
+    for k, before in prev.items():          # a chunk the new field does not mention
+        out.setdefault(k, np.asarray(before, np.float64))
+    return out
+
+
 def smooth_seam_fits(seam_fits, window=5, max_t=None):
     """Tame the per-frame elastic seam fits BEFORE they become corrections.
 
@@ -565,7 +659,35 @@ def smooth_seam_fits(seam_fits, window=5, max_t=None):
     return out, n_capped
 
 
-def elastic_corrections(chunk_indices, k, seam_fits, suspect=None):
+def chunk_trust(anchor_iqr):
+    """Per-chunk trust in (0, 1] from the MEASURED anchor spread — continuous,
+    with no cut-off anywhere.
+
+    USER 2026-09-16, on `[health] chunk 1 SUSPECT: IQR/median 0.311 > 0.30`:
+    a chunk does not become unreliable at 0.30 and stay perfect at 0.299. What
+    the number says is RELATIVE — this chunk's anchors agree worse than the
+    session's other chunks — so the reference is the session itself (the median
+    spread) and the result is a weight, not a label:
+
+        trust_k = 1 / (1 + spread_k / median_spread)
+
+    All chunks equally spread → every trust is 0.5 → no chunk is favoured. A
+    chunk twice as spread as its peers → 1/3 against 1/2: less say, still heard.
+    A chunk with no measurement keeps the median trust (it is not evidence).
+    """
+    vals = {int(k): float(v) for k, v in (anchor_iqr or {}).items()
+            if v is not None and np.isfinite(v) and v >= 0}
+    if not vals:
+        return {}
+    ref = float(np.median(list(vals.values()))) or 1e-6
+    trust = {k: 1.0 / (1.0 + (v / ref)) for k, v in vals.items()}
+    med_trust = float(np.median(list(trust.values())))
+    for k in (anchor_iqr or {}):
+        trust.setdefault(int(k), med_trust)
+    return trust
+
+
+def elastic_corrections(chunk_indices, k, seam_fits, suspect=None, trust=None):
     """Per-frame ELASTIC seam corrections for chunk k: [S, 4, 4] world-space rigid
     moves, one per local frame (identity where nothing constrains the frame).
 
@@ -597,11 +719,17 @@ def elastic_corrections(chunk_indices, k, seam_fits, suspect=None):
     seam (the seam is already rigid-glued, so per-frame residuals are small and
     smooth); a seam with no fits at all contributes identity.
 
-    `suspect`: the SOFT tier (flag_suspect_chunks). On a seam where exactly one
-    side is suspect the consensus is BIASED toward the trusted side (alpha warped
-    quadratically) instead of pinned — endpoints stay exact (1→0), so interiors
-    are never torn and the field stays continuous; the shaky chunk just gets
-    less say in where the shared pixels land.
+    `trust` (preferred): per-chunk weight from `chunk_trust`, measured from the
+    anchor spread. The consensus is biased CONTINUOUSLY toward the chunk whose
+    anchors agree better — alpha is warped by the exponent p = trust_b/trust_a,
+    which is exactly 1 (no warp) when the two sides are equally trustworthy and
+    grows smoothly as they diverge. Endpoints stay exact (1→0), so interiors are
+    never torn and the field stays continuous.
+
+    `suspect` (legacy): the binary SOFT tier. Used only when no `trust` is
+    given — it warped alpha quadratically the moment a chunk crossed a fixed
+    spread cut (USER 2026-09-16: a chunk is not sound at 0.299 and shaky at
+    0.311).
     """
     start, end = chunk_indices[k]
     S = end - start
@@ -618,9 +746,16 @@ def elastic_corrections(chunk_indices, k, seam_fits, suspect=None):
         return d[min(fitted, key=lambda gg: abs(gg - g))]
 
     def _alpha(j, i, L):
-        # weight of chunk j's (dst-side) opinion; pinned on mixed-health seams
+        # weight of chunk j's (dst-side) opinion, linear inside the overlap
         a = 1.0 - (i / (L - 1.0)) if L > 1 else 0.5
-        # soft tier: bias toward the trusted side, endpoints kept exact
+        if trust:
+            ta, tb = float(trust.get(j, 0.0)), float(trust.get(j + 1, 0.0))
+            if ta > 0 and tb > 0:
+                p = tb / ta                      # 1 when equally trusted
+                if p != 1.0:
+                    a = a ** p if p > 1 else 1.0 - (1.0 - a) ** (1.0 / p)
+            return a
+        # legacy binary tier (no measured trust available)
         if (j in suspect) != (j + 1 in suspect):
             a = a * a if j in suspect else 1.0 - (1.0 - a) ** 2
         return a

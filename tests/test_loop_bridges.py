@@ -93,11 +93,20 @@ def test_scale_out_of_tolerance_is_a_scale_break_not_a_discard():
     cfg = fork_loops_cfg()
     v = lb.verify_loop(meas, cfg)
     assert v["status"] == "scale_break"
-    assert v["sigma_m"] == pytest.approx(meas["residual_m"] * cfg["scale_break_sigma_factor"])
+    # σ is the SPLIT-HALF held-out residual (USER 2026-09-16), not the fit's
+    # own optimistic residual — the break factor multiplies THAT
+    _base = meas.get("holdout_residual_m", meas["residual_m"])
+    assert v["sigma_m"] == pytest.approx(_base * cfg["scale_break_sigma_factor"])
     assert v["checks"]["scale"]["passed"] is False
 
 
-def test_broken_bridge_rejected_by_geometry():
+def test_a_broken_bridge_is_kept_and_pays_in_sigma():
+    """USER 2026-09-16: a bad fit is weak evidence, not absent evidence.
+
+    The old rule dropped any bridge whose residual passed `max_residual_m`, and
+    on pccr that deleted the only two edges able to close a 44 m walk. A broken
+    window now still produces an edge — with a σ big enough that the pose graph
+    barely listens to it, and with the reason declared."""
     sess = session()
     chunks, ci, _ = make_chunks(sess)
     item = _item(ci, 0, 20, len(ci) - 1, ci[-1][0] + 15)
@@ -105,9 +114,30 @@ def test_broken_bridge_rejected_by_geometry():
     cfg = fork_loops_cfg()
     meas = lb.measure_bridge(bridge, lb.bridge_layout(item, ci), chunks[0], chunks[-1],
                              cfg, rigid=True)
+    clean = make_bridge(sess, item)
+    meas_ok = lb.measure_bridge(clean, lb.bridge_layout(item, ci), chunks[0], chunks[-1],
+                                cfg, rigid=True)
+    v = lb.verify_loop(meas, cfg, reference_m=meas_ok["residual_m"])
+    v_ok = lb.verify_loop(meas_ok, cfg, reference_m=meas_ok["residual_m"])
+    assert v["status"] in ("accepted", "scale_break")
+    assert v["checks"]["geometric"]["passed"] is True      # the fit EXISTS
+    # …and the broken one is the one that gets distrusted, by measurement
+    assert v["sigma_m"] > v_ok["sigma_m"]
+    assert v.get("evidence") == "weak"
+    assert any("weak evidence" in r for r in v["reasons"])
+
+
+def test_only_starvation_rejects():
+    sess = session()
+    chunks, ci, _ = make_chunks(sess)
+    item = _item(ci, 0, 20, len(ci) - 1, ci[-1][0] + 15)
+    bridge = make_bridge(sess, item)
+    cfg = fork_loops_cfg(min_correspondences=10 ** 9)     # nothing can feed the fit
+    meas = lb.measure_bridge(bridge, lb.bridge_layout(item, ci), chunks[0], chunks[-1],
+                             cfg, rigid=True)
     v = lb.verify_loop(meas, cfg)
     assert v["status"] == "rejected"
-    assert v["checks"]["geometric"]["passed"] is False
+    assert "sigma_m" not in v
 
 
 def test_semantic_and_ambiguous_checks():
@@ -123,7 +153,8 @@ def test_semantic_and_ambiguous_checks():
     bad = lb.verify_loop(meas, cfg, semantic={"a": ["box"], "b": ["box", "column"]})
     assert bad["status"] == "rejected"                   # movable labels never count
     amb = lb.verify_loop(meas, cfg, spatial={"verdict": "ambiguous"})
-    assert amb["sigma_m"] == pytest.approx(meas["residual_m"] * cfg["ambiguous_sigma_factor"])
+    _base = meas.get("holdout_residual_m", meas["residual_m"])
+    assert amb["sigma_m"] == pytest.approx(_base * cfg["ambiguous_sigma_factor"])
 
 
 def test_candidate_file_round_trip(tmp_path):

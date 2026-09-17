@@ -659,6 +659,15 @@ class VGGT_Long:
         # (zoom_scale_fix) instead of being turned into a declared hole. The
         # write-blocking gate was DELETED 2026-09-13 (never on since).
         self._stac_suspect_chunks = set(suspect)
+        # The flag stays as a REPORT label; what acts on the geometry is now a
+        # continuous weight measured from the same spread (USER 2026-09-16 —
+        # 0.311 vs a 0.30 cut decided by 0.011).
+        from loop_utils.metric_lock import chunk_trust
+        self._stac_chunk_trust = chunk_trust(anchor_iqr)
+        if self._stac_chunk_trust:
+            _tt = ", ".join(f"{k}:{v:.2f}" for k, v in sorted(self._stac_chunk_trust.items()))
+            print(f"[health] chunk trust (measured, 0.5 = as good as the session's "
+                  f"median): {_tt}")
         with open(_health_path, "w") as f:
             _json.dump({"tri_angle": {str(k): tri_map.get(k)
                                       for k in range(len(self.chunk_indices))},
@@ -920,8 +929,17 @@ class VGGT_Long:
                     if fit is not None:
                         R_, t_, res_, n_ = fit
                         sf[g] = (R_, t_)
+                        # How far this fit MOVES the frame's own points. |t| is
+                        # not that number: a small rotation about a far pivot
+                        # has a huge |t| and moves the points very little — and
+                        # the reverse. The motion is what must be proportionate
+                        # to the disagreement being removed (USER 2026-09-16).
+                        _pm = p_src[ok].astype(np.float64)
+                        _mv = np.linalg.norm((_pm @ np.asarray(R_).T + np.asarray(t_)) - _pm,
+                                             axis=1)
                         entry.update({"R": R_.tolist(), "t": t_.tolist(),
-                                      "residual_m": res_, "n_fit": n_})
+                                      "residual_m": res_, "n_fit": n_,
+                                      "motion_m": float(np.median(_mv))})
                         res_all.append(res_)
                     else:
                         entry["starved"] = True
@@ -969,7 +987,7 @@ class VGGT_Long:
         from loop_utils.metric_lock import elastic_corrections
 
         seams_path = os.path.join(self.output_dir, "elastic_seams.json")
-        fits = None
+        fits, report = None, None
         if os.path.exists(seams_path):
             try:
                 prev = _json.load(open(seams_path))
@@ -978,6 +996,7 @@ class VGGT_Long:
                                               np.asarray(v["t"], np.float64))
                                      for g, v in d.items() if "R" in v}
                             for j, d in prev.get("seams", {}).items()}
+                    report = prev        # a resumed run judges proportion too
                     print(f"[elastic] resume: fits loaded from elastic_seams.json "
                           f"({sum(len(d) for d in fits.values())} frame fits)")
                 else:
@@ -990,33 +1009,59 @@ class VGGT_Long:
             with open(seams_path, "w") as f:
                 _json.dump(report, f, indent=1)
 
-        # tame the raw fits: along-trajectory smoothing + translation cap (both
-        # sides consume the same smoothed fit, so copy coincidence is preserved)
+        # Tame the raw fits WITHOUT an absolute ceiling (USER 2026-09-16:
+        # *"podría haber una corrección de más de 30 cm y ser perfectamente
+        # correcta"*). A fit is demoted for being DISPROPORTIONATE — moving the
+        # points further than the disagreement it removes, which is what the old
+        # 30 cm cap was really catching (seam 7->8: 1.59 m to close 8 cm) — and
+        # the allowance is measured on that same seam, not declared.
         _win = int(self.config['Model'].get('elastic_smooth_win', 5) or 1)
-        _cap = self.config['Model'].get('elastic_max_t_m', 0.30)
+        _cap = self.config['Model'].get('elastic_max_t_m', None)
         _cap = float(_cap) if _cap else None
+        from loop_utils.metric_lock import demote_disproportionate_fits, smooth_seam_fits
+        fits, _ndem, _dem_stats = demote_disproportionate_fits(fits, report)
+        if _ndem:
+            print(f"[elastic] {_ndem} frame fit(s) demoted as disproportionate "
+                  f"(moved the points more than the disagreement they remove; worst "
+                  f"{_dem_stats['worst_ratio']:.1f}x on seam {_dem_stats['worst_seam']}) "
+                  f"— scaled to what their own seam measures, not to a fixed cap")
+        else:
+            print("[elastic] every frame fit is proportionate to the disagreement "
+                  "it removes — nothing demoted")
         if _win > 1 or _cap:
-            from loop_utils.metric_lock import smooth_seam_fits
             fits, _ncap = smooth_seam_fits(fits, window=_win, max_t=_cap)
             print(f"[elastic] fits tamed: smoothing window {_win} frames along the "
-                  f"trajectory, |t| cap {(_cap or 0) * 100:.0f} cm "
-                  f"({_ncap} frame fit(s) capped)")
+                  f"trajectory" + (f", |t| cap {_cap * 100:.0f} cm ({_ncap} capped)"
+                                   if _cap else " (no absolute cap — proportion decides)"))
+        else:
+            _ncap = 0
 
         # apply: every chunk gets its per-frame field. Both sides of every seam land
         # on the SAME consensus, so the fused cloud (one writer per frame) is
         # continuous through the ownership switch in the middle of each overlap.
-        self._stac_elastic_corr = {}
+        # The per-frame field is SHARED: the pose graph composes its closure into
+        # it before this stage runs (and moves the points in the npy directly),
+        # so rebuilding it from scratch here would drop the closure from the
+        # CAMERA side while the points keep it — points and cameras then sit the
+        # size of the closure apart, and every stage that compares one against
+        # the other measures a disagreement that does not exist. That is exactly
+        # what happened on pccr 2026-09-16 (see metric_lock.compose_frame_fields).
+        _prev_corr = getattr(self, '_stac_elastic_corr', None) or {}
+        _new_corr = {}
         _suspect = getattr(self, '_stac_suspect_chunks', set())
         for k in range(len(self.chunk_indices)):
             # suspect chunks (soft health tier): the consensus is BIASED toward
             # the trusted side, not pinned
-            corr = elastic_corrections(self.chunk_indices, k, fits, suspect=_suspect)
-            self._stac_elastic_corr[k] = corr
+            corr = elastic_corrections(self.chunk_indices, k, fits, suspect=_suspect,
+                                       trust=getattr(self, '_stac_chunk_trust', None))
+            _new_corr[k] = corr
             path = os.path.join(self.result_aligned_dir, f"chunk_{k}.npy")
             data = np.load(path, allow_pickle=True).item()
             if data.get('_stac_elastic_applied'):
                 print(f"[elastic] chunk {k}: already corrected — skipped")
                 continue
+            # `corr` (this stage's move only) is what the POINTS still need: they
+            # already carry the closure the pose graph applied to the npy.
             wp = np.asarray(data['world_points'])
             lead = wp.ndim == 5               # (1,S,H,W,3) — same guard as the origins writer
             if lead:
@@ -1035,16 +1080,34 @@ class VGGT_Long:
             dmax = float(np.max(np.linalg.norm(corr[:, :3, 3], axis=1)))
             print(f"[elastic] chunk {k}: {moved}/{wp.shape[0]} frames moved "
                   f"(max frame translation {dmax * 100:.1f} cm)")
+        # …and the SHARED field keeps both: this stage's move on top of whatever
+        # was already there (the pose-graph closure), so the cameras follow the
+        # points exactly.
+        from loop_utils.metric_lock import compose_frame_fields
+        self._stac_elastic_corr = compose_frame_fields(_prev_corr, _new_corr)
+        if _prev_corr:
+            _kept = max(float(np.max(np.linalg.norm(np.asarray(c)[:, :3, 3], axis=1)))
+                        for c in _prev_corr.values())
+            print(f"[elastic] composed on top of the existing per-frame field "
+                  f"(max {_kept * 100:.1f} cm already applied by an earlier stage) "
+                  f"— cameras keep it")
         print(f"[elastic] ✅ all {len(self.chunk_indices)} chunks on the per-frame "
               f"seam consensus — shared pixels now share ONE 3D position")
-        if self._stac_authority_cfg() and _cap:
-            _t_all = max(float(np.max(np.linalg.norm(c[:, :3, 3], axis=1)))
-                         for c in self._stac_elastic_corr.values())
-            _fr = _t_all / float(_cap)
+        if self._stac_authority_cfg():
+            # THIS stage's own move, not the composed field: the closure another
+            # stage already applied is not authority this one spent
+            _t_all = max(float(np.max(np.linalg.norm(np.asarray(c)[:, :3, 3], axis=1)))
+                         for c in _new_corr.values())
+            # Saturation against the MEASURED allowance (the disagreement the
+            # seams actually show), falling back to the legacy cap when one is
+            # still configured. No allowance measured → nothing to saturate.
+            _ref = float(_dem_stats.get("allowance_max_m") or 0.0) or (_cap or 0.0)
+            _fr = (_t_all / _ref) if _ref > 0 else 0.0
             self._stac_authority_record(
                 "elastic_seam", _fr,
                 _fr > float(self._stac_authority_cfg()["saturation_warn"]),
-                {"max_m": float(_cap), "used_max_m": _t_all, "n_capped_fits": int(_ncap)})
+                {"max_m": _ref, "used_max_m": _t_all, "n_capped_fits": int(_ncap),
+                 "n_demoted_fits": int(_ndem), "allowance": "measured_per_seam"})
 
     def _stac_aligned_pose(self, k, local, ext_c2w):
         """World-space c2w of chunk k's local frame as the CLOUD sees it: the
@@ -2227,6 +2290,16 @@ class VGGT_Long:
         lcfg = self._stac_loops_cfg()
         max_sig = float(cfg_req(lcfg, "max_edge_sigma_m", "loops"))
         starved_sig = float(cfg_req(lcfg, "starved_sigma_m", "loops"))
+        # What does THIS session achieve where the geometry is known to be the
+        # same? Its own exact seams (USER 2026-09-16 — a bridge is compared
+        # against that measurement, never against a constant).
+        _seams = [float(x) for x in (getattr(self, '_stac_seam_residuals', {}) or {}).values()
+                  if np.isfinite(x) and x > 0]
+        reference_m = float(np.median(_seams)) if _seams else None
+        if reference_m is not None:
+            print(f"[loop-verify] this session's own overlap agreement: "
+                  f"{reference_m*100:.1f} cm (median of {len(_seams)} exact seam(s)) "
+                  f"— bridges are judged against it, not against a constant")
         sem_path = os.path.join(self.output_dir, "loop_semantics.json")
         semantics = None
         if os.path.exists(sem_path):
@@ -2248,7 +2321,8 @@ class VGGT_Long:
                 sa = fr.get(str(ni), {}).get("structural")
                 sb = fr.get(str(nj), {}).get("structural")
                 sem = {"a": sa, "b": sb}
-            v = verify_loop(meas, lcfg, semantic=sem, spatial=meta.get("gate"))
+            v = verify_loop(meas, lcfg, semantic=sem, spatial=meta.get("gate"),
+                            reference_m=reference_m)
             if not meas.get("ok"):
                 # starved exact fit → the VENDOR coarse fit, recorded as low confidence
                 coarse = self._stac_vendor_bridge_fit(item, pred, meta)
@@ -2307,9 +2381,46 @@ class VGGT_Long:
                     self.loop_sim3_list.append((ka, kb, (1.0, np.asarray(meas["R_ab"]),
                                                          np.asarray(meas["t_ab"]))))
             tag = ("ACCEPTED" if v["status"] == "accepted" else v["status"].upper())
+            if v.get("evidence") == "weak":
+                tag += " (weak)"
+            # σ is printed only when it was MEASURED; a rejected bridge never
+            # had one computed, and printing "σ=nan" made a threshold decision
+            # look like a failed computation (USER 2026-09-16 read it as a bug)
+            sig = v.get("sigma_m")
+            sig_txt = f"σ={sig:.4f} m " if sig is not None else "σ not measured "
             print(f"[loop-verify] bridge {li} chunks {ka}<->{kb} ({cand['source']} "
-                  f"{cand['i']}<->{cand['j']}): {tag} σ={v.get('sigma_m', float('nan')):.4f} m "
+                  f"{cand['i']}<->{cand['j']}): {tag} {sig_txt}"
                   f"{'; '.join(v.get('reasons', []))}")
+        # ── σ from AGREEMENT: two independent bridges over the same chunk pair
+        # disagree by exactly as much as the measurement is uncertain. That
+        # disagreement is an error bar nobody had to invent (USER 2026-09-16);
+        # it replaces trusting a single fit's own optimism. The larger of the
+        # two — held-out error and cross-bridge spread — is what the edge
+        # carries, because a pair can agree by sharing the same systematic.
+        groups = {}
+        for e in self._stac_loop_edges:
+            groups.setdefault((int(e["a"]), int(e["b"])), []).append(e)
+        kf_by_bridge = {int(k["bridge"]): k for k in self._stac_loop_edges_kf}
+        for (ka_, kb_), grp in groups.items():
+            if len(grp) < 2:
+                continue
+            T = np.asarray([np.asarray(e["t_ab"], np.float64).ravel() for e in grp])
+            d = [float(np.linalg.norm(T[i] - T[j]))
+                 for i in range(len(T)) for j in range(i + 1, len(T))]
+            spread = float(np.median(d))
+            for e in grp:
+                before = float(e["sigma_m"])
+                if spread > before:
+                    e["sigma_m"] = spread
+                    e["sigma_source"] = "cross_bridge_spread"
+                    kf = kf_by_bridge.get(int(e["bridge"]))
+                    if kf is not None:
+                        kf["sigma_m"] = spread
+                        kf["sigma_source"] = "cross_bridge_spread"
+                else:
+                    e.setdefault("sigma_source", "holdout_residual")
+            print(f"[loop-verify] chunks {ka_}<->{kb_}: {len(grp)} independent bridge(s) "
+                  f"agree to {spread*100:.1f} cm → σ = max(held-out, agreement)")
         n_good = sum(1 for e in self._stac_loop_edges if e["sigma_m"] <= max_sig)
         self.loop_enable_opt = bool(self.loop_enable and n_good > 0)
         gate_mod = self._stac_server_module("reconstruction.loops.spatial_gate")
@@ -2320,8 +2431,14 @@ class VGGT_Long:
                                 "n_edges_usable": n_good,
                                 "loop_enable_opt": self.loop_enable_opt,
                                 "provisional_seams": getattr(self, '_stac_provisional_seams', None)})
-        print(f"[loop-verify] {n_good} usable edge(s) with σ ≤ {max_sig} m → loop optimizer "
-              f"{'ON' if self.loop_enable_opt else 'OFF (no trustworthy edge)'}; loop_edges.json")
+        # The vendor's per-chunk Sim3 optimizer is the only thing σ ≤ max_sig
+        # gates; the §4.3 keyframe pose graph takes EVERY accepted edge and
+        # weighs it by its own σ. Saying "loop optimizer OFF" without that
+        # second half read as "nothing closes" (USER 2026-09-16, pccr).
+        n_edges = len(self._stac_loop_edges_kf)
+        print(f"[loop-verify] {n_good} edge(s) with σ ≤ {max_sig} m → vendor Sim3 optimizer "
+              f"{'ON' if self.loop_enable_opt else 'OFF'}; {n_edges} edge(s) go to the "
+              f"keyframe pose graph weighted by σ; loop_edges.json")
 
     # ══════════════════════════════════════════════════════════════════════
     # STAC F2 — KEYFRAME SE(3) POSE GRAPH, INTRINSIC UNCERTAINTY, AUTHORITY

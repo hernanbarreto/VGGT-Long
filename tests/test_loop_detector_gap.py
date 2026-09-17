@@ -13,13 +13,16 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
-def _detector(min_gap, similarity_threshold, nms_threshold):
+def _detector(min_gap, similarity_threshold, nms_threshold, min_gap_frac=0.0):
     from LoopModels.LoopModel import LoopDetector
     cfg = {"Weights": {"SALAD": "unused.ckpt"},
            "Loop": {"SALAD": {"image_size": [336, 336], "batch_size": 32,
                               "similarity_threshold": similarity_threshold, "top_k": 5,
                               "use_nms": nms_threshold > 0, "nms_threshold": nms_threshold,
-                              "min_gap": min_gap}},
+                              "min_gap": min_gap,
+                              # the band is max(min_gap, ceil(min_gap_frac x n));
+                              # LoopModel requires the key (configs/base_config.yaml)
+                              "min_gap_frac": min_gap_frac}},
            "Model": {"frame_stride": 1}}
     det = LoopDetector(image_dir="/nonexistent", output="/dev/null", config=cfg)
     # 40 unit descriptors on a circle: frames i and i+20 identical (a revisit),
@@ -51,7 +54,7 @@ def test_top_k_is_taken_among_non_local_frames():
     cfg = {"Weights": {"SALAD": "unused.ckpt"},
            "Loop": {"SALAD": {"image_size": [336, 336], "batch_size": 32,
                               "similarity_threshold": 0.8, "top_k": 5, "use_nms": False,
-                              "nms_threshold": 0, "min_gap": 11}},
+                              "nms_threshold": 0, "min_gap": 11, "min_gap_frac": 0.0}},
            "Model": {"frame_stride": 1}}
     det = LoopDetector(image_dir="/nonexistent", output="/dev/null", config=cfg)
     # a smooth walk: adjacent descriptors nearly identical (small angular step),
