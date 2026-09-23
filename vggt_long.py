@@ -2818,21 +2818,26 @@ class VGGT_Long:
             after_loop_res = edge_res
             loop_after = float(np.sum([r["t_m"] for r in after_loop_res.values()])) if after_loop_res else 0.0
             # 4) gates — measured; advisory or veto per Model.graph.gate_mode
-            def _held_median(Xm):
+            from loop_utils.metric_lock import heldout_change
+            def _held_vals(Xm):
                 vals = []
                 for f_, g_, p, q in held:
                     p2 = p @ Xm[f_][:3, :3].T + Xm[f_][:3, 3]
                     q2 = q @ Xm[g_][:3, :3].T + Xm[g_][:3, 3]
                     vals.append(float(np.median(np.linalg.norm(p2 - q2, axis=1))))
-                return float(np.median(vals)) if vals else float("nan")
-            held_before = _held_median(np.tile(np.eye(4), (N, 1, 1)))
-            held_after = _held_median(Xc)
+                return vals
+            _hv_b, _hv_a = _held_vals(np.tile(np.eye(4), (N, 1, 1))), _held_vals(Xc)
+            held_before = float(np.median(_hv_b)) if _hv_b else float("nan")
+            held_after = float(np.median(_hv_a)) if _hv_a else float("nan")
+            held_chg = heldout_change(
+                _hv_b, _hv_a,
+                confidence=float(cfg_req(gcfg, "heldout_confidence", "graph")))
             gain = (1.0 - loop_after / loop_before) if loop_before > 0 else 0.0
             min_gain = float(cfg_req(gcfg, "min_loop_gain", "graph"))
-            max_deg = float(cfg_req(gcfg, "max_seam_degradation_m", "graph"))
             n_active = sum(1 for eid, _ in loop_ids if pg._edges[eid]["active"])
             ok_gain = (gain >= min_gain) if n_active > 0 else False
-            ok_held = (not np.isfinite(held_before)) or (held_after <= held_before + max_deg)
+            # the bar is the held-out sample's own noise, not a tolerated magnitude
+            ok_held = (not np.isfinite(held_before)) or (not held_chg["worsens"])
             # §4.7 authority: fraction used vs the declared maximum
             t_mag = np.linalg.norm(Xc[:, :3, 3], axis=1)
             r_mag = np.array([np.degrees(np.linalg.norm(se3_log(M)[:3])) for M in Xc])
@@ -2845,8 +2850,11 @@ class VGGT_Long:
             if not ok_gain:
                 gate_warnings.append(f"loop gain {gain * 100:.0f}% < {min_gain * 100:.0f}%")
             if not ok_held:
-                gate_warnings.append(f"held-out {held_before * 100:.2f}→{held_after * 100:.2f} cm "
-                                     f"(> +{max_deg * 100:.1f} cm)")
+                gate_warnings.append(
+                    f"held-out {held_before * 100:.2f}→{held_after * 100:.2f} cm — "
+                    f"degradation beyond the sample's own noise (paired change CI "
+                    f"[{held_chg['ci_low'] * 100:+.2f}, {held_chg['ci_high'] * 100:+.2f}] cm, "
+                    f"n={held_chg['n']})")
             if frac > 1.0:
                 gate_warnings.append(f"authority {frac * 100:.0f}% (max {a_max_m} m / {a_max_deg}°)")
             for ob in over_budget:
@@ -2868,7 +2876,7 @@ class VGGT_Long:
                                 "holdout_surface_pairs": {"n_pairs": len(held),
                                                           "median_before_m": held_before,
                                                           "median_after_m": held_after,
-                                                          "max_degradation_m": max_deg,
+                                                          "measured_bar": held_chg,
                                                           "passed": ok_held}},
                       "authority": {"stage": "pose_graph", "max_m": a_max_m, "max_deg": a_max_deg,
                                     "used_max_m": float(t_mag.max()), "used_max_deg": float(r_mag.max()),

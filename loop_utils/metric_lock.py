@@ -923,10 +923,48 @@ def solve_depth_graph(measurements, n_frames, scale_only=False, weights=None, we
     return a, b
 
 
-def depth_graph_verdict(a, b, meas, held, zref=5.0, improve=0.8, bound=5.0):
+def heldout_change(before, after, confidence=0.95, n_boot=2000, seed=0):
+    """Did the correction change the held-out disagreement by more than the
+    sample's OWN noise?
+
+    `before`/`after` are the PAIRED per-held-out-pair disagreements (same pair,
+    same order; any unit, as long as both share it). The statistic is the median
+    of d = before - after (positive = the correction helped) and its sampling
+    noise is MEASURED by bootstrapping over the pairs, so the bar adapts to how
+    many pairs there are and how much they disagree — instead of being a
+    constant someone chose.
+
+    improves / worsens = the whole confidence interval of median(d) sits on one
+    side of zero. NEITHER means the change is inside the noise: the held-out
+    sample cannot tell, which is not the same as "no change".
+
+    USER 2026-09-23 ("me parece bien"), after pccr showed the two halves of the
+    same evidence judged by two invented round numbers pointing opposite ways:
+    0.8 rejected a measured 12 % improvement while 0.005 m accepted a measured
+    10 % degradation.
+    """
+    b = np.asarray(before, np.float64).ravel()
+    a = np.asarray(after, np.float64).ravel()
+    if b.size == 0 or b.size != a.size:
+        return {"improves": False, "worsens": False, "n": int(b.size),
+                "median_delta": 0.0, "ci_low": 0.0, "ci_high": 0.0}
+    d = b - a
+    n = int(d.size)
+    rng = np.random.default_rng(int(seed))
+    meds = np.median(d[rng.integers(0, n, size=(int(n_boot), n))], axis=1)
+    alpha = (1.0 - float(confidence)) / 2.0
+    lo = float(np.percentile(meds, 100.0 * alpha))
+    hi = float(np.percentile(meds, 100.0 * (1.0 - alpha)))
+    return {"improves": bool(lo > 0.0), "worsens": bool(hi < 0.0), "n": n,
+            "median_delta": float(np.median(d)), "ci_low": lo, "ci_high": hi}
+
+
+def depth_graph_verdict(a, b, meas, held, zref=5.0, confidence=0.95, bound=5.0,
+                        n_boot=2000, seed=0):
     """Self-validation shared by every rung of the depth-graph model ladder.
     Judged ONLY on held-out pairs (never fitted): the corrected disagreement at
-    ``zref`` must improve by ≥(1-improve), and the corrections must stay within
+    ``zref`` must fall by more than the held-out sample's own noise
+    (``heldout_change``), and the corrections must stay within
     ``bound``× the pairwise signal (an order of magnitude beyond what the pairs
     show is noise integration along the chain, not signal). Returns a dict with
     bounded / improves / med_before / med_after / sig_a / sig_b."""
@@ -942,10 +980,13 @@ def depth_graph_verdict(a, b, meas, held, zref=5.0, improve=0.8, bound=5.0):
     sig_b = max(float(np.median(bes)), 1e-3)
     bounded = (float(np.percentile(np.abs(np.log(a)), 99)) <= bound * sig_a
                and float(np.percentile(np.abs(b), 99)) <= bound * sig_b)
-    improves = med_a <= improve * med_b
+    _chg = heldout_change(rb, ra, confidence=confidence, n_boot=n_boot, seed=seed)
+    improves = bool(_chg["improves"])
     return {"bounded": bounded, "improves": improves,
             "med_before": med_b, "med_after": med_a,
-            "sig_a": sig_a, "sig_b": sig_b}
+            "sig_a": sig_a, "sig_b": sig_b,
+            "heldout_ci_low": _chg["ci_low"], "heldout_ci_high": _chg["ci_high"],
+            "heldout_n": float(_chg["n"]), "heldout_median_delta": _chg["median_delta"]}
 
 
 def apply_depth_correction(world_points, depth, cam_center, a, b):
@@ -1326,7 +1367,8 @@ def blend_chunk_fields(chunk_indices, fields, n_frames):
     return out
 
 
-def chunk_field_verdict(xi, pair_taus, held, improve=0.8, bound=5.0):
+def chunk_field_verdict(xi, pair_taus, held, confidence=0.95, bound=5.0,
+                        n_boot=2000, seed=0):
     """Per-chunk self-gate (the family discipline): held-out within-chunk pairs
     judge, corrections bounded by 5× the P90 pair magnitude — a smooth bump's
     pointwise correction legitimately exceeds the MEDIAN pairwise difference,
@@ -1353,7 +1395,9 @@ def chunk_field_verdict(xi, pair_taus, held, improve=0.8, bound=5.0):
     r_sig = max(float(np.percentile(r_pair, 90)), 1e-4)
     bounded = (float(np.max(np.linalg.norm(xi[:, 3:], axis=1))) <= bound * t_sig
                and float(np.max(np.linalg.norm(xi[:, :3], axis=1))) <= bound * r_sig)
-    improves = med_a <= improve * med_b
+    chg = heldout_change(before, after, confidence=confidence,
+                         n_boot=n_boot, seed=seed)
+    improves = bool(chg["improves"])
     return {"bounded": bounded, "improves": improves,
             "med_before": med_b, "med_after": med_a,
-            "t_sig": t_sig, "r_sig": r_sig}
+            "t_sig": t_sig, "r_sig": r_sig, "heldout": chg}
