@@ -745,6 +745,18 @@ class VGGT_Long:
                   f"({info['n_segments']} segments)")
         return rows
 
+    def _stac_pose_conf_floor(self):
+        """USER 2026-09-23: the quality floor the POSE fits sample under.
+
+        The intra-chunk field and the keyframe pose graph fit on surface pair
+        correspondences and judge themselves on held-out pairs drawn from the
+        SAME points, so a low-confidence point both biases the correction and
+        corrupts its own examiner. `conf > 1e-5` in the sampler is the sky mask,
+        not a quality gate. One number governs the whole pipeline: this is the
+        same min-max fraction the CloudCompy gate (postprocessing.conf_min_norm)
+        and the viewer slider use. 0 = historical behaviour."""
+        return float(self.config['Model'].get('pose_fit_conf_min_norm', 0.0) or 0.0)
+
     def _stac_conf_threshold(self, confs):
         """STAC patch: the ONE confidence threshold for a chunk's PLY + origins.
 
@@ -765,13 +777,29 @@ class VGGT_Long:
         if not ps.get('use_conf_filter', True):
             return -1.0
         confs = np.asarray(confs).reshape(-1)
+        valid = confs[confs > 1e-5]
         pct = ps.get('conf_percentile')
         if pct is not None:
-            valid = confs[confs > 1e-5]
             if valid.size == 0:
                 return -1.0
-            return float(np.percentile(valid.astype(np.float64), float(pct)))
-        return float(np.mean(confs, dtype=np.float64)) * ps['conf_threshold_coef']
+            thr = float(np.percentile(valid.astype(np.float64), float(pct)))
+        else:
+            thr = float(np.mean(confs, dtype=np.float64)) * ps['conf_threshold_coef']
+        # USER 2026-09-23: *"deben desaparecer de la nube eh!, porque no quiero que
+        # se hagan ajustes de pose sobre ruido"*. An ABSOLUTE floor on top of the
+        # percentile, as a min-max fraction of this chunk's own valid confidences —
+        # the same arithmetic the viewer slider (PotreeLoader.ts:711) and the pose-fit
+        # sampler use, so ONE number means one thing everywhere. It lives HERE, the
+        # earliest place the cloud is written, so segmentation and the correction
+        # module receive it already filtered and the CloudCompy gate stays off (a
+        # second min-max gate downstream would re-normalise over the surviving range
+        # and cut again). The percentile and the floor compose: whichever is stricter.
+        floor = self._stac_pose_conf_floor()
+        if floor > 0.0 and valid.size:
+            lo, hi = float(valid.min()), float(valid.max())
+            if hi > lo:
+                thr = max(thr, lo + floor * (hi - lo))
+        return thr
 
     def _stac_owned_confs(self, confs, chunk_idx):
         """FRAME OWNERSHIP: zero the confidence of frames this chunk does not OWN,
@@ -1201,7 +1229,8 @@ class VGGT_Long:
                             continue
                         pq = surface_pair_correspondences(
                             cache[f][0], cache[f][1],
-                            cache[g][0], cache[g][1], cache[g][2], cache[g][3])
+                            cache[g][0], cache[g][1], cache[g][2], cache[g][3],
+                            conf_min_norm=self._stac_pose_conf_floor())
                         if pq is None:
                             continue
                         if d in holdout_offsets:
@@ -2692,7 +2721,8 @@ class VGGT_Long:
                 pq = surface_pair_correspondences(cache[f][0], cache[f][1],
                                                   cache[g][0], cache[g][1],
                                                   cache[g][2], cache[g][3],
-                                                  max_samples=n_samp)
+                                                  max_samples=n_samp,
+                                                  conf_min_norm=self._stac_pose_conf_floor())
                 if pq is not None:
                     pairs.append((f, g, pq[0], pq[1]))
         return pairs

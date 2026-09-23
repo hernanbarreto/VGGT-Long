@@ -1219,15 +1219,33 @@ def frame_owner(chunk_indices, n_frames):
 
 
 def surface_pair_correspondences(wp_src, conf_src, wp_dst, conf_dst, w2c_dst, K_dst,
-                                 max_samples=8000, seed=0):
+                                 max_samples=8000, seed=0, conf_min_norm=0.0):
     """EXACT-surface 3D correspondences between two frames: project src's valid
     points into dst's camera and pair them with dst's OWN 3D point at the hit
     pixel. Returns (p_src[n,3], q_dst[n,3]) or None when starved — the rigid
-    analogue of depth_pair_samples (same association, full 3D instead of z)."""
+    analogue of depth_pair_samples (same association, full 3D instead of z).
+
+    `conf_min_norm` (USER 2026-09-23) is a QUALITY floor on top of the sky mask,
+    as a min-max fraction of this frame's own valid confidences — the same
+    arithmetic the viewer slider and the CloudCompy gate use, so one number means
+    one thing everywhere. It matters more here than in the cloud: these pairs are
+    what the intra-chunk field and the pose graph FIT on *and* what their held-out
+    pairs JUDGE with, so an unconfident point biases the correction and corrupts
+    its own examiner. `conf > 1e-5` alone is the SKY MASK, not a quality gate.
+    0.0 keeps the historical behaviour."""
     H, W = wp_dst.shape[:2]
     p = np.asarray(wp_src, np.float64).reshape(-1, 3)
     c = np.asarray(conf_src, np.float32).reshape(-1)
     idx = np.flatnonzero(c > 1e-5)
+    if float(conf_min_norm) > 0.0 and idx.size:
+        v = c[idx]
+        lo, hi = float(v.min()), float(v.max())
+        if hi > lo:
+            keep = v >= lo + float(conf_min_norm) * (hi - lo)
+            # never starve the fit: a frame whose confidences are nearly uniform
+            # would lose everything to a floor that means nothing there
+            if keep.sum() >= 500:
+                idx = idx[keep]
     if len(idx) < 500:
         return None
     if len(idx) > max_samples:
