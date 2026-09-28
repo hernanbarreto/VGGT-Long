@@ -1,4 +1,6 @@
+import json
 import math
+import os
 import torch
 import argparse
 import numpy as np
@@ -8,6 +10,7 @@ from tqdm import tqdm
 from pathlib import Path
 
 from LoopModels.vpr_model import VPRModel
+from LoopModels.calibration import calibrate_threshold
 
 class LoopDetector:
     """Loop detector class for detecting loop closures in image sequences"""
@@ -208,13 +211,54 @@ class LoopDetector:
         D = D / D.norm(dim=1, keepdim=True).clamp_min(1e-12)
         sims = (D @ D.T).numpy()
         n = sims.shape[0]
-        min_gap = max(int(self.min_gap), int(math.ceil(self.min_gap_frac * n)))
+        # a pair closer than one bridge window (Model.loop_chunk_size) can never give an
+        # INDEPENDENT loop — its two windows share keyframes, the same Omega evidence
+        # twice (STAC 2026-09-28: 16 of pccr's 19 edges were such pairs and bent the
+        # chain) — so it does not compete for the top-k slots of the real revisits
+        _bridge = int((self.config.get('Model') or {}).get('loop_chunk_size', 0) or 0)
+        min_gap = max(int(self.min_gap), int(math.ceil(self.min_gap_frac * n)), _bridge)
         print(f"[loops] SALAD non-local band: {min_gap} keyframe(s) "
-              f"(floor {self.min_gap}, {self.min_gap_frac:g} x {n} frames)")
+              f"(floor {self.min_gap}, {self.min_gap_frac:g} x {n} frames, one bridge "
+              f"window {_bridge})")
         idx = np.arange(n)
         local = np.abs(idx[:, None] - idx[None, :]) < min_gap           # self + odometry band
         sims_nonlocal = np.where(local, -np.inf, sims)
+        # the evidence behind the count: "0 loop pairs" alone cannot say whether
+        # nothing looked alike or the bar sat just above what did
+        _upper = sims[np.triu(~local, 1)]
+        if _upper.size:
+            print(f"[loops] SALAD non-local similarity over {_upper.size} pair(s): "
+                  f"p50 {np.percentile(_upper, 50):.3f}, p99 {np.percentile(_upper, 99):.3f}, "
+                  f"max {_upper.max():.3f}; {int((_upper > self.similarity_threshold).sum())} "
+                  f"above {self.similarity_threshold:g}")
 
+        # STAC 2026-09-28: the appearance bar calibrated on the session's own GEOMETRIC
+        # revisits (the DA3-window walk) when map_worker provides them; the configured
+        # value stays the fallback and is reported beside it
+        ref_path = self.config['Loop']['SALAD'].get('revisit_reference')
+        threshold = float(self.similarity_threshold)
+        if ref_path and os.path.exists(ref_path):
+            with open(ref_path) as _f:
+                ref = json.load(_f)
+            frame_of = [int("".join(ch for ch in Path(p).stem if ch.isdigit()))
+                        for p in self.image_paths]
+            cal, crep = calibrate_threshold(sims, local, frame_of, ref)
+            crep["configured_threshold"] = threshold
+            if cal is not None:
+                threshold = cal
+                print(f"[loops] SALAD bar CALIBRATED on {crep['n_revisit_pairs']} geometric "
+                      f"revisit pair(s): {cal:.3f} (Youden J {crep['youden_j']:.2f}, TPR "
+                      f"{crep['tpr']:.2f}, FPR {crep['fpr']:.3f}; revisit median "
+                      f"{crep['revisit_similarity_median']:.3f} vs other "
+                      f"{crep['other_similarity_median']:.3f}; configured "
+                      f"{self.similarity_threshold:g})")
+            else:
+                print(f"[loops] SALAD bar NOT calibrated ({crep.get('reason')}) — the "
+                      f"configured {threshold:g} stands")
+            if self.output:
+                with open(os.path.join(os.path.dirname(str(self.output)),
+                                       "salad_calibration.json"), "w") as _f:
+                    json.dump(crep, _f, indent=1)
         loop_closures = []
         k = min(self.top_k, n)
         for i in range(n):
@@ -224,7 +268,7 @@ class LoopDetector:
             order = np.argsort(-row)[:k]
             for neighbor_idx in order:
                 similarity = float(row[neighbor_idx])
-                if not np.isfinite(similarity) or similarity <= self.similarity_threshold:
+                if not np.isfinite(similarity) or similarity <= threshold:
                     continue
                 neighbor_idx = int(neighbor_idx)
                 if i < neighbor_idx:

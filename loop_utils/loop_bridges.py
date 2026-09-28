@@ -214,6 +214,28 @@ def split_half_residual(p, q, rigid: bool, sample: int, min_pts: int,
 
 # ── the measurement ─────────────────────────────────────────────────────
 
+def _side_range_m(q: np.ndarray, chunk, chunk_locals: Sequence[int]):
+    """Median distance of the chunk-side correspondences ``q`` to the cameras
+    of the chunk frames they came from (their centroid — the frames of one
+    window sit within a few tens of centimetres of each other). ``extrinsic``
+    is (S,4,4) c2w in the STAC npy; a (S,3,4) w2c is inverted. None when the
+    chunk carries no extrinsics or the side has no correspondences."""
+    if q is None or len(q) == 0 or "extrinsic" not in chunk:
+        return None
+    ext = np.asarray(chunk["extrinsic"], np.float64)
+    ext = ext[0] if ext.ndim == 4 else ext
+    idx = [int(c) for c in chunk_locals if 0 <= int(c) < len(ext)]
+    if not idx:
+        return None
+    if ext.shape[1:] == (4, 4):
+        C = ext[idx, :3, 3]
+    else:                                   # (3,4) w2c: C = -Rᵀ t
+        R = ext[idx, :3, :3]; t = ext[idx, :3, 3]
+        C = -np.einsum("nji,nj->ni", R, t)
+    c0 = np.median(C, axis=0)
+    return float(np.median(np.linalg.norm(np.asarray(q, np.float64) - c0, axis=1)))
+
+
 def measure_bridge(bridge, layout: dict, chunk_a, chunk_b, loops_cfg: dict,
                    rigid: bool, seed: int = 0) -> dict:
     """Fit the bridge against both chunks on exact correspondences.
@@ -232,6 +254,13 @@ def measure_bridge(bridge, layout: dict, chunk_a, chunk_b, loops_cfg: dict,
                                 ("b", chunk_b, layout["bridge_b"], layout["chunk_b_local"])):
         p, q = exact_correspondences(bridge, bl, chunk, cl, cap, seed=seed)
         rec = {"n_corr": int(len(p)), "starved": False}
+        # the LEVER ARM of this side: how far the surfaces that constrained the
+        # fit sit from the cameras that saw them. A translation error bar σ on
+        # those surfaces is a rotation error bar σ/range on the pose — the
+        # same measurement read in angle (USER 2026-09-25: no constant σ_rot)
+        rng_m = _side_range_m(q, chunk, cl)
+        if rng_m is not None:
+            rec["range_m"] = float(rng_m)
         fit = None
         if len(p) >= min_pts:
             if rigid:
@@ -261,8 +290,13 @@ def measure_bridge(bridge, layout: dict, chunk_a, chunk_b, loops_cfg: dict,
         s_ab, R_ab, t_ab = compose_ab(fits["a"], fits["b"])
         sh_a = out["sides"]["a"].get("split_half")
         sh_b = out["sides"]["b"].get("split_half")
+        ranges = [out["sides"][s_]["range_m"] for s_ in ("a", "b")
+                  if out["sides"][s_].get("range_m") is not None]
         out.update({"ok": True, "s_ab": float(s_ab), "R_ab": R_ab.tolist(),
                     "t_ab": t_ab.tolist(),
+                    # the SHORTER lever arm decides: it is the side whose
+                    # translation error bar turns into the larger angle
+                    "range_m": (float(min(ranges)) if ranges else None),
                     "residual_m": float(max(out["sides"]["a"]["residual_m"],
                                             out["sides"]["b"]["residual_m"])),
                     "n_corr": int(min(out["sides"]["a"]["n_corr"],

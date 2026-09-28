@@ -32,6 +32,21 @@ def _omega_pkg_on_path() -> None:
         sys.path.insert(0, p)
 
 
+# claude_stac.txt §4-F3: the parts of the network without which the prediction is
+# not Omega's — a checkpoint missing any of their tensors must not run on random init
+REQUIRED_PREFIXES = ("aggregator.", "camera_head.", "depth_head.")
+
+
+def omega_load_report(missing, unexpected, required=REQUIRED_PREFIXES) -> dict:
+    """What load_state_dict(strict=False) left out or ignored. ``missing_required``:
+    the missing keys of the parts Omega cannot run without."""
+    missing, unexpected = sorted(missing), sorted(unexpected)
+    miss_req = [k for k in missing if k.startswith(tuple(required))]
+    return {"missing_keys": missing, "unexpected_keys": unexpected,
+            "missing_required": miss_req, "required_prefixes": list(required),
+            "ok": not miss_req, "provenance": "tool_measured"}
+
+
 def _ensure_bsd(x: torch.Tensor, n_lead: int = 2) -> torch.Tensor:
     """Ensure a leading (batch, seq) pair: if the tensor has only `seq` leading,
     add a batch dim. Used to normalise omega outputs to [B,S,...]."""
@@ -53,7 +68,20 @@ class VGGTOmegaAdapter(Base3DModel):
         state_dict = torch.load(url, map_location="cpu")
         if isinstance(state_dict, dict) and "model" in state_dict and "pose_enc" not in state_dict:
             state_dict = state_dict["model"]           # tolerate {'model': sd} wrappers
-        self.model.load_state_dict(state_dict, strict=False)
+        res = self.model.load_state_dict(state_dict, strict=False)
+        # STRICT REPORT (claude_stac.txt §4-F3): strict=False used to discard what it
+        # skipped — a checkpoint missing a head would have run on random weights
+        self.load_report = omega_load_report(res.missing_keys, res.unexpected_keys)
+        print(f"[omega-load] {len(res.missing_keys)} missing, "
+              f"{len(res.unexpected_keys)} unexpected key(s)"
+              + (f": missing {res.missing_keys[:8]}" if res.missing_keys else "")
+              + (f"; unexpected {res.unexpected_keys[:8]}" if res.unexpected_keys else ""))
+        if self.load_report["missing_required"]:
+            raise RuntimeError(
+                f"VGGT-Omega checkpoint {url} lacks {len(self.load_report['missing_required'])} "
+                f"tensor(s) of {', '.join(REQUIRED_PREFIXES)} — e.g. "
+                f"{self.load_report['missing_required'][:5]}; refusing to run on random "
+                f"weights")
         self.model.eval()
         self.model = self.model.to(self.device)
 

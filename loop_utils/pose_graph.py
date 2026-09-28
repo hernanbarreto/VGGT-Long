@@ -19,7 +19,13 @@
 #              dense torch.linalg.cholesky/cholesky_solve when 6·n_kf ≤
 #              dense_max_unknowns, block-Jacobi preconditioned conjugate gradient
 #              beyond; λ adaptive (Nielsen); gauge δ_0 ≡ 0; float64 throughout
-#   stop       ‖δ‖ < tol, relative cost improvement < rel_tol, or max_iters
+#   stop       CONVERGED when every node's step is below ``tol`` in radians AND in metres
+#              (per component, per node — no norm mixing the two units); the step
+#              factor reaching lambda_max = no descent left (stationary, converged);
+#              ``max_iters`` reached = NOT converged (report.converged False — the
+#              caller does not apply it). A relative-cost stop is gone: under IRLS
+#              the cost can creep while poses still move (pccr 2026-09-28 stopped at
+#              50 iterations with the cost still falling and applied the iterate).
 #
 # Only torch + torch.linalg — no g2o / GTSAM / Ceres. Every threshold comes from
 # the caller's config dict (Model.graph.*); the module holds no decision literal.
@@ -413,7 +419,6 @@ class PoseGraph:
         lam = float(_req(self.cfg, "lambda_init"))
         nu = 2.0
         tol = float(_req(self.cfg, "tol"))
-        rel_tol = float(_req(self.cfg, "rel_tol"))
         max_iters = int(_req(self.cfg, "max_iters"))
         T = self.T.clone()
         res = self._residuals(T, groups, with_jac=True)
@@ -425,9 +430,10 @@ class PoseGraph:
         for it in range(max_iters):
             H, gvec, _ = self._assemble(groups, res)
             d = self._solve_linear(H, gvec, lam)
-            dn = float(torch.linalg.norm(d))
+            # per node: rotation (rad) and translation (m) parts, each against tol
+            dn = float(d.view(-1, 6).abs().max())
             if dn < tol:
-                stop = "step_below_tol"
+                stop = "converged"
                 break
             T_new = self._apply_delta(T, d)
             res_new = self._residuals(T_new, groups, with_jac=False)
@@ -437,21 +443,17 @@ class PoseGraph:
             rho = (cost - cost_new) / pred if pred > 0 else (1.0 if cost_new < cost else -1.0)
             if cost_new < cost:
                 T = T_new
-                improvement = (cost - cost_new) / max(cost, 1e-30)
                 cost = cost_new
                 res = self._residuals(T, groups, with_jac=True)
                 history.append(cost)
                 n_accept += 1
                 lam = lam * max(1.0 / 3.0, 1.0 - (2.0 * rho - 1.0) ** 3)
                 nu = 2.0
-                if improvement < rel_tol:
-                    stop = "rel_tol"
-                    break
             else:
                 lam *= nu
                 nu *= 2.0
                 if lam > float(_req(self.cfg, "lambda_max")):
-                    stop = "lambda_max"
+                    stop = "stationary"            # no descent left at any step size
                     break
         self.T = T
         self.poses = T.cpu().numpy()
@@ -464,10 +466,12 @@ class PoseGraph:
                                       "raw": raw[k].tolist(), "tag": self._edges[eid]["tag"]}
         self.report = {"cost_initial": cost0, "cost_final": cost, "iterations": len(history) - 1,
                        "accepted_steps": n_accept, "stop": stop, "lambda_final": lam,
+                       "converged": stop in ("converged", "stationary"),
                        "n_nodes": self.n, "n_edges": self.n_edges,
                        "history": history, "per_edge": per_edge}
         log(f"[pose-graph] {self.n} nodes, {self.n_edges} edges: cost {cost0:.4g} → {cost:.4g} "
-            f"in {len(history) - 1} accepted step(s), stop={stop}")
+            f"in {len(history) - 1} accepted step(s), stop={stop}"
+            + ("" if stop in ("converged", "stationary") else " — NOT CONVERGED"))
         return self.report
 
     # ── helpers for the caller ───────────────────────────────────────────

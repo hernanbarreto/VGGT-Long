@@ -1972,7 +1972,8 @@ class VGGT_Long:
                 int(item[3][0] + (item[3][1] - item[3][0]) // 2)
             cand = by_pair.get((item[-1][0], item[-1][1])) if len(item) > 4 else None
             if cand is None:
-                cand = {"i": i_hi, "j": j_lo, "sim": None, "source": "salad"}
+                ci, cj = (int(item[-1][0]), int(item[-1][1])) if len(item) > 4 else (i_hi, j_lo)
+                cand = {"i": ci, "j": cj, "sim": None, "source": "salad"}
             gate = {"verdict": "off", "rules": {}}
             if view is not None:
                 gate = gate_mod.gate_frame_pair(int(cand['i']), int(cand['j']), view,
@@ -2389,15 +2390,28 @@ class VGGT_Long:
                 ext_b = np.asarray(pred['extrinsic'])
                 if ext_b.ndim == 4:
                     ext_b = ext_b[0]
-                la = lay["bridge_a"][len(lay["bridge_a"]) // 2]
-                lb_ = lay["bridge_b"][len(lay["bridge_b"]) // 2]
-                gi = int(item[1][0] + len(lay["bridge_a"]) // 2)
-                gj = int(item[3][0] + len(lay["bridge_b"]) // 2)
+                # the edge joins the CANDIDATE frames the spatial gate judged (both
+                # inside their windows), not the window centres a clamp can move
+                gi, gj = int(cand["i"]), int(cand["j"])
+                la = lay["bridge_a"][gi - int(item[1][0])]
+                lb_ = lay["bridge_b"][gj - int(item[3][0])]
                 Ei = np.asarray(ext_b[la], np.float64)
                 Ej = np.asarray(ext_b[lb_], np.float64)
                 Z = np.linalg.inv(Ei) @ Ej
+                # σ_rot is the SAME measurement read in angle: the translation
+                # error bar over the lever arm of the surfaces that constrained
+                # the fit (measure_bridge.range_m). A starved edge has no
+                # correspondences, so its lever arm is the baseline the edge
+                # itself spans. No configured degree (USER 2026-09-25).
+                _rng = meas.get("range_m")
+                if not (_rng and np.isfinite(_rng) and _rng > 0):
+                    _rng = float(np.linalg.norm(Z[:3, 3]))
+                    _rng_src = "edge_baseline"
+                else:
+                    _rng_src = "correspondence_range"
                 kf_edge = {"i": gi, "j": gj, "Z": Z.tolist(), "sigma_m": float(v["sigma_m"]),
-                           "sigma_deg": float(cfg_req(gcfg, "loop_sigma_rot_deg", "graph")),
+                           "sigma_deg": self._stac_sigma_deg(float(v["sigma_m"]), _rng),
+                           "range_m": float(_rng), "range_source": _rng_src,
                            "bridge": li, "status": v["status"], "chunks": [ka, kb]}
                 self._stac_loop_edges_kf.append(kf_edge)
                 edge["keyframe_edge"] = kf_edge
@@ -2445,6 +2459,7 @@ class VGGT_Long:
                     kf = kf_by_bridge.get(int(e["bridge"]))
                     if kf is not None:
                         kf["sigma_m"] = spread
+                        kf["sigma_deg"] = self._stac_sigma_deg(spread, float(kf["range_m"]))
                         kf["sigma_source"] = "cross_bridge_spread"
                 else:
                     e.setdefault("sigma_source", "holdout_residual")
@@ -2680,6 +2695,63 @@ class VGGT_Long:
         if getattr(self, '_stac_chunk_cache_aligned', None):
             self._stac_chunk_cache_aligned.clear()
 
+    @staticmethod
+    def _stac_sigma_deg(sigma_m, range_m):
+        """A translation error bar on surfaces ``range_m`` away is this many
+        degrees of pose rotation — one measurement, two readings."""
+        return float(np.degrees(float(sigma_m) / max(float(range_m), 1e-6)))
+
+    def _stac_odometry_sigma(self, held, T0, owner):
+        """Per-link odometry σ (translation, rotation) MEASURED from the graph's
+        own held-out surface pairs, per chunk (USER 2026-09-25: "sin números
+        inventados"). A pair (f, f+d) owned by one chunk disagrees by h on the
+        surface it shares: that is the chain's error over d links, h/√d per
+        link; read over the range r of those surfaces from the cameras it is
+        (h/r)/√d of rotation. Median per chunk; a chunk with no pair of its own
+        gets the session median; a session with no pair at all cannot weigh
+        its chain and says so (None).
+
+        This replaces sigma_odo_intra_m (a constant 1 cm) composed with the
+        two-copy disagreement of the SHARED frames (a seam quantity, 6.6 cm on
+        bufferStop) that every frame received — the non-shared ones by
+        fallback — so an intra-chunk link claimed ~9 cm where the chain measures
+        1.3-1.7 cm, and eleven odometry-range bridges of 3-8 cm bent the chain
+        and worsened the held-out (bufferStop 2026-09-25, 1.72→2.53 cm)."""
+        per_chunk_t, per_chunk_r = {}, {}
+        all_t, all_r = [], []
+        for f_, g_, p, q in held:
+            k_f, k_g = int(owner[f_]), int(owner[g_])
+            if k_f != k_g:
+                continue                      # a seam pair: the seam residual carries it
+            d = max(int(g_) - int(f_), 1)
+            h = float(np.median(np.linalg.norm(np.asarray(p) - np.asarray(q), axis=1)))
+            r = float(np.median(np.linalg.norm(np.asarray(q) - T0[g_][:3, 3], axis=1)))
+            if not (np.isfinite(h) and np.isfinite(r) and r > 0):
+                continue
+            st = h / np.sqrt(d)
+            sr = np.degrees((h / r) / np.sqrt(d))
+            per_chunk_t.setdefault(k_f, []).append(st)
+            per_chunk_r.setdefault(k_f, []).append(sr)
+            all_t.append(st); all_r.append(sr)
+        if not all_t:
+            return None
+        med_t, med_r = float(np.median(all_t)), float(np.median(all_r))
+        rep = {"source": "held-out surface pairs (h/sqrt(d) per link; h/range for rotation)",
+               "session_median_m": med_t, "session_median_deg": med_r,
+               "n_pairs": int(len(all_t)), "chunks": {}}
+        sig_t, sig_r = {}, {}
+        for k in range(len(self.chunk_indices)):
+            if per_chunk_t.get(k):
+                sig_t[k] = float(np.median(per_chunk_t[k]))
+                sig_r[k] = float(np.median(per_chunk_r[k]))
+                rep["chunks"][str(k)] = {"sigma_m": sig_t[k], "sigma_deg": sig_r[k],
+                                         "n_pairs": len(per_chunk_t[k])}
+            else:
+                sig_t[k], sig_r[k] = med_t, med_r
+                rep["chunks"][str(k)] = {"sigma_m": med_t, "sigma_deg": med_r,
+                                         "n_pairs": 0, "fallback": "session median"}
+        return sig_t, sig_r, rep
+
     def _stac_holdout_pairs(self, gcfg):
         """Held-out surface pairs (frames f, f+d — d from graph.holdout_offsets,
         every graph.holdout_stride-th f) with exact-surface correspondences
@@ -2787,32 +2859,44 @@ class VGGT_Long:
                     if owner[g] == k:
                         T0[g] = self._stac_aligned_pose(k, local, ext[local])
             self._stac_drop_aligned_cache()
-            # 2) σ per frame from the two-copy uncertainty
-            unc = getattr(self, '_stac_uncert', {}) or {}
-            unc_med = float(getattr(self, '_stac_uncert_median', 0.0) or 0.0)
-
-            def sig_u(g):
-                v = unc.get(g)
-                return float(v["median_m"]) if v and v.get("median_m") is not None else unc_med
-
+            # 2) the held-out pairs FIRST: they are the judge of the graph AND
+            #    the measurement of how much the chain is worth per link
+            held = self._stac_holdout_pairs(gcfg)
+            odo = self._stac_odometry_sigma(held, T0, owner)
+            if odo is None:
+                report = {"verdict": "IDENTITY",
+                          "reason": "no held-out surface pair measures the chain — its "
+                                    "odometry cannot be weighed against the loop edges "
+                                    "(nothing is assumed in its place)",
+                          "chunk_indices": [list(ci) for ci in self.chunk_indices],
+                          "n_loop_edges": len(edges_kf)}
+                with open(pg_path, "w") as f:
+                    _json.dump(report, f, indent=1)
+                print(f"[pose-graph] IDENTITY: {report['reason']}")
+                return
+            sig_t, sig_r, odo_rep = odo
             seam_res = getattr(self, '_stac_seam_residuals', {}) or {}
-            s_intra = float(cfg_req(gcfg, "sigma_odo_intra_m", "graph"))
-            s_intra_deg = float(cfg_req(gcfg, "sigma_odo_intra_deg", "graph"))
+            for k_ in sorted(sig_t):
+                _ck = odo_rep['chunks'][str(k_)]
+                print(f"[pose-graph] odometry σ chunk {k_}: {sig_t[k_] * 100:.2f} cm / "
+                      f"{sig_r[k_]:.3f}° per link from {_ck['n_pairs']} held-out pair(s)"
+                      f"{' (session median)' if _ck.get('fallback') else ''}")
             pg = PoseGraph(T0, gcfg)
             for g in range(N - 1):
                 Z = se3_inv(T0[g]) @ T0[g + 1]
-                s_t = np.sqrt(s_intra ** 2 + sig_u(g) ** 2 + sig_u(g + 1) ** 2)
+                k_o = int(owner[g])
+                s_t, s_deg = float(sig_t[k_o]), float(sig_r[k_o])
                 if owner[g] != owner[g + 1]:
-                    s_t = np.sqrt(s_t ** 2 + float(seam_res.get(int(owner[g]), 0.0)) ** 2)
-                pg.add_relative(g, g + 1, Z, s_intra_deg, s_t, huber=False, tag="odo")
+                    # the link that crosses ownership carries the seam's own
+                    # measured residual on top of the chain's
+                    s_t = np.sqrt(s_t ** 2 + float(seam_res.get(k_o, 0.0)) ** 2)
+                pg.add_relative(g, g + 1, Z, s_deg, s_t, huber=False, tag="odo")
             loop_ids = []
             for e in edges_kf:
                 eid = pg.add_relative(int(e["i"]), int(e["j"]), np.asarray(e["Z"]),
                                       float(e["sigma_deg"]), float(e["sigma_m"]), huber=True,
                                       tag=f"loop:{e['bridge']}")
                 loop_ids.append((eid, e))
-            # held-out judge BEFORE
-            held = self._stac_holdout_pairs(gcfg)
             before_loop = pg.edge_residuals("loop")
             loop_before = float(np.sum([r["t_m"] for r in before_loop.values()])) if before_loop else 0.0
             # 3) ONE solve; the §4.7 drift budget δ(L) = max(floor, rate·L) per
@@ -2859,9 +2943,16 @@ class VGGT_Long:
             _hv_b, _hv_a = _held_vals(np.tile(np.eye(4), (N, 1, 1))), _held_vals(Xc)
             held_before = float(np.median(_hv_b)) if _hv_b else float("nan")
             held_after = float(np.median(_hv_a)) if _hv_a else float("nan")
+            # the judge reads only the pairs the correction can have changed: two frames
+            # that received the SAME rigid correction keep their disagreement exactly,
+            # and on pccr they were most pairs — the paired median sat at 0 while the
+            # held-out median went 4.46 → 4.63 cm, blind to damage on a subset
+            _moved = [k for k, (f_, g_, _p, _q) in enumerate(held)
+                      if np.abs(np.linalg.inv(Xc[f_]) @ Xc[g_] - np.eye(4)).max() > 1e-9]
             held_chg = heldout_change(
-                _hv_b, _hv_a,
+                [_hv_b[k] for k in _moved], [_hv_a[k] for k in _moved],
                 confidence=float(cfg_req(gcfg, "heldout_confidence", "graph")))
+            held_chg["n_pairs_changed"] = len(_moved)
             gain = (1.0 - loop_after / loop_before) if loop_before > 0 else 0.0
             min_gain = float(cfg_req(gcfg, "min_loop_gain", "graph"))
             n_active = sum(1 for eid, _ in loop_ids if pg._edges[eid]["active"])
@@ -2890,16 +2981,27 @@ class VGGT_Long:
             for ob in over_budget:
                 gate_warnings.append(f"loop {ob['i']}<->{ob['j']} closure {ob['correction_m'] * 100:.0f} cm "
                                      f"> drift budget {ob['budget_m'] * 100:.0f} cm")
+            converged = bool(pg.report.get("converged"))
+            if not converged:
+                gate_warnings.append(f"the graph did not converge in {pg.report['iterations']} "
+                                     f"iteration(s) (stop={pg.report['stop']}) — its iterate is "
+                                     f"not a solution")
+            # MEASURED refusals, whatever the gate mode (USER 2026-09-28: a precision
+            # system does not apply what it has not solved, nor a correction its own
+            # held-out measures as damage beyond the sample's noise)
+            refused = (not converged) or (not ok_held)
             if gate_mode == "veto":
                 verdict = "APPLY" if (n_active > 0 and not gate_warnings) else "IDENTITY"
             else:
-                verdict = "APPLY" if n_active > 0 else "IDENTITY"
+                verdict = "APPLY" if (n_active > 0 and not refused) else "IDENTITY"
             for w in gate_warnings:
                 print(f"[pose-graph] ⚠ gate: {w} — "
-                      f"{'declared, closure applied' if gate_mode == 'advisory' else 'veto'}")
+                      f"{'veto' if gate_mode != 'advisory' else ('NOT applied' if refused else 'declared, closure applied')}")
             xi = np.array([se3_log(M) for M in Xc])
             report = {"chunk_indices": [list(ci) for ci in self.chunk_indices],
                       "verdict": verdict, "gate_mode": gate_mode, "gate_warnings": gate_warnings,
+                      "converged": converged,
+                      "odometry_sigma": odo_rep,
                       "gates": {"loop_gain": {"value": gain, "min": min_gain, "passed": ok_gain,
                                               "loop_residual_before_m": loop_before,
                                               "loop_residual_after_m": loop_after},
@@ -3041,22 +3143,50 @@ class VGGT_Long:
         if self.loop_enable:
             print('Loop SIM(3) estimating...')
             half = int(self.config['Model']['loop_chunk_size'] / 2)
-            loop_results = process_loop_list(self.chunk_indices, self.loop_list, half_window=half)
             if _stac_loops:
-                # STAC: keep the (i, j) candidate attached to its windows and KEEP
-                # intra-chunk candidates (i, j in the same chunk) — they are pose
-                # edges for the keyframe graph even though they carry no scale row.
-                _paired = []
-                _seen = set()
-                for res, (i, j) in zip(loop_results, self.loop_list):
-                    key = (res[0], res[2], res[1], res[3])
-                    if key in _seen:
-                        continue
-                    _seen.add(key)
-                    _paired.append(tuple(res) + ((int(i), int(j)),))
+                # STAC (2026-09-28): each candidate frame's window is centred on it in
+                # the chunk that OWNS it (frame_owner: the nearest centre), the (i, j)
+                # candidate stays attached to ITS windows (the old zip against
+                # process_loop_list paired candidates with another pair's windows as
+                # soon as one pair was skipped), and a bridge is spent only on an
+                # INDEPENDENT measurement:
+                #   - two windows that share a keyframe are the same Omega evidence
+                #     fed twice — on pccr 16 of 19 accepted edges repeated 4-18
+                #     frames and bent the chain 30-85 cm against 1-4 cm/link;
+                #   - a candidate whose two windows both overlap the windows of an
+                #     already kept one (higher SALAD similarity: the list is sorted)
+                #     is the same revisit measured again, not a second loop.
+                from loop_utils.metric_lock import frame_owner
                 _keep_intra = bool((self._stac_loops_cfg() or {}).get('intra_chunk_loops', True))
-                loop_results = [r for r in _paired if _keep_intra or r[0] != r[2]]
+                _own = frame_owner(self.chunk_indices, len(self.img_list))
+                _ov = lambda r, q: max(r[0], q[0]) < min(r[1], q[1])     # noqa: E731
+                loop_results, _kept_w = [], []
+                _n_shared, _n_dup, _n_intra = 0, 0, 0
+                for (i, j) in self.loop_list:
+                    i, j = int(i), int(j)
+                    ka, kb = int(_own[i]), int(_own[j])
+                    if ka < 0 or kb < 0:
+                        continue
+                    ra = get_frame_range(self.chunk_indices[ka], i, half)
+                    rb = get_frame_range(self.chunk_indices[kb], j, half)
+                    if _ov(ra, rb):
+                        _n_shared += 1
+                        continue
+                    if any(_ov(ra, qa) and _ov(rb, qb) for qa, qb in _kept_w):
+                        _n_dup += 1
+                        continue
+                    if ka == kb and not _keep_intra:
+                        _n_intra += 1
+                        continue
+                    _kept_w.append((ra, rb))
+                    loop_results.append((ka, ra, kb, rb, (i, j)))
+                print(f"[loops] {len(loop_results)} of {len(self.loop_list)} candidate(s) get a "
+                      f"bridge: {_n_shared} rejected (their two windows share keyframes — the "
+                      f"same Omega evidence twice, not a loop), {_n_dup} merged into a kept "
+                      f"revisit, {_n_intra} intra-chunk off by config")
             else:
+                loop_results = process_loop_list(self.chunk_indices, self.loop_list,
+                                                 half_window=half)
                 loop_results = remove_duplicates(loop_results)
             print(loop_results)
             # return e.g. (31, (1574, 1594), 2, (129, 149))
@@ -3518,6 +3648,11 @@ class VGGT_Long:
         torch.cuda.empty_cache()
         print('Loading model...')
         self.model.load()
+        _rep = getattr(self.model, "load_report", None)
+        if _rep is not None:                       # claude_stac.txt §4-F3
+            import json as _json
+            with open(os.path.join(self.output_dir, "omega_load.json"), "w") as _f:
+                _json.dump(_rep, _f, indent=1)
 
         if self.config['Model']['calib']:
             calib_path = Path(self.img_dir).parent / 'calib.txt'
@@ -3579,10 +3714,18 @@ class VGGT_Long:
         # is chunk k's world-space 4x4 for local frame i, applied AFTER the chunk's
         # accumulated Sim3 (the corrections were fitted on the aligned chunks).
         _ecorr = getattr(self, '_stac_elastic_corr', None)
+        # STAC (2026-09-28, traceability): a frame shared by two chunks gets the pose
+        # and K of the chunk that OWNS it — the one that writes its points to the
+        # cloud (frame_owner) — not of whichever chunk was written last; the pose of
+        # record and the points of record come from the same Omega copy.
+        from loop_utils.metric_lock import frame_owner
+        _owner = frame_owner(self.chunk_indices, len(self.img_list))
 
         first_chunk_range, first_chunk_extrinsics = self.all_camera_poses[0]
         _, first_chunk_intrinsics = self.all_camera_intrinsics[0]
         for i, idx in enumerate(range(first_chunk_range[0], first_chunk_range[1])):
+            if _owner[idx] != 0:
+                continue
             c2w = first_chunk_extrinsics[i]
             if _ecorr is not None:
                 c2w = _ecorr[0][i] @ c2w
@@ -3601,6 +3744,8 @@ class VGGT_Long:
             S[:3, 3] = t
 
             for i, idx in enumerate(range(chunk_range[0], chunk_range[1])):
+                if _owner[idx] != chunk_idx:
+                    continue
                 c2w = chunk_extrinsics[i]  #
 
                 transformed_c2w = S @ c2w  # Be aware of the left multiplication!
@@ -3714,6 +3859,17 @@ def copy_file(src_path, dst_dir):
         print(f"Copy Error: {e}")
 
 if __name__ == '__main__':
+    # STAC (2026-09-28): identical keyframes → bit-identical Omega output. cuBLAS
+    # reads its workspace config when its handle is created (map_worker also puts it
+    # in the environment); warn_only keeps an op without a deterministic kernel from
+    # aborting the run — it is then NAMED in the log instead of silently varying.
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.manual_seed(42)
+    np.random.seed(42)
+    torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS", "8")))
 
     parser = argparse.ArgumentParser(description='VGGT-Long')
     parser.add_argument('--image_dir', type=str, required=True,
