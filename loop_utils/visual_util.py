@@ -84,6 +84,8 @@ def predictions_to_glb(
 
     # Get images from predictions
     images = predictions["images"]
+    if np.asarray(images).dtype == np.uint8:          # STAC 2026-10-05: chunks store uint8
+        images = np.asarray(images).astype(np.float32) / 255.0
     # Use extrinsic matrices instead of pred_extrinsic_list
     camera_matrices = predictions["extrinsic"]
 

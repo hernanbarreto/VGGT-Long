@@ -93,6 +93,21 @@ class LongSeqResult:
         self.all_camera_poses = []
         self.all_camera_intrinsics = [] 
 
+def _stac_images_u8(images):
+    """Chunk images as uint8 RGB whatever they were stored as: uint8 (since 2026-10-05)
+    or float32 in [0, 1] (older chunk files on disk — a resume reads both)."""
+    a = np.asarray(images)
+    if a.dtype == np.uint8:
+        return a
+    return np.clip(np.rint(a * 255.0), 0, 255).astype(np.uint8)
+
+
+def _stac_images_to_u8(predictions):
+    """In place: predictions['images'] → uint8 (a quarter of the float32 bytes)."""
+    if 'images' in predictions and predictions['images'] is not None:
+        predictions['images'] = _stac_images_u8(predictions['images'])
+
+
 class VGGT_Long:
     def __init__(self, image_dir, save_dir, config, selected_frames=None):
         self.config = config
@@ -347,6 +362,12 @@ class VGGT_Long:
             # chunks — and at 1080p they are a third of the 3.6 GB a 48-frame bridge weighs,
             # on disk and in loop_predict_list. The sky mask above already consumed them.
             predictions.pop('images', None)
+        else:
+            # STAC (USER 2026-10-05, pccr 2408 at 92 % of the /workspace quota): the chunk
+            # images are only COLOURS (the PLY writer, the sky mask above already ran) —
+            # float32 in [0, 1] is 4x the bytes of uint8 for the same 8-bit pixels the
+            # frames had on disk. 1.4 GB of a 3.9 GB chunk at 296 frames x 464x832.
+            _stac_images_to_u8(predictions)
 
         np.save(save_path, predictions)
 
@@ -895,7 +916,7 @@ class VGGT_Long:
         data — ONE ownership mask and ONE conf threshold shared by both writers, so
         the PLY and {K}_origins.npz stay 1:1 by construction."""
         points = chunk_data['world_points'].reshape(-1, 3)
-        colors = (chunk_data['images'].transpose(0, 2, 3, 1).reshape(-1, 3) * 255).astype(np.uint8)
+        colors = _stac_images_u8(chunk_data['images']).transpose(0, 2, 3, 1).reshape(-1, 3)
         confs = self._stac_owned_confs(chunk_data['world_points_conf'].reshape(-1), K)
         drops = getattr(self, '_stac_far_drop', None)
         if drops:
