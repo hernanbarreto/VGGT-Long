@@ -2995,10 +2995,19 @@ class VGGT_Long:
                 gate_warnings.append(f"the graph did not converge in {pg.report['iterations']} "
                                      f"iteration(s) (stop={pg.report['stop']}) — its iterate is "
                                      f"not a solution")
-            # MEASURED refusals, whatever the gate mode (USER 2026-09-28: a precision
-            # system does not apply what it has not solved, nor a correction its own
-            # held-out measures as damage beyond the sample's noise)
-            refused = (not converged) or (not ok_held)
+            # MEASURED refusal, whatever the gate mode: a solve that did not converge is
+            # not a solution (USER 2026-09-28). The held-out is MEASURED and declared but
+            # no longer refuses under advisory (USER 2026-10-05, "la 2"): its pairs are
+            # intra-chunk, a few frames apart — they measure LOCAL smoothness — while a
+            # loop closure corrects a GLOBAL drift of metres over a long walk, and
+            # spreading that correction can cost local smoothness: the judge vetoed the
+            # only correction that mattered (pccr 2408, 100 m). What protects against a
+            # false SALAD match is the bridge's own σ and the graph's edge vote; the
+            # verdict on the geometry is the user's eye on the cloud. (zaragoza
+            # 2026-10-05 also refused on 12.47 → 12.65 cm with a degenerate CI
+            # [-0.00, -0.00], n=118 — noted, to be looked at.) 2026-09-28 → 2026-10-05
+            # the held-out refused here too, against what gate_mode: advisory declares.
+            refused = (not converged) or (gate_mode == "veto" and not ok_held)
             if gate_mode == "veto":
                 verdict = "APPLY" if (n_active > 0 and not gate_warnings) else "IDENTITY"
             else:
