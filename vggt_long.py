@@ -3475,6 +3475,24 @@ class VGGT_Long:
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
             plt.close()
 
+        # STAC (USER 2026-10-05, the /workspace quota at 92 % on pccr 2408): the bridge
+        # files are consumed — every bridge is in memory (loop_predict_list) and the
+        # loop stage is through — and the aligned chunk copy is about to be written. The
+        # files only served a resume of the bridges; ~0.4 GB each, 79 on pccr 2408 (34 GB)
+        # sitting there while the aligned copy doubles the chunks. loop_closures.txt
+        # stays: a resume past this point re-measures the bridges.
+        try:
+            _freed = 0
+            for _fn in os.listdir(self.result_loop_dir):
+                _fp = os.path.join(self.result_loop_dir, _fn)
+                if os.path.isfile(_fp) and _fn.endswith('.npy'):
+                    _freed += os.path.getsize(_fp)
+                    os.remove(_fp)
+            if _freed:
+                print(f'[STAC storage] bridge files consumed — {_freed / 1e9:.1f} GB freed '
+                      f'before the aligned chunk copy (loop_closures.txt kept)')
+        except OSError as _e:
+            print(f'[STAC storage] WARN: bridge files not deleted ({_e})')
         print('Apply alignment')
         self.sim3_list = accumulate_sim3_transforms(self.sim3_list)
         # STAC: persist the accumulated per-chunk transforms — the post-hoc
