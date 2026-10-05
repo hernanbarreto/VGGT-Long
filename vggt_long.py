@@ -323,6 +323,12 @@ class VGGT_Long:
                 if is_loop and _n_on_disk != expected_frames:
                     raise ValueError(f"bridge on disk has {_n_on_disk} frames, this run "
                                      f"needs {expected_frames} (extra-frame policy changed)")
+                if not is_loop and _n_on_disk != expected_frames:
+                    # USER 2026-10-05 ("debe ser determinista"): a chunk file of ANOTHER chunk
+                    # plan (a different walk measured, a different chunk size) is not this
+                    # chunk — loading it would place 296 frames' geometry on 297 keyframes
+                    raise ValueError(f"chunk on disk has {_n_on_disk} frames, this run's "
+                                     f"chunk {chunk_idx} has {expected_frames} (another chunk plan)")
                 if is_loop:
                     predictions.pop('images', None)      # never read for a bridge (see below)
                 if not is_loop and range_2 is None:
