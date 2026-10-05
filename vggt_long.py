@@ -3639,11 +3639,18 @@ class VGGT_Long:
             print(f"[STAC] Loop detector pinned to {len(_kf)} frames (aligned with chunks)")
 
         # STAC patch (resume): only skip if VGGT-Long FULLY completed — camera_poses.txt
-        # AND at least one pcd/*_pcd.ply. A run that saved poses but no PLY (e.g. the old
-        # single-chunk bug) is NOT complete and must re-run (it'll reuse the cached chunks).
-        if (os.path.exists(os.path.join(self.output_dir, "camera_poses.txt"))
-                and glob.glob(os.path.join(self.pcd_dir, "*_pcd.ply"))):
-            print("[STAC resume] camera_poses.txt + pcd exist — VGGT-Long already complete, skipping")
+        # AND the chunk clouds: pcd/*_pcd.ply, or the chunk_*.ply the server's post-process
+        # copied next to this directory (the cascade cleanup deletes pcd/ at the end of EVERY
+        # completed run, so the pcd test alone never fired on a resume and Omega was inferred
+        # again over a finished session — zaragoza 2026-10-05, 18 min of GPU and new epoch-0
+        # geometry under a session already at epoch 2). A run that saved poses but no PLY
+        # (the old single-chunk bug) is still NOT complete and re-runs over its cached chunks.
+        _poses_done = os.path.exists(os.path.join(self.output_dir, "camera_poses.txt"))
+        _clouds_done = (glob.glob(os.path.join(self.pcd_dir, "*_pcd.ply"))
+                        or glob.glob(os.path.join(os.path.dirname(os.path.abspath(self.output_dir)),
+                                                  "chunk_*.ply")))
+        if _poses_done and _clouds_done:
+            print("[STAC resume] camera_poses.txt + chunk clouds exist — VGGT-Long already complete, skipping")
             return
 
         if self.loop_enable:
