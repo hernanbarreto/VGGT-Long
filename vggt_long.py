@@ -308,6 +308,8 @@ class VGGT_Long:
                 if is_loop and _n_on_disk != expected_frames:
                     raise ValueError(f"bridge on disk has {_n_on_disk} frames, this run "
                                      f"needs {expected_frames} (extra-frame policy changed)")
+                if is_loop:
+                    predictions.pop('images', None)      # never read for a bridge (see below)
                 if not is_loop and range_2 is None:
                     self.all_camera_poses.append((self.chunk_indices[chunk_idx], predictions['extrinsic']))
                     self.all_camera_intrinsics.append((self.chunk_indices[chunk_idx], predictions['intrinsic']))
@@ -338,6 +340,13 @@ class VGGT_Long:
         # builder's confidence filter removes them. Sky detection is MapAnything-side
         # (skyseg.onnx) — DA3 priors are NOT relied on for this.
         self._stac_mask_sky(predictions, chunk_image_paths)
+
+        if is_loop:
+            # STAC (USER 2026-10-05, zaragoza): a bridge's images are read by nothing — the
+            # measurements use world_points / conf / extrinsic, the PLY colours come from the
+            # chunks — and at 1080p they are a third of the 3.6 GB a 48-frame bridge weighs,
+            # on disk and in loop_predict_list. The sky mask above already consumed them.
+            predictions.pop('images', None)
 
         np.save(save_path, predictions)
 
