@@ -711,9 +711,10 @@ def elastic_corrections(chunk_indices, k, seam_fits, suspect=None, trust=None):
     put, B = I). Each chunk's correction field is therefore identity at its own
     centre and grows toward its edges: interiors are never torn, edges bend onto
     the consensus, and the fused cloud is continuous through the frame-ownership
-    switch in the middle of every overlap. (With the pipeline's 50% overlap each
-    frame belongs to at most two chunks, so the two seams of a chunk touch
-    disjoint frame ranges.)
+    switch in the middle of every overlap. (With the pipeline's 50% overlap — and
+    on any explicit layout, by validate_chunk_ranges rule 5 — each frame belongs
+    to at most two chunks, so the two seams of a chunk touch disjoint frame
+    ranges.)
 
     A shared frame whose fit starved inherits the nearest fitted frame of the same
     seam (the seam is already rigid-glued, so per-frame residuals are small and
@@ -1206,6 +1207,150 @@ def frame_owner(chunk_indices, n_frames):
                     best, bd = k, d
         owner[g] = best
     return owner
+
+
+# ── CHUNK LAYOUT: the vendor's uniform ranges or an EXPLICIT list ──
+# USER 2026-10-06: the chunked Omega path runs the co-visibility planner's
+# layout (server/reconstruction/chunk_covis.py — variable-size chunks, each seam
+# its own overlap) handed over as Model.chunk_ranges. Every stage of the fork
+# reads the real per-chunk (start, end) of chunk_indices and the real per-seam
+# overlap of seam_overlap; the uniform construction below stays the
+# layout when no explicit list is given (bit-identical to the vendor's).
+
+# Fewest frames two consecutive chunks may share. NOT a tuning knob: it is the
+# floor of the seam's own fallback fit — when the exact seam starves, the seam is
+# glued by weighted_align_point_maps (sim3utils.py), which wants
+# align_min_inlier_frames (default 8) mutually consistent overlap frames and only
+# warns below it — so a seam narrower than this could not be measured the way
+# every other seam is. The co-visibility planner's seams are whole blocks of
+# >= MIN_CHUNK_FRAMES // 2 = 12 frames (server/reconstruction/chunk_covis.py).
+MIN_SEAM_FRAMES = 8
+
+
+class ChunkRangesError(ValueError):
+    """A Model.chunk_ranges the fork cannot run. The message names the problem."""
+
+
+def uniform_chunk_ranges(n_frames, chunk_size, overlap):
+    """The vendor's uniform layout, EXACTLY as VGGT-Long's process_long_sequence
+    built it: step = chunk_size - overlap, ceil((N - overlap) / step) chunks, the
+    last one clipped to N; one chunk [(0, N)] when N <= chunk_size."""
+    n_frames, chunk_size, overlap = int(n_frames), int(chunk_size), int(overlap)
+    if overlap >= chunk_size:
+        raise ValueError(f"[SETTING ERROR] Overlap ({overlap}) must be less than chunk "
+                         f"size ({chunk_size})")
+    if n_frames <= chunk_size:
+        return [(0, n_frames)]
+    step = chunk_size - overlap
+    num_chunks = (n_frames - overlap + step - 1) // step
+    return [(i * step, min(i * step + chunk_size, n_frames)) for i in range(num_chunks)]
+
+
+def _as_index(v):
+    """An integer keyframe index (int or numpy integer — never bool, never float)."""
+    if isinstance(v, (bool, np.bool_)):
+        return None
+    if isinstance(v, (int, np.integer)):
+        return int(v)
+    return None
+
+
+def validate_chunk_ranges(ranges, n_frames=None, min_seam=MIN_SEAM_FRAMES):
+    """Explicit chunk layout → list of (start, end) int tuples, or ChunkRangesError
+    naming what is wrong. Ranges are [start, end) keyframe indices AFTER any
+    keyframe filter and frame stride (the fork's img_list).
+
+    Rules (each one an assumption some fork stage is built on):
+      1. a non-empty list of [start, end] integer pairs, start >= 0, start < end;
+      2. the first chunk starts at 0 and the last ends at n_frames (a frame no
+         chunk covers has no pose: save_camera_poses fails on it) — skipped when
+         n_frames is None (the early structural check, before the frame list
+         exists);
+      3. sorted: starts AND ends strictly increasing (the seams pair chunk k with
+         k+1; find_chunk_index bisects on the starts);
+      4. consecutive chunks share >= min_seam frames (MIN_SEAM_FRAMES): every seam
+         is measured on its shared frames (exact seam, metric-lock seam ratio,
+         elastic fits, two-copy uncertainty);
+      5. no frame in three chunks (end of k <= start of k+2): the elastic
+         corrections, the two-copy blend, the backfill and the uncertainty
+         pair chunk k with k-1 and k+1 only, on disjoint frame ranges;
+      6. frame ownership (frame_owner) steps 0 or +1 from chunk 0 to the last
+         chunk, so every chunk writes at least one frame and the pose graph's
+         ownership-crossing link carries THAT seam's residual. Rules 1-5 imply it
+         (no layout passing them failed it: every 3-chunk layout up to 63 frames,
+         200 000 random 3-6-chunk ones); it is checked anyway because the pose
+         graph and the writers stand on it."""
+    if isinstance(ranges, np.ndarray):
+        ranges = ranges.tolist()
+    if not isinstance(ranges, (list, tuple)) or len(ranges) == 0:
+        raise ChunkRangesError(f"Model.chunk_ranges must be a non-empty list of [start, end] "
+                               f"pairs, got {ranges!r}")
+    out = []
+    for k, pair in enumerate(ranges):
+        if isinstance(pair, np.ndarray):
+            pair = pair.tolist()
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            raise ChunkRangesError(f"Model.chunk_ranges: chunk {k} is {pair!r}, not a "
+                                   f"[start, end] pair")
+        s, e = _as_index(pair[0]), _as_index(pair[1])
+        if s is None or e is None:
+            raise ChunkRangesError(f"Model.chunk_ranges: chunk {k} is {list(pair)!r} — start "
+                                   f"and end must be integer keyframe indices")
+        if s < 0 or e <= s:
+            raise ChunkRangesError(f"Model.chunk_ranges: chunk {k} [{s}, {e}) is empty or "
+                                   f"negative")
+        out.append((s, e))
+    if out[0][0] != 0:
+        raise ChunkRangesError(f"Model.chunk_ranges: the first chunk starts at {out[0][0]}, "
+                               f"it must start at 0 (frames 0..{out[0][0] - 1} would have no "
+                               f"chunk)")
+    n = out[-1][1] if n_frames is None else int(n_frames)
+    if n_frames is not None and out[-1][1] != n:
+        raise ChunkRangesError(f"Model.chunk_ranges: the last chunk ends at {out[-1][1]} but "
+                               f"this run has {n} frames after the keyframe filter and the "
+                               f"frame stride — the ranges were planned for another frame "
+                               f"list")
+    for k in range(len(out) - 1):
+        (s0, e0), (s1, e1) = out[k], out[k + 1]
+        if not (s1 > s0 and e1 > e0):
+            raise ChunkRangesError(f"Model.chunk_ranges: not sorted — chunk {k + 1} [{s1}, "
+                                   f"{e1}) does not start AND end after chunk {k} [{s0}, {e0})")
+        ov = e0 - s1
+        if ov < int(min_seam):
+            what = (f"a gap of {-ov} frame(s) [{e0}, {s1})" if ov < 0
+                    else f"{ov} shared frame(s) [{s1}, {e0})")
+            raise ChunkRangesError(f"Model.chunk_ranges: seam {k}->{k + 1} has {what}, at "
+                                   f"least {int(min_seam)} shared frames are needed "
+                                   f"(MIN_SEAM_FRAMES)")
+    for k in range(len(out) - 2):
+        e0, s2 = out[k][1], out[k + 2][0]
+        if e0 > s2:
+            raise ChunkRangesError(f"Model.chunk_ranges: frames [{s2}, {e0}) are in three "
+                                   f"chunks ({k}, {k + 1}, {k + 2}) — a frame may be in two "
+                                   f"chunks at most (end of chunk {k} <= start of chunk "
+                                   f"{k + 2})")
+    owner = frame_owner(out, n)
+    if owner[0] != 0 or owner[-1] != len(out) - 1:
+        raise ChunkRangesError(f"Model.chunk_ranges: frame ownership runs from chunk "
+                               f"{int(owner[0])} to {int(owner[-1])}, it must run from 0 to "
+                               f"{len(out) - 1}")
+    steps = np.diff(owner.astype(np.int64))
+    bad = np.flatnonzero((steps < 0) | (steps > 1))
+    if bad.size:
+        g = int(bad[0]) + 1
+        raise ChunkRangesError(f"Model.chunk_ranges: frame ownership jumps from chunk "
+                               f"{int(owner[g - 1])} to chunk {int(owner[g])} at frame {g} — "
+                               f"chunk(s) in between own no frame (chunk centres too close "
+                               f"for their lengths)")
+    return out
+
+
+def seam_overlap(chunk_indices, k):
+    """Frames shared by chunks k and k+1 = end of chunk k - start of chunk k+1: the
+    vendor's `overlap` on a uniform layout (every seam), this seam's own count on
+    an explicit one. Chunk k's last seam_overlap frames are chunk k+1's first ones —
+    the seam fits slice [-ov:] / [:ov] with it."""
+    return int(chunk_indices[k][1]) - int(chunk_indices[k + 1][0])
 
 
 # ── INTRA-CHUNK per-frame consensus (bounded fields, anchored boundaries) ──

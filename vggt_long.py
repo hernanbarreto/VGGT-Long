@@ -117,8 +117,21 @@ class VGGT_Long:
         self.config = config
         self.selected_frames = selected_frames  # STAC patch: optional keyframe subset
 
-        self.chunk_size = self.config['Model']['chunk_size']
-        self.overlap = self.config['Model']['overlap']
+        # STAC (USER 2026-10-06): an EXPLICIT chunk layout — Model.chunk_ranges, the
+        # co-visibility planner's variable-size [start, end) ranges — replaces the
+        # chunk_size/overlap construction; without it the vendor's uniform layout is
+        # built exactly as before. Its structure is checked HERE, before the model
+        # loads; its end against the frame list once the list exists
+        # (process_long_sequence).
+        self.chunk_ranges_cfg = self.config['Model'].get('chunk_ranges')
+        if self.chunk_ranges_cfg is None:
+            self.chunk_size = self.config['Model']['chunk_size']
+            self.overlap = self.config['Model']['overlap']
+        else:
+            from loop_utils.metric_lock import validate_chunk_ranges
+            validate_chunk_ranges(self.chunk_ranges_cfg)
+            self.chunk_size = self.config['Model'].get('chunk_size')
+            self.overlap = self.config['Model'].get('overlap')
         self.seed = 42
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
@@ -287,6 +300,29 @@ class VGGT_Long:
         predictions['world_points_conf'] = wpc
         print(f"[STAC sky] masked sky on {n}/{S} chunk frames")
 
+    def _stac_layout_stamp(self):
+        """This run's chunk layout as the products stamp it. Written only on an
+        EXPLICIT layout (Model.chunk_ranges): there two plans can give chunks of
+        the same length at different places, which the frame-count checks cannot
+        see; a uniform run writes its products exactly as before."""
+        if getattr(self, 'chunk_ranges_cfg', None) is None:
+            return None
+        return [[int(a), int(b)] for a, b in self.chunk_indices]
+
+    def _stac_check_layout_stamp(self, doc, what):
+        """A product stamped with ANOTHER chunk layout stops the run (USER 2026-10-05:
+        the outputs of two chunk plans never live side by side). Unstamped
+        products (uniform runs) pass — the frame-count checks still hold for them."""
+        prev = doc.get("chunk_indices") if isinstance(doc, dict) else None
+        if prev is None:
+            return
+        now = [[int(a), int(b)] for a, b in self.chunk_indices]
+        if [[int(a), int(b)] for a, b in prev] != now:
+            raise _StacPlanMismatch(
+                f"{what} was written for the chunk layout {prev}, this run's layout is "
+                f"{now} — the outputs on disk are of ANOTHER chunk plan; re-run with "
+                f"replace, or let the map worker wipe them")
+
     def process_single_chunk(self, range_1, chunk_idx=None, range_2=None, is_loop=False,
                              extra_1=None, extra_2=None):
         start_idx, end_idx = range_1
@@ -337,6 +373,16 @@ class VGGT_Long:
                         f"{save_path} has {_n_on_disk} frames, this run's chunk {chunk_idx} "
                         f"has {expected_frames} — the outputs on disk are of ANOTHER chunk "
                         f"plan; re-run with replace, or let the map worker wipe them")
+                if not is_loop and predictions.get('_stac_range') is not None:
+                    # an EXPLICIT-layout chunk carries its [start, end): same length is
+                    # not the same chunk when the plan places chunks freely
+                    _rng = [int(x) for x in predictions['_stac_range']]
+                    if _rng != [int(range_1[0]), int(range_1[1])]:
+                        raise _StacPlanMismatch(
+                            f"{save_path} is frames {_rng}, this run's chunk {chunk_idx} is "
+                            f"{[int(range_1[0]), int(range_1[1])]} — the outputs on disk are "
+                            f"of ANOTHER chunk plan; re-run with replace, or let the map "
+                            f"worker wipe them")
                 if is_loop:
                     predictions.pop('images', None)      # never read for a bridge (see below)
                 if not is_loop and range_2 is None:
@@ -384,6 +430,8 @@ class VGGT_Long:
             # float32 in [0, 1] is 4x the bytes of uint8 for the same 8-bit pixels the
             # frames had on disk. 1.4 GB of a 3.9 GB chunk at 296 frames x 464x832.
             _stac_images_to_u8(predictions)
+            if self._stac_layout_stamp() is not None:
+                predictions['_stac_range'] = [int(range_1[0]), int(range_1[1])]
 
         np.save(save_path, predictions)
 
@@ -413,6 +461,13 @@ class VGGT_Long:
         already = set()
         _prev_path = os.path.join(self.output_dir, "metric_lock.json")
         if os.path.exists(_prev_path):
+            # a lock of ANOTHER chunk layout must not tell this one which chunks are
+            # already scaled (explicit layouts stamp it; see _stac_layout_stamp)
+            try:
+                _prev_doc = _json.load(open(_prev_path))
+            except Exception:
+                _prev_doc = None
+            self._stac_check_layout_stamp(_prev_doc, _prev_path)
             try:
                 already = {int(k) for k, v in _json.load(open(_prev_path))
                            .get("chunks", {}).items() if v.get("s") is not None
@@ -423,6 +478,8 @@ class VGGT_Long:
                 already = set()
 
         report = {"chunks": {}, "loops": {}, "seams": {}}
+        if self._stac_layout_stamp() is not None:
+            report["chunk_indices"] = self._stac_layout_stamp()
         scales = {}
         n_anchor_map = {}
         seam_rel = {}
@@ -691,7 +748,12 @@ class VGGT_Long:
         _health_path = os.path.join(self.output_dir, "chunk_health.json")
         if os.path.exists(_health_path):
             try:
-                _prev_health = _json.load(open(_health_path))
+                _prev_health_doc = _json.load(open(_health_path))
+            except Exception:
+                _prev_health_doc = None
+            self._stac_check_layout_stamp(_prev_health_doc, _health_path)
+            try:
+                _prev_health = _prev_health_doc
                 for k_str, rs in (_prev_health.get("sick") or {}).items():
                     if int(k_str) not in tri_map:
                         sick.setdefault(int(k_str), rs)
@@ -714,8 +776,12 @@ class VGGT_Long:
             _tt = ", ".join(f"{k}:{v:.2f}" for k, v in sorted(self._stac_chunk_trust.items()))
             print(f"[health] chunk trust (measured, 0.5 = as good as the session's "
                   f"median): {_tt}")
+        _health_doc = {}
+        if self._stac_layout_stamp() is not None:
+            _health_doc["chunk_indices"] = self._stac_layout_stamp()
         with open(_health_path, "w") as f:
-            _json.dump({"tri_angle": {str(k): tri_map.get(k)
+            _json.dump({**_health_doc,
+                        "tri_angle": {str(k): tri_map.get(k)
                                       for k in range(len(self.chunk_indices))},
                         "anchor_iqr_over_median": {str(k): anchor_iqr.get(k)
                                                    for k in range(len(self.chunk_indices))},
@@ -1891,10 +1957,8 @@ class VGGT_Long:
         for chunk_idx in range(len(self.chunk_indices) - 1):
             d1 = self._stac_load_chunk(chunk_idx)
             d2 = self._stac_load_chunk(chunk_idx + 1)
-            pm1 = d1['world_points'][-self.overlap:]
-            pm2 = d2['world_points'][:self.overlap]
-            c1 = d1['world_points_conf'][-self.overlap:]
-            c2 = d2['world_points_conf'][:self.overlap]
+            # THIS seam's shared frames (its own count on an explicit layout)
+            _, pm1, pm2, c1, c2 = self._stac_seam_copies(chunk_idx, d1, d2)
             _p1 = np.asarray(pm1, np.float64).reshape(-1, 3)
             _p2 = np.asarray(pm2, np.float64).reshape(-1, 3)
             _ok = (np.asarray(c1).reshape(-1) > 1e-5) & (np.asarray(c2).reshape(-1) > 1e-5)
@@ -2319,6 +2383,8 @@ class VGGT_Long:
         s_frames = getattr(self, '_stac_drift_frames', None)
         rep = {"version": 1,
                "n_chunks": n_chunks,
+               **({"chunk_indices": self._stac_layout_stamp()}
+                  if self._stac_layout_stamp() is not None else {}),
                "sigma_seam": inputs["sigma_seam"], "sigma_anchor": inputs["sigma_anchor"],
                "sigma_loop": sigma_loop,
                "s_v1_anchors_seams": {str(k): float(v) for k, v in s_v1.items()},
@@ -2622,15 +2688,27 @@ class VGGT_Long:
         edir = os.path.join(self.output_dir, "_tmp_results_ensemble")
         os.makedirs(edir, exist_ok=True)
         N = len(self.img_list)
-        step = self.chunk_size - self.overlap
         ranges = []
-        start = off
-        while start + 2 < N:
-            end = min(start + self.chunk_size, N)
-            ranges.append((start, end))
-            if end >= N:
-                break
-            start += step
+        if getattr(self, 'chunk_ranges_cfg', None) is not None:
+            # explicit layout: THIS run's chunks shifted by `off` frames (each keeps its
+            # own length, clipped to N) — the uniform formula below would rebuild a
+            # layout this run never ran
+            for a, b in self.chunk_indices:
+                start, end = int(a) + off, min(int(b) + off, N)
+                if start + 2 >= N:
+                    break
+                ranges.append((start, end))
+                if end >= N:
+                    break
+        else:
+            step = self.chunk_size - self.overlap
+            start = off
+            while start + 2 < N:
+                end = min(start + self.chunk_size, N)
+                ranges.append((start, end))
+                if end >= N:
+                    break
+                start += step
         self._stac_ensemble_ranges = ranges
         for e_idx, (a, b) in enumerate(ranges):
             path = os.path.join(edir, f"chunk_{e_idx}.npy")
@@ -3215,20 +3293,46 @@ class VGGT_Long:
         finally:
             self._stac_drop_chunk_cache()
 
-    def process_long_sequence(self):
-        if self.overlap >= self.chunk_size:
-            raise ValueError(f"[SETTING ERROR] Overlap ({self.overlap}) must be less than chunk size ({self.chunk_size})")
-        if len(self.img_list) <= self.chunk_size:
-            num_chunks = 1
-            self.chunk_indices = [(0, len(self.img_list))]
+    def _stac_layout_text(self):
+        """One line for the log: chunk count, lengths and seam overlaps."""
+        from loop_utils.metric_lock import seam_overlap
+        lens = [int(e - s) for s, e in self.chunk_indices]
+        seams = [seam_overlap(self.chunk_indices, k) for k in range(len(lens) - 1)]
+        txt = f"{len(lens)} chunk(s), lengths {min(lens)}-{max(lens)}"
+        if seams:
+            txt += f", seams {min(seams)}-{max(seams)} shared frames"
+        return txt
+
+    def _stac_build_layout(self):
+        """self.chunk_indices for this run: the EXPLICIT Model.chunk_ranges when given
+        (USER 2026-10-06 — the ranges were planned on the keyframe list; N here is
+        that list after the keyframe filter and the frame stride, and a plan for
+        another list fails loudly), else the vendor's uniform chunk_size/overlap
+        layout, built exactly as before. Returns the chunk count."""
+        from loop_utils.metric_lock import uniform_chunk_ranges, validate_chunk_ranges
+        if getattr(self, 'chunk_ranges_cfg', None) is not None:
+            self.chunk_indices = validate_chunk_ranges(self.chunk_ranges_cfg,
+                                                       len(self.img_list))
+            print(f"[STAC layout] explicit Model.chunk_ranges over {len(self.img_list)} "
+                  f"frames: {self._stac_layout_text()} — "
+                  + " ".join(f"[{s_},{e_})" for s_, e_ in self.chunk_indices))
         else:
-            step = self.chunk_size - self.overlap
-            num_chunks = (len(self.img_list) - self.overlap + step - 1) // step
-            self.chunk_indices = []
-            for i in range(num_chunks):
-                start_idx = i * step
-                end_idx = min(start_idx + self.chunk_size, len(self.img_list))
-                self.chunk_indices.append((start_idx, end_idx))
+            self.chunk_indices = uniform_chunk_ranges(len(self.img_list), self.chunk_size,
+                                                      self.overlap)
+        return len(self.chunk_indices)
+
+    def _stac_seam_copies(self, k, d1, d2):
+        """Both copies of the frames seam k shares — chunk k's LAST ov frames and chunk
+        k+1's FIRST ov frames, ov = seam_overlap: the vendor's `overlap` on a uniform
+        layout, THIS seam's own count on an explicit one. Returns (ov, world points of
+        chunk k, of chunk k+1, conf of chunk k, of chunk k+1)."""
+        from loop_utils.metric_lock import seam_overlap
+        ov = seam_overlap(self.chunk_indices, k)
+        return (ov, d1['world_points'][-ov:], d2['world_points'][:ov],
+                d1['world_points_conf'][-ov:], d2['world_points_conf'][:ov])
+
+    def process_long_sequence(self):
+        num_chunks = self._stac_build_layout()
 
         for chunk_idx in range(len(self.chunk_indices)):
             print(f'[Progress]: {chunk_idx}/{len(self.chunk_indices)-1}')
@@ -3302,8 +3406,12 @@ class VGGT_Long:
                     single_chunk_predictions = self.process_single_chunk(item[1], range_2=item[3], is_loop=True)
                     self.loop_predict_list.append((item, single_chunk_predictions))
                     print(item)
-        print(
-            f"Processing {len(self.img_list)} images in {num_chunks} chunks of size {self.chunk_size} with {self.overlap} overlap")
+        if getattr(self, 'chunk_ranges_cfg', None) is not None:
+            print(f"Processing {len(self.img_list)} images in {self._stac_layout_text()} "
+                  f"(explicit ranges)")
+        else:
+            print(
+                f"Processing {len(self.img_list)} images in {num_chunks} chunks of size {self.chunk_size} with {self.overlap} overlap")
 
         del self.model # Save GPU Memory
         torch.cuda.empty_cache()
@@ -3333,15 +3441,15 @@ class VGGT_Long:
             chunk_data1 = np.load(os.path.join(self.result_unaligned_dir, f"chunk_{chunk_idx}.npy"), allow_pickle=True).item()
             chunk_data2 = np.load(os.path.join(self.result_unaligned_dir, f"chunk_{chunk_idx+1}.npy"), allow_pickle=True).item()
             
-            point_map1 = chunk_data1['world_points'][-self.overlap:]
-            point_map2 = chunk_data2['world_points'][:self.overlap]
-            conf1 = chunk_data1['world_points_conf'][-self.overlap:]
-            conf2 = chunk_data2['world_points_conf'][:self.overlap]
+            # STAC: the frames THIS seam shares — `overlap` on the uniform layout, the
+            # seam's own count on an explicit (co-visibility planned) one
+            ov, point_map1, point_map2, conf1, conf2 = self._stac_seam_copies(
+                chunk_idx, chunk_data1, chunk_data2)
 
             mask = None
             if chunk_data1["mask"] is not None:
-                mask1 = chunk_data1["mask"][-self.overlap:]
-                mask2 = chunk_data2["mask"][:self.overlap]
+                mask1 = chunk_data1["mask"][-ov:]
+                mask2 = chunk_data2["mask"][:ov]
                 mask = mask1.squeeze() & mask2.squeeze()
 
             # STAC: EXACT seam alignment. The overlap maps are the SAME frames pixel
