@@ -18,8 +18,19 @@ import numpy as np
 from loop_utils.lie import se3_inv, se3_log
 
 
+def min_judge_closures(confidence: float) -> int:
+    """The fewest held-out closures that can testify (USER 2026-10-06): if a correction did
+    nothing real, each held-out closure improves or worsens like a coin; all n improving by chance
+    has probability 0.5**n, which must fall below 1 - confidence — n = ceil(log(1-c)/log(0.5)).
+    At the declared 0.95: 5. Fewer cannot tell a correction from luck (pccr 2026-08-31: ONE
+    held-out closure, 34.5 → 34.5 cm, read as 'improves')."""
+    import math
+    c = float(confidence)
+    return int(math.ceil(math.log(1.0 - c) / math.log(0.5) - 1e-12))
+
+
 def split_loop_edges(edges: Sequence[dict], owner: Sequence[int], frac: float,
-                     min_edges: int) -> Tuple[List[dict], List[dict], dict]:
+                     min_edges: int, min_judge: int = 1) -> Tuple[List[dict], List[dict], dict]:
     """(fit, judge, report): every k-th edge (k = round(1/frac)) of the edges sorted by
     chunk pair, then keyframes, is held out — and every chunk pair keeps at least one
     FIT edge, so the judge measures both direct and transitive consistency. Fewer than
@@ -40,7 +51,11 @@ def split_loop_edges(edges: Sequence[dict], owner: Sequence[int], frac: float,
 
     order = sorted(range(n), key=lambda k_: (pair(edges[k_]), int(edges[k_]["i"]),
                                              int(edges[k_]["j"]), int(edges[k_].get("bridge", k_))))
+    # hold out frac of the closures — and at least min_judge when the edges allow it (every
+    # k-th, so k never exceeds n // min_judge; the fit keeps at least every other edge)
     k = max(2, int(round(1.0 / float(frac))))
+    if min_judge > 1 and n // int(min_judge) >= 2:
+        k = max(2, min(k, n // int(min_judge)))
     judge_idx = {order[pos] for pos in range(n) if pos % k == k - 1}
     by_pair: Dict[Tuple[int, int], List[int]] = {}
     for idx in order:

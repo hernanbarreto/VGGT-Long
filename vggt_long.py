@@ -3022,9 +3022,12 @@ class VGGT_Long:
             # THE JUDGE (USER 2026-10-06): a share of the closures themselves is held out of
             # the solve and measured before/after — loop_utils/loop_judge.py
             from loop_utils.loop_judge import loop_residuals_m, split_loop_edges
+            from loop_utils.loop_judge import min_judge_closures
+            _min_judge = min_judge_closures(float(cfg_req(gcfg, "heldout_confidence", "graph")))
             fit_edges, judge_edges, split_rep = split_loop_edges(
                 edges_kf, owner, float(cfg_req(gcfg, "loop_holdout_frac", "graph")),
-                int(cfg_req(gcfg, "loop_holdout_min_edges", "graph")))
+                int(cfg_req(gcfg, "loop_holdout_min_edges", "graph")), min_judge=_min_judge)
+            split_rep["min_judge"] = _min_judge
             print(f"[pose-graph] loop edges: {split_rep['n_fit']} fitted, {split_rep['n_judge']} "
                   f"held out as the judge"
                   + (f" — {split_rep['reason']}" if split_rep.get("reason")
@@ -3145,13 +3148,19 @@ class VGGT_Long:
             # unjudged is how bridges disagreeing by metres would bend the chain (zaragoza).
             # With too few closures to hold any out, the local held-out pairs judge as on
             # 2026-09-28 (declared). The local pairs are always measured and declared.
-            if judge_edges:
-                judge_rule = "held-out loop closures must improve beyond their own noise"
+            # USER 2026-10-06: the judge needs at least min_judge_closures(confidence) held-out
+            # closures to testify (5 at 0.95); with fewer the correction CANNOT be judged and is
+            # NOT applied — no fallback to the local pairs, which measure smoothness, not drift.
+            if len(judge_edges) >= _min_judge:
+                judge_rule = (f"held-out loop closures ({len(judge_edges)} >= {_min_judge}) must "
+                              f"improve beyond their own noise")
                 refused = (not converged) or (not ok_judge)
             else:
-                judge_rule = ("no loop closure could be held out — the local held-out surface "
-                              "pairs judge (the 2026-09-28 rule)")
-                refused = (not converged) or (not ok_held)
+                judge_rule = (f"only {len(judge_edges)} held-out loop closure(s) — {_min_judge} are "
+                              f"needed to tell a correction from luck at "
+                              f"{float(cfg_req(gcfg, 'heldout_confidence', 'graph')):.2f}: NOT applied")
+                refused = True
+                gate_warnings.append(judge_rule)
             if gate_mode == "veto":
                 refused = refused or (not ok_held)
             if gate_mode == "veto":
