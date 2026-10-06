@@ -2927,7 +2927,11 @@ class VGGT_Long:
                 print(f"[pose-graph] odometry σ chunk {k_}: {sig_t[k_] * 100:.2f} cm / "
                       f"{sig_r[k_]:.3f}° per link from {_ck['n_pairs']} held-out pair(s)"
                       f"{' (session median)' if _ck.get('fallback') else ''}")
-            pg = PoseGraph(T0, gcfg)
+            # the solver is torch: on the card when there is one (USER 2026-10-06 — on CPU
+            # a dense 12k x 12k Cholesky per LM iteration took minutes, up to 1000 of them)
+            _dev = "cuda" if torch.cuda.is_available() else "cpu"
+            print(f"[pose-graph] solver on {_dev}: {N} keyframes, {6 * N} unknowns")
+            pg = PoseGraph(T0, gcfg, device=_dev)
             for g in range(N - 1):
                 Z = se3_inv(T0[g]) @ T0[g + 1]
                 k_o = int(owner[g])
@@ -2937,8 +2941,18 @@ class VGGT_Long:
                     # measured residual on top of the chain's
                     s_t = np.sqrt(s_t ** 2 + float(seam_res.get(k_o, 0.0)) ** 2)
                 pg.add_relative(g, g + 1, Z, s_deg, s_t, huber=False, tag="odo")
+            # THE JUDGE (USER 2026-10-06): a share of the closures themselves is held out of
+            # the solve and measured before/after — loop_utils/loop_judge.py
+            from loop_utils.loop_judge import loop_residuals_m, split_loop_edges
+            fit_edges, judge_edges, split_rep = split_loop_edges(
+                edges_kf, owner, float(cfg_req(gcfg, "loop_holdout_frac", "graph")),
+                int(cfg_req(gcfg, "loop_holdout_min_edges", "graph")))
+            print(f"[pose-graph] loop edges: {split_rep['n_fit']} fitted, {split_rep['n_judge']} "
+                  f"held out as the judge"
+                  + (f" — {split_rep['reason']}" if split_rep.get("reason")
+                     else f" (every {split_rep['every_kth']}th by chunk pair; every pair keeps a fitted edge)"))
             loop_ids = []
-            for e in edges_kf:
+            for e in fit_edges:
                 eid = pg.add_relative(int(e["i"]), int(e["j"]), np.asarray(e["Z"]),
                                       float(e["sigma_deg"]), float(e["sigma_m"]), huber=True,
                                       tag=f"loop:{e['bridge']}")
@@ -2999,6 +3013,13 @@ class VGGT_Long:
                 [_hv_b[k] for k in _moved], [_hv_a[k] for k in _moved],
                 confidence=float(cfg_req(gcfg, "heldout_confidence", "graph")))
             held_chg["n_pairs_changed"] = len(_moved)
+            # the held-out CLOSURES at the chain and at the solution: paired, bootstrapped
+            _jb = loop_residuals_m(judge_edges, T0)
+            _ja = loop_residuals_m(judge_edges, T0, Xc)
+            judge_chg = heldout_change(_jb, _ja, confidence=float(cfg_req(gcfg, "heldout_confidence", "graph")))
+            judge_before = float(np.median(_jb)) if _jb else float("nan")
+            judge_after = float(np.median(_ja)) if _ja else float("nan")
+            ok_judge = bool(judge_chg["improves"]) if judge_edges else None
             gain = (1.0 - loop_after / loop_before) if loop_before > 0 else 0.0
             min_gain = float(cfg_req(gcfg, "min_loop_gain", "graph"))
             n_active = sum(1 for eid, _ in loop_ids if pg._edges[eid]["active"])
@@ -3022,6 +3043,12 @@ class VGGT_Long:
                     f"degradation beyond the sample's own noise (paired change CI "
                     f"[{held_chg['ci_low'] * 100:+.2f}, {held_chg['ci_high'] * 100:+.2f}] cm, "
                     f"n={held_chg['n']})")
+            if judge_edges and not ok_judge:
+                gate_warnings.append(
+                    f"held-out loop closures {judge_before * 100:.1f}→{judge_after * 100:.1f} cm — "
+                    f"no improvement beyond their own noise (paired change CI "
+                    f"[{judge_chg['ci_low'] * 100:+.1f}, {judge_chg['ci_high'] * 100:+.1f}] cm, "
+                    f"n={judge_chg['n']})")
             if frac > 1.0:
                 gate_warnings.append(f"authority {frac * 100:.0f}% (max {a_max_m} m / {a_max_deg}°)")
             for ob in over_budget:
@@ -3032,19 +3059,23 @@ class VGGT_Long:
                 gate_warnings.append(f"the graph did not converge in {pg.report['iterations']} "
                                      f"iteration(s) (stop={pg.report['stop']}) — its iterate is "
                                      f"not a solution")
-            # MEASURED refusal, whatever the gate mode: a solve that did not converge is
-            # not a solution (USER 2026-09-28). The held-out is MEASURED and declared but
-            # no longer refuses under advisory (USER 2026-10-05, "la 2"): its pairs are
-            # intra-chunk, a few frames apart — they measure LOCAL smoothness — while a
-            # loop closure corrects a GLOBAL drift of metres over a long walk, and
-            # spreading that correction can cost local smoothness: the judge vetoed the
-            # only correction that mattered (pccr 2408, 100 m). What protects against a
-            # false SALAD match is the bridge's own σ and the graph's edge vote; the
-            # verdict on the geometry is the user's eye on the cloud. (zaragoza
-            # 2026-10-05 also refused on 12.47 → 12.65 cm with a degenerate CI
-            # [-0.00, -0.00], n=118 — noted, to be looked at.) 2026-09-28 → 2026-10-05
-            # the held-out refused here too, against what gate_mode: advisory declares.
-            refused = (not converged) or (gate_mode == "veto" and not ok_held)
+            # WHAT DECIDES (USER 2026-10-06, after a day of pccr 2408): a solve that did not
+            # converge is not a solution (USER 2026-09-28) — refused always. Then THE JUDGE:
+            # the held-out loop closures must IMPROVE beyond their own noise — they measure
+            # the global drift a closure corrects, which the local surface pairs cannot see
+            # (those vetoed the only correction that mattered on pccr 2408); and applying
+            # unjudged is how bridges disagreeing by metres would bend the chain (zaragoza).
+            # With too few closures to hold any out, the local held-out pairs judge as on
+            # 2026-09-28 (declared). The local pairs are always measured and declared.
+            if judge_edges:
+                judge_rule = "held-out loop closures must improve beyond their own noise"
+                refused = (not converged) or (not ok_judge)
+            else:
+                judge_rule = ("no loop closure could be held out — the local held-out surface "
+                              "pairs judge (the 2026-09-28 rule)")
+                refused = (not converged) or (not ok_held)
+            if gate_mode == "veto":
+                refused = refused or (not ok_held)
             if gate_mode == "veto":
                 verdict = "APPLY" if (n_active > 0 and not gate_warnings) else "IDENTITY"
             else:
@@ -3064,7 +3095,18 @@ class VGGT_Long:
                                                           "median_before_m": held_before,
                                                           "median_after_m": held_after,
                                                           "measured_bar": held_chg,
-                                                          "passed": ok_held}},
+                                                          "passed": ok_held},
+                                "holdout_loop_closures": {"n_fit": len(fit_edges), "n_judge": len(judge_edges),
+                                                          "median_before_m": judge_before,
+                                                          "median_after_m": judge_after,
+                                                          "measured_bar": judge_chg,
+                                                          "passed": ok_judge, "split": split_rep,
+                                                          "per_edge": [{"bridge": int(e.get("bridge", -1)),
+                                                                        "i": int(e["i"]), "j": int(e["j"]),
+                                                                        "chunks": [int(owner[int(e["i"])]), int(owner[int(e["j"])])],
+                                                                        "before_m": b_, "after_m": a_}
+                                                                       for e, b_, a_ in zip(judge_edges, _jb, _ja)]}},
+                      "judge": judge_rule,
                       "authority": {"stage": "pose_graph", "max_m": a_max_m, "max_deg": a_max_deg,
                                     "used_max_m": float(t_mag.max()), "used_max_deg": float(r_mag.max()),
                                     "fraction_used": frac, "saturated": bool(saturated),
@@ -3077,8 +3119,10 @@ class VGGT_Long:
             with open(pg_path, "w") as f:
                 _json.dump(report, f, indent=1)
             print(f"[pose-graph] loop residual {loop_before * 100:.1f} → {loop_after * 100:.1f} cm "
-                  f"(gain {gain * 100:.0f}%, min {min_gain * 100:.0f}%) | held-out pairs "
-                  f"{held_before * 100:.2f} → {held_after * 100:.2f} cm | authority "
+                  f"(gain {gain * 100:.0f}%, min {min_gain * 100:.0f}%) | held-out closures "
+                  f"{judge_before * 100:.1f} → {judge_after * 100:.1f} cm ({len(judge_edges)}, "
+                  f"{'IMPROVE' if ok_judge else ('no verdict' if ok_judge is None else 'NO improvement')}) "
+                  f"| held-out pairs {held_before * 100:.2f} → {held_after * 100:.2f} cm | authority "
                   f"{frac * 100:.0f}% of {a_max_m * 100:.0f} cm / {a_max_deg:.1f}° "
                   f"{'SATURATED ' if saturated else ''}→ {verdict} ({gate_mode})")
             X = Xc if verdict == "APPLY" else np.tile(np.eye(4), (N, 1, 1))
