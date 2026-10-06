@@ -93,6 +93,10 @@ class LongSeqResult:
         self.all_camera_poses = []
         self.all_camera_intrinsics = [] 
 
+class _StacPlanMismatch(RuntimeError):
+    """A chunk file on disk belongs to another chunk plan (never silently re-inferred)."""
+
+
 def _stac_images_u8(images):
     """Chunk images as uint8 RGB whatever they were stored as: uint8 (since 2026-10-05)
     or float32 in [0, 1] (older chunk files on disk — a resume reads both)."""
@@ -324,11 +328,15 @@ class VGGT_Long:
                     raise ValueError(f"bridge on disk has {_n_on_disk} frames, this run "
                                      f"needs {expected_frames} (extra-frame policy changed)")
                 if not is_loop and _n_on_disk != expected_frames:
-                    # USER 2026-10-05 ("debe ser determinista"): a chunk file of ANOTHER chunk
-                    # plan (a different walk measured, a different chunk size) is not this
-                    # chunk — loading it would place 296 frames' geometry on 297 keyframes
-                    raise ValueError(f"chunk on disk has {_n_on_disk} frames, this run's "
-                                     f"chunk {chunk_idx} has {expected_frames} (another chunk plan)")
+                    # USER 2026-10-05: a chunk file of ANOTHER chunk plan must never be
+                    # re-inferred alone next to the others — old and new would live side
+                    # by side. The map worker wipes every product of an old plan before
+                    # Omega (_invalidate_on_new_chunk_plan); reaching this means that
+                    # guard did not run: stop, loudly.
+                    raise _StacPlanMismatch(
+                        f"{save_path} has {_n_on_disk} frames, this run's chunk {chunk_idx} "
+                        f"has {expected_frames} — the outputs on disk are of ANOTHER chunk "
+                        f"plan; re-run with replace, or let the map worker wipe them")
                 if is_loop:
                     predictions.pop('images', None)      # never read for a bridge (see below)
                 if not is_loop and range_2 is None:
@@ -336,6 +344,8 @@ class VGGT_Long:
                     self.all_camera_intrinsics.append((self.chunk_indices[chunk_idx], predictions['intrinsic']))
                 print(f'[STAC resume] {filename} on disk — inference skipped')
                 return predictions if is_loop or range_2 is not None else None
+            except _StacPlanMismatch:
+                raise
             except Exception as _e:
                 print(f'[STAC resume] {filename} unreadable ({_e}) — re-inferring')
 
