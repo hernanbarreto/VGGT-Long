@@ -13,7 +13,7 @@ import pytest
 import torch  # noqa: F401 — vggt_long imports it at module level
 
 from synth_metric import (make_session, make_chunks, make_bridge, write_anchors,
-                                fork_loops_cfg, fork_scale_cfg)
+                                fork_loops_cfg, fork_scale_cfg, fork_graph_cfg)
 
 _FORK = Path(__file__).resolve().parents[1]
 _SERVER = _FORK.parents[1] / "server"
@@ -47,6 +47,9 @@ def _make_runner(tmp_path, sess, chunks, ci, loops_over=None, scale_over=None):
                           "loops": fork_loops_cfg(stac_server_dir=str(_SERVER),
                                                   **(loops_over or {})),
                           "scale": fork_scale_cfg(**(scale_over or {})),
+                          # the rule's confidence and factor (zoom exclusion, scale drift —
+                          # plan point 18) are read from Model.graph, as in production
+                          "graph": fork_graph_cfg(),
                           "exact_seam_align": True, "frame_ownership": True}}
     r.chunk_size, r.overlap = 60, 30
     r.chunk_indices = list(ci)

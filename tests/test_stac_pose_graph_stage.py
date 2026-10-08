@@ -1,10 +1,13 @@
 """claude_stac.txt §12.3 / §12.7c on the fork: the keyframe SE(3) graph stage
 inside VGGT_Long on synthetic chunks — intra-chunk drift injected along the
-walk (what per-chunk rigid seams cannot remove), one verified exact bridge at
-the revisit; the graph closes the loop within tolerance, held-out surface
-pairs do not degrade; the §4.7 drift budget / authority gates are MEASURED
-and declared: applied under gate_mode advisory (USER 2026-09-09), identity
-under veto; no edge means identity; resume replays."""
+walk (what per-chunk rigid seams cannot remove), verified closures at the
+revisits. THE JUDGE (USER 2026-10-07, docs/plan_determinismo.md points 1-2):
+every closure judges once, left out of its own solve; with fewer than 5
+closures the graph is declared before solving and NOT applied; with enough
+closures that improve beyond 2 x the largest bridge σ the final graph (all
+closures) closes the loop; the §4.7 drift budget / authority gates are then
+MEASURED and declared: applied under gate_mode advisory (USER 2026-09-09),
+identity under veto; no edge means identity; resume replays."""
 
 import json
 import os
@@ -27,6 +30,9 @@ def _runner(tmp_path, sess, chunks, ci, graph_over=None, auth_over=None):
     r.config["Model"]["graph"] = fork_graph_cfg(**(graph_over or {}))
     r.config["Model"]["authority"] = fork_authority_cfg(**(auth_over or {}))
     r.config["Model"]["certify"] = {"ensemble_offset_frames": 0}
+    # production solves on the card only (plan point 12: no CPU fallback); this CPU test
+    # hands the stage the CPU explicitly
+    r._stac_solver_device = lambda: "cpu"
     return r, save_dir
 
 
@@ -67,6 +73,22 @@ def _run_loop_stage(r, sess, ci, cand, bridge_kw=None):
     r._stac_verify_loops(r._stac_measure_loops(rigid=True))
 
 
+# revisit-like frame pairs far apart along the walk (each closes accumulated drift)
+GT_PAIRS = [(140, 8), (132, 14), (124, 22), (146, 4), (116, 30), (110, 36)]
+
+
+def _gt_closures(sess, pairs=GT_PAIRS, sigma_m=0.01, sigma_deg=0.2, first_bridge=0):
+    """Verified closures measuring the TRUE relative pose of each pair (what an exact bridge
+    measures up to its σ), in the keyframe-edge format of _stac_verify_loops."""
+    out = []
+    for b, (i, j) in enumerate(pairs):
+        Z = np.linalg.inv(sess.poses[i]) @ sess.poses[j]
+        out.append({"i": int(i), "j": int(j), "Z": Z.tolist(), "sigma_m": float(sigma_m),
+                    "sigma_deg": float(sigma_deg), "bridge": first_bridge + b,
+                    "status": "accepted"})
+    return out
+
+
 def _chain_pose(r, g, ci):
     """Per-frame c2w as the cloud sees it after the stage (owner copy)."""
     from loop_utils.metric_lock import frame_owner
@@ -92,30 +114,51 @@ def synth_drift():
     return sess, chunks, ci, errors, D
 
 
-def test_graph_closes_the_injected_drift(tmp_path, synth_drift):
+def test_one_closure_is_declared_before_solving_and_not_applied(tmp_path, synth_drift):
+    """USER 2026-10-07 (point 2): one verified closure cannot judge the graph (5 are needed at
+    0.95) — declared BEFORE solving; nothing solved, nothing moved."""
     sess, chunks, ci, errors, D = synth_drift
     r, save_dir = _runner(tmp_path, sess, chunks, ci)
     _run_loop_stage(r, sess, ci, (140, 8), bridge_kw={"s_L": 1.2, "yaw_L_deg": 5.0,
                                                        "t_L": (0.5, 0.1, -0.2)})
     assert r._stac_loop_edges_kf, "a verified bridge must yield a keyframe edge"
     _align_and_write(r, save_dir, ci)
-    # BEFORE: the loop endpoints disagree with the ground truth by the drift
-    e = r._stac_loop_edges_kf[0]
-    gi, gj = int(e["i"]), int(e["j"])
-    Ti0, Tj0 = _chain_pose(r, gi, ci), _chain_pose(r, gj, ci)
-    Z_gt = np.linalg.inv(sess.poses[gi]) @ sess.poses[gj]
-    Z_before = np.linalg.inv(Ti0) @ Tj0
-    err_before = float(np.linalg.norm((np.linalg.inv(Z_gt) @ Z_before)[:3, 3]))
-    assert err_before > 0.2, err_before
+    gi = int(r._stac_loop_edges_kf[0]["i"])
+    Ti0 = _chain_pose(r, gi, ci)
     r._stac_uncertainty()
-    assert Path(save_dir / "uncertainty.json").exists()
     r._stac_pose_graph()
     rep = json.loads((save_dir / "pose_graph.json").read_text())
-    assert rep["verdict"] == "APPLY", rep.get("gates")
-    assert rep["gates"]["loop_gain"]["passed"] and rep["gates"]["holdout_surface_pairs"]["passed"]
+    assert rep["verdict"] == "IDENTITY" and rep["solved"] is False
+    loo = rep["leave_one_out_closures"]
+    assert loo["declared_before_solving"] and loo["n_closures"] == 1 and loo["min_judges"] == 5
+    assert np.allclose(_chain_pose(r, gi, ci), Ti0)
+    d0 = np.load(save_dir / "_tmp_results_aligned" / "chunk_0.npy", allow_pickle=True).item()
+    assert not d0.get("_stac_pose_graph_applied")
+
+
+def test_graph_closes_the_injected_drift(tmp_path, synth_drift):
+    """Six verified closures: each judges once, left out of its own solve; they improve beyond
+    2 x the largest bridge σ — the final graph (all six) is applied and closes the drift."""
+    sess, chunks, ci, errors, D = synth_drift
+    r, save_dir = _runner(tmp_path, sess, chunks, ci)
+    r._stac_metric_lock()
+    _align_and_write(r, save_dir, ci)
+    r._stac_loop_edges_kf = _gt_closures(sess)
+    gi, gj = GT_PAIRS[0]
+    Ti0, Tj0 = _chain_pose(r, gi, ci), _chain_pose(r, gj, ci)
+    Z_gt = np.linalg.inv(sess.poses[gi]) @ sess.poses[gj]
+    err_before = float(np.linalg.norm((np.linalg.inv(Z_gt) @ (np.linalg.inv(Ti0) @ Tj0))[:3, 3]))
+    assert err_before > 0.2, err_before
+    r._stac_uncertainty()
+    r._stac_pose_graph()
+    rep = json.loads((save_dir / "pose_graph.json").read_text())
+    loo = rep["leave_one_out_closures"]
+    assert loo["n_judges"] == 6 and loo["improves"], loo["reason"]
+    assert loo["decision"]["required_delta"] == pytest.approx(0.02)
+    assert rep["verdict"] == "APPLY", rep.get("gate_warnings")
+    assert rep["solved"] and rep["n_loop_edges"] == 6
     Ti1, Tj1 = _chain_pose(r, gi, ci), _chain_pose(r, gj, ci)
-    Z_after = np.linalg.inv(Ti1) @ Tj1
-    err_after = float(np.linalg.norm((np.linalg.inv(Z_gt) @ Z_after)[:3, 3]))
+    err_after = float(np.linalg.norm((np.linalg.inv(Z_gt) @ (np.linalg.inv(Ti1) @ Tj1))[:3, 3]))
     assert err_after < 0.05, (err_before, err_after)
     # authority.json carries the stage's fraction
     auth = json.loads((save_dir / "authority.json").read_text())
@@ -124,36 +167,52 @@ def test_graph_closes_the_injected_drift(tmp_path, synth_drift):
     d0 = np.load(save_dir / "_tmp_results_aligned" / "chunk_0.npy", allow_pickle=True).item()
     assert d0.get("_stac_pose_graph_applied")
     r._stac_pose_graph()
-    Ti2 = _chain_pose(r, gi, ci)
-    assert np.allclose(Ti2, Ti1)
+    assert np.allclose(_chain_pose(r, gi, ci), Ti1)
 
 
-def test_over_budget_loop_is_declared_not_vetoed(tmp_path, synth_drift):
-    """A closure beyond the drift budget is a MEASUREMENT: it is applied and
-    declared (over_budget + gate warning), never silently dropped. Under veto
-    (evaluation) the same edge keeps identity."""
+def test_closures_within_twice_their_sigma_are_not_applied(tmp_path, synth_drift):
+    """The same six closures measured with a σ so large that twice it exceeds what they
+    improve: the rule refuses — the final graph is not even solved."""
     sess, chunks, ci, errors, D = synth_drift
     r, save_dir = _runner(tmp_path, sess, chunks, ci)
-    _run_loop_stage(r, sess, ci, (140, 8))
+    r._stac_metric_lock()
     _align_and_write(r, save_dir, ci)
-    honest = dict(r._stac_loop_edges_kf[0])
-    Z = np.asarray(honest["Z"], np.float64).copy()
-    Z[:3, 3] += np.array([8.0, 0.0, 0.0])          # 8 m demanded at the revisit
-    big = dict(honest, Z=Z.tolist(), bridge=99)
-    r._stac_loop_edges_kf = [honest, big]
+    r._stac_loop_edges_kf = _gt_closures(sess, sigma_m=3.0)
     r._stac_uncertainty()
     r._stac_pose_graph()
     rep = json.loads((save_dir / "pose_graph.json").read_text())
+    loo = rep["leave_one_out_closures"]
+    assert rep["verdict"] == "IDENTITY" and rep["solved"] is False
+    assert loo["n_judges"] == 6 and not loo["improves"] and "error" in loo["decision"]["failed"]
+
+
+def test_over_budget_loop_is_declared_not_vetoed(tmp_path, synth_drift):
+    """A closure beyond the drift budget is a MEASUREMENT: once the judge passed it is applied
+    and declared (over_budget + gate warning), never silently dropped. Under veto
+    (evaluation) the same evidence keeps identity."""
+    sess, chunks, ci, errors, D = synth_drift
+    edges = _gt_closures(sess)
+    Z = np.asarray(edges[0]["Z"], np.float64).copy()
+    Z[:3, 3] += np.array([8.0, 0.0, 0.0])          # 8 m demanded at the revisit
+    big = dict(edges[0], Z=Z.tolist(), bridge=99)
+    r, save_dir = _runner(tmp_path, sess, chunks, ci)
+    r._stac_metric_lock()
+    _align_and_write(r, save_dir, ci)
+    r._stac_loop_edges_kf = edges + [big]
+    r._stac_uncertainty()
+    r._stac_pose_graph()
+    rep = json.loads((save_dir / "pose_graph.json").read_text())
+    assert rep["leave_one_out_closures"]["improves"], rep["leave_one_out_closures"]["reason"]
     assert rep["gate_mode"] == "advisory"
     assert rep["over_budget"] and any(o["bridge"] == 99 for o in rep["over_budget"])
     assert any("drift budget" in w for w in rep["gate_warnings"])
-    assert rep["n_loop_edges_active"] == 2 and rep["verdict"] == "APPLY"
+    assert rep["n_loop_edges_active"] == 7 and rep["verdict"] == "APPLY"
     assert "vetoed" not in rep
     # veto mode: the same evidence keeps identity, declared
     r2, save2 = _runner(tmp_path / "veto", sess, chunks, ci, graph_over={"gate_mode": "veto"})
-    _run_loop_stage(r2, sess, ci, (140, 8))
+    r2._stac_metric_lock()
     _align_and_write(r2, save2, ci)
-    r2._stac_loop_edges_kf = [dict(r2._stac_loop_edges_kf[0]), dict(r2._stac_loop_edges_kf[0], Z=Z.tolist(), bridge=99)]
+    r2._stac_loop_edges_kf = [dict(e) for e in edges] + [dict(big)]
     r2._stac_uncertainty()
     r2._stac_pose_graph()
     rep2 = json.loads((save2 / "pose_graph.json").read_text())
@@ -163,13 +222,14 @@ def test_over_budget_loop_is_declared_not_vetoed(tmp_path, synth_drift):
 def test_authority_exceeded_is_declared_advisory_applies_veto_keeps_identity(tmp_path, synth_drift):
     sess, chunks, ci, errors, D = synth_drift
     r, save_dir = _runner(tmp_path, sess, chunks, ci, auth_over={"pose_graph_max_m": 0.05})
-    _run_loop_stage(r, sess, ci, (140, 8))
+    r._stac_metric_lock()
     _align_and_write(r, save_dir, ci)
+    r._stac_loop_edges_kf = _gt_closures(sess)
     r._stac_uncertainty()
     r._stac_pose_graph()
     rep = json.loads((save_dir / "pose_graph.json").read_text())
-    # closing 1.2 m of drift needs more than the 5 cm authority: declared,
-    # applied anyway (advisory — the user judges in the kit)
+    # closing the drift needs more than the 5 cm authority: declared, applied anyway
+    # (advisory — the user judges in the kit)
     assert rep["authority"]["exceeded"] is True
     assert any("authority" in w for w in rep["gate_warnings"])
     assert rep["verdict"] == "APPLY"
@@ -178,8 +238,9 @@ def test_authority_exceeded_is_declared_advisory_applies_veto_keeps_identity(tmp
     # veto: identity, nothing stamped
     r2, save2 = _runner(tmp_path / "veto", sess, chunks, ci, auth_over={"pose_graph_max_m": 0.05},
                         graph_over={"gate_mode": "veto"})
-    _run_loop_stage(r2, sess, ci, (140, 8))
+    r2._stac_metric_lock()
     _align_and_write(r2, save2, ci)
+    r2._stac_loop_edges_kf = _gt_closures(sess)
     r2._stac_uncertainty()
     r2._stac_pose_graph()
     rep2 = json.loads((save2 / "pose_graph.json").read_text())

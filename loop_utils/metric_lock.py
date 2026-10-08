@@ -130,6 +130,134 @@ def seam_relative_scale(depth_a, depth_b, min_px=1000):
     return float(1.0 / np.median(db[m] / da[m]))
 
 
+def seam_scale_error(depth_a, depth_b, min_px=1000):
+    """The RESOLUTION of seam_relative_scale on one shared frame (log units): the frame's
+    valid pixels split in two halves by their stable key (loop_utils.stable_sample — a pixel
+    entering or leaving does not reshuffle the others), the log of each half's ratio; two
+    independent half-estimates differ by twice the error of the whole, so the error is
+    |log r_A - log r_B| / 2. None when either half is under ``min_px`` / 2 pixels. The
+    measured error of a seam observation in the user's rule (plan point 18)."""
+    from loop_utils.stable_sample import pixel_keys, stable_half
+    da = np.asarray(depth_a, np.float32).squeeze()
+    db = np.asarray(depth_b, np.float32).squeeze()
+    if da.shape != db.shape:
+        return None
+    m = (np.isfinite(da) & np.isfinite(db) & (da > 1e-6) & (db > 1e-6)).reshape(-1)
+    idx = np.flatnonzero(m)
+    if len(idx) < min_px:
+        return None
+    in_a = stable_half(pixel_keys(0, idx))
+    ra, rb = da.reshape(-1)[idx], db.reshape(-1)[idx]
+    h = []
+    for sel in (in_a, ~in_a):
+        if int(sel.sum()) < min_px // 2:
+            return None
+        h.append(float(np.log(np.median(rb[sel] / ra[sel]))))
+    return float(abs(h[0] - h[1]) / 2.0)
+
+
+def fx_frame_error(fx):
+    """The measured ERROR of a chunk's focal (px): the spread of its per-frame focals —
+    what one frame's focal estimate scatters by inside the chunk (robust: 1.4826 x the MAD
+    about their median, the normal-consistency constant of the MAD — mathematics, not a
+    decision). It is the instrument's error on fx, the analogue of a bridge's σ in the pose
+    graph's rule (point 1): a chunk whose focal departs from the session by less than a few
+    times what a single frame scatters by has not zoomed. None with fewer than two frames
+    (one focal says nothing about its own scatter). The error of the zoom rule (plan point
+    18)."""
+    fx = np.asarray(fx, np.float64).ravel()
+    if fx.size < 2:
+        return None
+    if not np.all(np.isfinite(fx)):
+        raise ValueError("fx_frame_error: non-finite focal values")
+    return float(1.4826 * np.median(np.abs(fx - np.median(fx))))
+
+
+def inference_focal_error(fx_frames, chunk_indices):
+    """Omega's error on a chunk's focal BETWEEN inferences (px), MEASURED on the frames two
+    chunks share: the same frame — the same lens — gets a focal from each chunk's inference, so
+    the offset between the two copies is pure estimation error, never a zoom. Per seam the median
+    offset of its shared frames; the error of ONE inference = RMS of those offsets / √2 (each
+    offset holds two inferences' errors). pccr 2026-10-07: offsets +1.4, +11.8, −1.9, +21.8 px →
+    8.8 px, while each chunk's own frame scatter (the old error) read 2–5 px, so Omega's noise
+    passed for a zoom on 4 of 5 chunks and the scale verification failed by 18.6 %. None with no
+    shared frame."""
+    offs = []
+    ranges = [(int(a), int(b)) for a, b in chunk_indices]
+    for k in range(len(ranges) - 1):
+        if k not in fx_frames or (k + 1) not in fx_frames:
+            continue
+        a, b = ranges[k + 1][0], ranges[k][1]
+        if b <= a:
+            continue
+        fk = np.asarray(fx_frames[k], np.float64).ravel()[a - ranges[k][0]: b - ranges[k][0]]
+        fk1 = np.asarray(fx_frames[k + 1], np.float64).ravel()[0: b - a]
+        n = min(len(fk), len(fk1))
+        if n:
+            offs.append(float(np.median(fk[:n] - fk1[:n])))
+    if not offs:
+        return None
+    return float(np.sqrt(np.mean(np.square(offs)) / 2.0))
+
+
+def zoom_anchor_test(fx_chunk, fx_rest, *, error_factor, confidence, n_boot=2000, seed=0,
+                     inference_error_px=None):
+    """USER 2026-10-07 (plan point 18): a chunk's DA3 anchors are excluded as ZOOMED only when
+    its focal differs from the rest of the session SIGNIFICANTLY — the whole ``confidence``
+    bootstrap interval of median(fx of the chunk's frames) - median(fx of every other chunk's
+    frames) on one side of zero (both samples resampled, seeded) — AND by at least
+    ``error_factor`` (the user's 2) x the chunk's own measured fx error (fx_frame_error: the
+    scatter of its per-frame focals). No robust-z cut
+    (the 3.5 was invented; its MAD came from five numbers). Returns a JSON-able dict: the
+    verdict ``zoomed`` and every margin."""
+    a = np.asarray(fx_chunk, np.float64).ravel()
+    b = np.asarray(fx_rest, np.float64).ravel()
+    if not (np.all(np.isfinite(a)) and np.all(np.isfinite(b))):
+        raise ValueError("zoom_anchor_test: non-finite focal values")
+    conf = float(confidence)
+    fac = float(error_factor)
+    if not (0.0 < conf < 1.0):
+        raise ValueError(f"zoom_anchor_test: confidence {confidence!r} must lie in (0, 1)")
+    if not (np.isfinite(fac) and fac > 0.0):
+        raise ValueError(f"zoom_anchor_test: error_factor {error_factor!r} must be > 0")
+    out = {"rule": "USER 2026-10-07: significant AND |median diff| >= factor x the chunk's fx error",
+           "n_chunk_frames": int(a.size), "n_rest_frames": int(b.size), "confidence": conf,
+           "error_factor": fac, "n_boot": int(n_boot), "seed": int(seed),
+           "error_source": "the scatter of the chunk's per-frame focals (1.4826 x MAD)"}
+    err = fx_frame_error(a)
+    if b.size < 2 or err is None:
+        out.update({"zoomed": False, "fx_error_px": err,
+                    "reason": "too few frames to measure the chunk's focal, its error or the "
+                              "session's — no exclusion"})
+        return out
+    # the chunk's focal is ONE inference: its error is the larger of its frames' scatter and
+    # Omega's measured error between inferences (inference_focal_error) — USER 2026-10-07
+    out["fx_frame_scatter_px"] = float(err)
+    out["inference_error_px"] = (float(inference_error_px) if inference_error_px is not None else None)
+    if inference_error_px is not None and np.isfinite(inference_error_px):
+        err = max(float(err), float(inference_error_px))
+        out["error_source"] = ("max(the scatter of the chunk's per-frame focals, Omega's focal error "
+                               "between inferences measured on the shared frames)")
+    diff = float(np.median(a) - np.median(b))
+    rng = np.random.default_rng(int(seed))
+    bd = np.empty(int(n_boot), np.float64)
+    for q in range(int(n_boot)):
+        bd[q] = (np.median(a[rng.integers(0, a.size, a.size)])
+                 - np.median(b[rng.integers(0, b.size, b.size)]))
+    alpha = (1.0 - conf) / 2.0
+    lo = float(np.percentile(bd, 100.0 * alpha))
+    hi = float(np.percentile(bd, 100.0 * (1.0 - alpha)))
+    significant = bool(lo > 0.0 or hi < 0.0)
+    required = fac * float(err)
+    beyond = bool(abs(diff) >= required)
+    out.update({"fx_chunk_median": float(np.median(a)), "fx_rest_median": float(np.median(b)),
+                "diff_px": diff, "ci_low": lo, "ci_high": hi, "significant": significant,
+                "fx_error_px": float(err), "required_px": float(required),
+                "error_margin_px": float(abs(diff) - required), "beyond_error": beyond,
+                "zoomed": bool(significant and beyond)})
+    return out
+
+
 def solve_scale_graph(s_da3, n_anchors, seam_rel, n_chunks,
                       sigma_seam=0.003, sigma_anchor=0.08,
                       loop_rel=None, absolute=None, skip_loop=None):
@@ -354,43 +482,56 @@ def solve_scale_drift(anchors, seam_obs, n_chunks, prior=None,
     return np.exp(x[0::2]), np.exp(x[1::2])
 
 
-def scale_drift_gate(anchors, s_const, seam_obs, n_chunks,
-                     min_holdout=5, improve=0.75, max_drift_log=None, **solve_kw):
+def scale_drift_gate(anchors, s_const, seam_obs, n_chunks, *, seam_frames, seam_err,
+                     error_factor, confidence, max_drift_log=None, **solve_kw):
     """Self-validation for the drift model — it must EARN the right to touch
     the geometry (same discipline as the depth graph).
 
     The judge is the PRECISE sensor: the per-frame seam ratios (same pixels,
     0.3-1% noise — the drift signature is their variation ALONG the overlap;
     DA3 anchors at 8-15% noise cannot discriminate a model this fine). Every
-    3rd seam observation is HELD OUT; both the drift model and a CONSTANT
-    reference are fitted on the SAME remaining data — the constant one is
-    the identical solver with the drift DOF pinned, so the comparison leaks
-    nothing and favours nobody:
+    shared frame whose GLOBAL index is 2 mod 3 is HELD OUT (a stable choice: a
+    frame whose ratio starves does not shift which others are held out — plan
+    point 11); both the drift model and a CONSTANT reference are fitted on the
+    SAME remaining data — the constant one is the identical solver with the
+    drift DOF pinned, so the comparison leaks nothing and favours nobody.
 
-      apply ⟺ held-out |log error| median improves by ≥ (1-improve)
-              (default 25% — measured: real ±10-20% drift improves ~9x while
-              pure seam noise buys at most ~17% by overfitting the 2 extra
-              DOF/chunk, so the cut separates them with an order of magnitude
-              of margin)
-              AND every chunk's |log(s1/s0)| ≤ max_drift_log (default log 1.6).
+    THE USER'S RULE (2026-10-07, plan point 18 — "fuera el 0,75"): the drift
+    applies only when metric_lock.decide_change says so on the held-out
+    |log| errors, constant (before) vs drift (after): significant at
+    ``confidence``, at least min_judge_closures(confidence) held-out frames,
+    and a median improvement >= ``error_factor`` x the largest measured error
+    of those held-out ratios (``seam_err``: seam_scale_error per frame) — AND
+    every chunk's |log(s1/s0)| <= max_drift_log (default log 1.6, the bound).
 
-    Returns (verdict_bool, info dict). The caller refits on ALL data when
-    the verdict is True."""
+    ``seam_frames``: {k: [global frame of each observation]}, ``seam_err``:
+    {k: [its measured error or None]} — parallel to ``seam_obs``. Returns
+    (verdict_bool, info dict). The caller refits on ALL data when True."""
     if max_drift_log is None:
         max_drift_log = float(np.log(1.6))
     fit_seams, held = {}, []
     for k, obs in (seam_obs or {}).items():
+        frames = list((seam_frames or {}).get(k) or [])
+        errs = list((seam_err or {}).get(k) or [])
+        if len(frames) != len(obs) or len(errs) != len(obs):
+            raise ValueError(f"scale_drift_gate: seam {k} has {len(obs)} observation(s), "
+                             f"{len(frames)} frame(s), {len(errs)} error(s)")
         keep = []
-        for i, (u_k, u_k1, r) in enumerate(obs):
-            if len(obs) >= 3 and i % 3 == 2:
-                held.append((k, u_k, u_k1, r))
+        for (u_k, u_k1, r), g, e in zip(obs, frames, errs):
+            if int(g) % 3 == 2:
+                held.append((k, u_k, u_k1, r, e))
             else:
                 keep.append((u_k, u_k1, r))
         fit_seams[k] = keep
-    if len(held) < int(min_holdout):
-        return False, {"reason": f"held-out too thin ({len(held)} seam obs "
-                                 f"< {min_holdout})",
-                       "n_holdout": len(held)}
+    # a held-out frame whose ratio has no measurable error cannot testify (counted)
+    n_no_err = sum(1 for h in held if h[4] is None or not np.isfinite(h[4]))
+    held = [h for h in held if h[4] is not None and np.isfinite(h[4])]
+    info = {"n_holdout": len(held), "n_holdout_without_error": int(n_no_err),
+            "bound_log": max_drift_log}
+    if not held:
+        info.update({"reason": "no held-out seam observation with a measured error",
+                     "decision": None})
+        return False, info
     s0, s1 = solve_scale_drift(anchors, fit_seams, n_chunks,
                                prior=s_const, **solve_kw)
     kw_const = dict(solve_kw, sigma_drift=1e-6)      # same solver, drift pinned
@@ -401,17 +542,26 @@ def scale_drift_gate(anchors, s_const, seam_obs, n_chunks,
         return (1.0 - u) * np.log(a0[k]) + u * np.log(a1[k])
 
     err_d, err_c = [], []
-    for k, u_k, u_k1, r in held:
+    for k, u_k, u_k1, r, _e in held:
         err_d.append(abs(np.log(r) - (_pred(s0, s1, k + 1, u_k1)
                                       - _pred(s0, s1, k, u_k))))
         err_c.append(abs(np.log(r) - (_pred(c0, c1, k + 1, u_k1)
                                       - _pred(c0, c1, k, u_k))))
     med_d, med_c = float(np.median(err_d)), float(np.median(err_c))
     drift_mag = float(np.max(np.abs(np.log(s1 / s0))))
-    ok = med_d <= float(improve) * med_c and drift_mag <= max_drift_log
-    return ok, {"n_holdout": len(held), "holdout_const": med_c,
-                "holdout_drift": med_d, "max_drift_log": drift_mag,
-                "bound_log": max_drift_log}
+    error = float(max(h[4] for h in held))
+    decision = decide_change(err_c, err_d, error=error, error_factor=error_factor,
+                             confidence=confidence)
+    decision["error_source"] = "the largest measured error of the held-out seam ratios"
+    bounded = drift_mag <= max_drift_log
+    ok = bool(decision["improves"]) and bounded
+    info.update({"holdout_const": med_c, "holdout_drift": med_d,
+                 "max_drift_log": drift_mag, "bounded": bool(bounded),
+                 "decision": decision,
+                 "reason": decision["reason"] + ("" if bounded else
+                                                 f"; drift {drift_mag:.3f} beyond the bound "
+                                                 f"{max_drift_log:.3f}")})
+    return ok, info
 
 
 def apply_scale_drift(chunk_data, s_frames):
@@ -448,18 +598,31 @@ def apply_scale_drift(chunk_data, s_frames):
     return chunk_data
 
 
-def robust_rigid(src, dst, iters=8, sample=200000, seed=0):
+def robust_rigid(src, dst, iters=8, sample=200000, seed=0, keys=None):
     """Rigid fit dst ≈ R·src + t from EXACT correspondences (same pixel, same
     frame, two chunks), IRLS with a Cauchy weight on the residuals so the
     chunk-internal disagreement (non-rigid noise + far-field junk) does not
-    drag the fit. Returns (R, t, median_residual_m, n_used) or None."""
+    drag the fit. Returns (R, t, median_residual_m, n_used) or None.
+
+    Past ``sample`` correspondences the fit uses a subsample chosen by a STABLE
+    KEY of each correspondence (plan point 11, loop_utils.stable_sample):
+    ``keys`` — one uint64 per row, the pixel identity (stable_sample.pixel_keys)
+    when the caller has it — else the bits of the row itself; ``seed`` salts
+    the choice. One correspondence entering or leaving no longer re-draws the
+    others."""
+    from loop_utils.stable_sample import row_keys, stable_pick
     src = np.asarray(src, np.float64); dst = np.asarray(dst, np.float64)
     m = np.isfinite(src).all(1) & np.isfinite(dst).all(1)
+    if keys is not None:
+        keys = np.asarray(keys).ravel()
+        if len(keys) != len(m):
+            raise ValueError(f"robust_rigid: {len(keys)} keys for {len(m)} correspondences")
+        keys = keys[m]
     src, dst = src[m], dst[m]
     if len(src) < 1000:
         return None
     if len(src) > sample:
-        idx = np.random.default_rng(seed).choice(len(src), sample, replace=False)
+        idx = stable_pick(row_keys(src, dst) if keys is None else keys, sample, salt=seed)
         src, dst = src[idx], dst[idx]
     w = np.ones(len(src))
     R, t = np.eye(3), np.zeros(3)
@@ -791,7 +954,10 @@ def depth_pair_samples(wp_src, conf_src, wp_dst, conf_dst, w2c_dst, K_dst,
     into dst's camera, read dst's OWN depth at the hit pixel. Returns (z_src, z_dst)
     — the depth src's geometry implies in dst's frame vs the depth dst itself
     predicts for that surface — or None when starved. Purely geometric: the same
-    association the seam work uses, generalized to any nearby frame pair."""
+    association the seam work uses, generalized to any nearby frame pair.
+    Past ``max_samples`` the source pixels are chosen by a stable per-pixel key
+    in the namespace ``seed`` (the source frame's key — plan point 11)."""
+    from loop_utils.stable_sample import pixel_keys, stable_pick
     H, W = wp_dst.shape[:2]
     p = np.asarray(wp_src, np.float64).reshape(-1, 3)
     c = np.asarray(conf_src, np.float32).reshape(-1)
@@ -799,7 +965,9 @@ def depth_pair_samples(wp_src, conf_src, wp_dst, conf_dst, w2c_dst, K_dst,
     if len(idx) < 500:
         return None
     if len(idx) > max_samples:
-        idx = np.random.default_rng(seed).choice(idx, max_samples, replace=False)
+        # stable per-pixel choice (plan point 11): ``seed`` is the frame key of the
+        # source frame (the fork passes its global keyframe index)
+        idx = idx[stable_pick(pixel_keys(int(seed), idx), max_samples)]
     p = p[idx]
     w2c = np.asarray(w2c_dst, np.float64)
     X = p @ w2c[:3, :3].T + w2c[:3, 3]
@@ -852,6 +1020,28 @@ def pair_depth_relation(z_src, z_dst, iters=6):
     if not (0.8 < a < 1.25):      # a pair this broken is occlusion/garbage, not a
         return None               # depth-field measurement (measured pairs: <=5%)
     return float(a), float(b), before, int(len(zs))
+
+
+def pair_relation_error(z_src, z_dst, zref, iters=6):
+    """The RESOLUTION of one pair's depth relation at ``zref`` (relative units, the unit of
+    the depth graph's held-out judge): the pair's samples split in two halves by a stable key
+    of each sample (its own values — loop_utils.stable_sample.row_keys), the affine relation
+    fitted on each half (pair_depth_relation), and |pred_A(zref) - pred_B(zref)| / (2 zref) —
+    two independent half-estimates differ by twice the error of the whole. None when a half
+    does not fit. The measured error of a held-out pair in the user's rule (plan point 19)."""
+    from loop_utils.stable_sample import row_keys, stable_half
+    zs = np.asarray(z_src, np.float64).ravel()
+    zd = np.asarray(z_dst, np.float64).ravel()
+    if zs.size != zd.size or zs.size == 0:
+        return None
+    in_a = stable_half(row_keys(zs, zd))
+    preds = []
+    for sel in (in_a, ~in_a):
+        rel = pair_depth_relation(zs[sel], zd[sel], iters=iters)
+        if rel is None:
+            return None
+        preds.append(rel[0] * float(zref) + rel[1])
+    return float(abs(preds[0] - preds[1]) / (2.0 * float(zref)))
 
 
 def solve_depth_graph(measurements, n_frames, scale_only=False, weights=None, weights_b=None):
@@ -960,34 +1150,215 @@ def heldout_change(before, after, confidence=0.95, n_boot=2000, seed=0):
             "median_delta": float(np.median(d)), "ci_low": lo, "ci_high": hi}
 
 
+# ── THE USER'S RULE for every "apply this correction / model?" decision ─────────
+# USER 2026-10-07 (docs/plan_determinismo.md, point 1, binding for points 1, 2, 18, 19, 30,
+# 46, 48): a correction is applied only when THREE things hold at once —
+#   (a) it is SIGNIFICANT: the whole bootstrap confidence interval of the paired change lies on
+#       the improving side (fixed seed: the same sample gives the same interval);
+#   (b) enough JUDGES testify: n >= min_judge_closures(confidence) (5 at 0.95 — the fewest
+#       independent judges that can all improve by chance with probability below 1 - confidence);
+#   (c) it is LARGER THAN THE ERROR: the median paired improvement >= error_factor x the measured
+#       error of what is being judged (the factor 2 is the user's, read from
+#       correction_graph.graph.improvement_error_factor — never a literal here).
+# heldout_change() above stays for the reports that only describe a change.
+
+# memory bound of one bootstrap block (elements of the resample matrix): changes neither the draws
+# (numpy's Generator.integers with int64 consumes the stream value by value, so blocks of rows
+# draw exactly what one big matrix would) nor any number the rule returns
+_BOOT_BLOCK_ELEMS = 1 << 22
+
+
+def _pooled_median(vals_sorted, weights_sorted):
+    """np.median of the multiset where ``vals_sorted[i]`` appears ``weights_sorted[i]`` times —
+    the same middle element(s) and the same (a + b) / 2 as np.median on the expanded array,
+    without expanding it."""
+    cw = np.cumsum(weights_sorted)
+    m = int(cw[-1])
+    i_lo = int(np.searchsorted(cw, (m - 1) // 2, side="right"))
+    i_hi = int(np.searchsorted(cw, m // 2, side="right"))
+    if i_lo == i_hi:
+        return float(vals_sorted[i_lo])
+    return float((vals_sorted[i_lo] + vals_sorted[i_hi]) / 2.0)
+
+
+def decide_change(before, after, *, error, error_factor, confidence, min_judges=None,
+                  clusters=None, n_boot=2000, seed=0):
+    """THE USER'S RULE (2026-10-07): does a correction improve what it is judged on — significantly,
+    with enough judges, and by more than ``error_factor`` x the measured ``error``?
+
+    ``before`` / ``after``: the PAIRED disagreements of the judges at the state without and with the
+    correction (same judge, same order, lower = better, one unit shared with ``error``). Every value
+    must be finite — observations that are not valid in both states are the caller's to discard
+    AND COUNT (plan point 60) before calling.
+    ``error``: the measured error of the thing judged, in the same unit (point 1: the largest bridge
+    sigma; 18: the chunk's measured fx error; 46: the solver error of point 59; ...). Finite, >= 0.
+    ``error_factor``: correction_graph.graph.improvement_error_factor (the user's 2).
+    ``confidence``: the declared confidence of the interval (heldout_confidence, 0.95).
+    ``min_judges``: None = min_judge_closures(confidence) (5 at 0.95).
+    ``clusters``: one label per observation (e.g. the keyframe of each F5 observation, point 46):
+    the bootstrap resamples whole CLUSTERS with replacement and the judges are the clusters; None =
+    every observation is its own judge (and the resample is bit-identical to heldout_change's).
+    The statistic is the median of d = before - after (positive = improves), over the pooled
+    observations of the resample; its interval is the bootstrap percentile interval (seeded).
+
+    Returns a JSON-able dict: ``improves`` (= the verdict: a and b and c), ``significant`` (a),
+    ``enough_judges`` (b), ``beyond_error`` (c), ``worsens`` (the interval entirely on the worsening
+    side — for reports), every margin (``ci_margin`` = ci_low, ``judges_margin`` = n_judges -
+    min_judges, ``error_margin`` = median_delta - required_delta), ``failed`` (the conditions that
+    did not hold, in the order judges / significance / error) and ``reason`` (one line for the log).
+    """
+    b = np.asarray(before, np.float64).ravel()
+    a = np.asarray(after, np.float64).ravel()
+    if b.size != a.size:
+        raise ValueError(f"decide_change: {b.size} 'before' values for {a.size} 'after' values — "
+                         f"the comparison is paired, judge by judge")
+    if not (np.all(np.isfinite(b)) and np.all(np.isfinite(a))):
+        raise ValueError("decide_change: non-finite disagreements — discard the observations that "
+                         "are not valid in both states (and count them) before judging")
+    err = float(error)
+    fac = float(error_factor)
+    conf = float(confidence)
+    if not (np.isfinite(err) and err >= 0.0):
+        raise ValueError(f"decide_change: error {error!r} must be a finite measured value >= 0")
+    if not (np.isfinite(fac) and fac > 0.0):
+        raise ValueError(f"decide_change: error_factor {error_factor!r} must be finite and > 0 "
+                         f"(correction_graph.graph.improvement_error_factor)")
+    if not (0.0 < conf < 1.0):
+        raise ValueError(f"decide_change: confidence {confidence!r} must lie in (0, 1)")
+    if min_judges is None:
+        from loop_utils.loop_judge import min_judge_closures
+        min_judges = min_judge_closures(conf)
+    min_judges = int(min_judges)
+    if min_judges < 1:
+        raise ValueError(f"decide_change: min_judges {min_judges} must be >= 1")
+    n_boot = int(n_boot)
+    if n_boot < 1:
+        raise ValueError(f"decide_change: n_boot {n_boot} must be >= 1")
+
+    d = b - a
+    n_obs = int(d.size)
+    if clusters is None:
+        inv, n_judges = None, n_obs
+    else:
+        cl = np.asarray(clusters).ravel()
+        if cl.size != n_obs:
+            raise ValueError(f"decide_change: {cl.size} cluster labels for {n_obs} observations")
+        _labels, inv = np.unique(cl, return_inverse=True)
+        n_judges = int(_labels.size)
+    required = fac * err
+    out = {"rule": "USER 2026-10-07: significant AND >= min_judges AND median >= factor x error",
+           "statistic": "median of paired (before - after); positive = improves",
+           "n_obs": n_obs, "n_judges": int(n_judges), "min_judges": min_judges,
+           "clustered": clusters is not None, "confidence": conf, "n_boot": n_boot,
+           "seed": int(seed), "error": err, "error_factor": fac, "required_delta": float(required)}
+
+    if n_obs == 0:
+        out.update({"median_delta": 0.0, "ci_low": 0.0, "ci_high": 0.0})
+    else:
+        med = float(np.median(d))
+        rng = np.random.default_rng(int(seed))
+        meds = np.empty(n_boot, np.float64)
+        if inv is None:
+            rows = max(1, _BOOT_BLOCK_ELEMS // n_obs)
+            for s in range(0, n_boot, rows):
+                r = min(rows, n_boot - s)
+                meds[s:s + r] = np.median(d[rng.integers(0, n_obs, size=(r, n_obs))], axis=1)
+        else:
+            order = np.argsort(d, kind="stable")
+            d_sorted = d[order]
+            inv_sorted = inv[order]
+            k = int(n_judges)
+            rows = max(1, _BOOT_BLOCK_ELEMS // k)
+            for s in range(0, n_boot, rows):
+                r = min(rows, n_boot - s)
+                draw = rng.integers(0, k, size=(r, k))
+                for q in range(r):
+                    counts = np.bincount(draw[q], minlength=k)
+                    meds[s + q] = _pooled_median(d_sorted, counts[inv_sorted])
+        alpha = (1.0 - conf) / 2.0
+        lo = float(np.percentile(meds, 100.0 * alpha))
+        hi = float(np.percentile(meds, 100.0 * (1.0 - alpha)))
+        out.update({"median_delta": med, "ci_low": lo, "ci_high": hi})
+
+    enough = bool(n_judges >= min_judges)
+    significant = bool(n_obs > 0 and out["ci_low"] > 0.0)
+    beyond = bool(n_obs > 0 and out["median_delta"] >= required)
+    failed = []
+    if not enough:
+        failed.append("judges")
+    if not significant:
+        failed.append("significance")
+    if not beyond:
+        failed.append("error")
+    pct = 100.0 * conf
+    reason = (f"median improvement {out['median_delta']:.6g} vs {fac:g} x error {err:.6g} = "
+              f"{required:.6g} (margin {out['median_delta'] - required:+.6g}); {pct:g} % CI "
+              f"[{out['ci_low']:.6g}, {out['ci_high']:.6g}]; {n_judges} judge(s) for {min_judges} "
+              f"required")
+    out.update({"improves": bool(enough and significant and beyond), "significant": significant,
+                "enough_judges": enough, "beyond_error": beyond,
+                "worsens": bool(n_obs > 0 and out["ci_high"] < 0.0),
+                "ci_margin": float(out["ci_low"]), "judges_margin": int(n_judges - min_judges),
+                "error_margin": float(out["median_delta"] - required), "failed": failed,
+                "reason": ("IMPROVES — " if not failed else
+                           "does NOT pass (" + ", ".join(failed) + ") — ") + reason})
+    return out
+
+
 def depth_graph_verdict(a, b, meas, held, zref=5.0, confidence=0.95, bound=5.0,
-                        n_boot=2000, seed=0):
+                        n_boot=2000, seed=0, *, held_err=None, error_factor=None):
     """Self-validation shared by every rung of the depth-graph model ladder.
-    Judged ONLY on held-out pairs (never fitted): the corrected disagreement at
-    ``zref`` must fall by more than the held-out sample's own noise
-    (``heldout_change``), and the corrections must stay within
-    ``bound``× the pairwise signal (an order of magnitude beyond what the pairs
+    Judged ONLY on held-out pairs (never fitted), by THE USER'S RULE (2026-10-07,
+    plan point 19 — metric_lock.decide_change): the paired change of the
+    held-out disagreement at ``zref`` must be significant at ``confidence``,
+    come from at least min_judge_closures(confidence) pairs, and its median must
+    be >= ``error_factor`` x the largest measured error of those pairs
+    (``held_err``: pair_relation_error per held-out pair; a pair without one
+    cannot testify and is counted out). AND the corrections must stay within
+    ``bound``x the pairwise signal (an order of magnitude beyond what the pairs
     show is noise integration along the chain, not signal). Returns a dict with
-    bounded / improves / med_before / med_after / sig_a / sig_b."""
+    bounded / improves / med_before / med_after / sig_a / sig_b / decision.
+
+    Without ``held_err`` and ``error_factor`` it MEASURES only — bounded, the
+    held-out medians, sig_a / sig_b, no 'improves' and no decision: the server's
+    witness depth stage (reconstruction/witness/depth_tracks) reads those and
+    judges with its own held-out test. Giving one of the two without the other
+    is refused."""
+    if (held_err is None) != (error_factor is None):
+        raise ValueError("depth_graph_verdict: held_err and error_factor go together (the "
+                         "rule needs both), or neither (measurement only)")
     a = np.asarray(a, np.float64)
     b = np.asarray(b, np.float64)
-    rb = [abs(al * zref + be - zref) / zref for _, _, al, be in held]
-    ra = [abs((a[f] * zref + b[f]) - (a[g] * (al * zref + be) + b[g])) / zref
-          for f, g, al, be in held]
-    med_b, med_a = float(np.median(rb)), float(np.median(ra))
+    rb_all = [abs(al * zref + be - zref) / zref for _, _, al, be in held]
+    ra_all = [abs((a[f] * zref + b[f]) - (a[g] * (al * zref + be) + b[g])) / zref
+              for f, g, al, be in held]
+    if held_err is None:
+        keep = list(range(len(held)))
+    else:
+        if len(held_err) != len(held):
+            raise ValueError(f"depth_graph_verdict: {len(held_err)} errors for {len(held)} pairs")
+        keep = [q for q, e in enumerate(held_err) if e is not None and np.isfinite(e)]
+    rb = [rb_all[q] for q in keep]
+    ra = [ra_all[q] for q in keep]
+    med_b = float(np.median(rb)) if rb else float("nan")
+    med_a = float(np.median(ra)) if ra else float("nan")
     las = np.abs(np.log([al for _, _, al, _ in meas]))
     bes = np.abs([be for _, _, _, be in meas])
     sig_a = max(float(np.median(las)), 1e-4)
     sig_b = max(float(np.median(bes)), 1e-3)
     bounded = (float(np.percentile(np.abs(np.log(a)), 99)) <= bound * sig_a
                and float(np.percentile(np.abs(b), 99)) <= bound * sig_b)
-    _chg = heldout_change(rb, ra, confidence=confidence, n_boot=n_boot, seed=seed)
-    improves = bool(_chg["improves"])
-    return {"bounded": bounded, "improves": improves,
-            "med_before": med_b, "med_after": med_a,
-            "sig_a": sig_a, "sig_b": sig_b,
-            "heldout_ci_low": _chg["ci_low"], "heldout_ci_high": _chg["ci_high"],
-            "heldout_n": float(_chg["n"]), "heldout_median_delta": _chg["median_delta"]}
+    out = {"bounded": bool(bounded), "med_before": med_b, "med_after": med_a,
+           "sig_a": sig_a, "sig_b": sig_b}
+    if held_err is None:
+        return out
+    error = float(max(held_err[q] for q in keep)) if keep else 0.0
+    decision = decide_change(rb, ra, error=error, error_factor=error_factor,
+                             confidence=confidence, n_boot=n_boot, seed=seed)
+    decision["error_source"] = "the largest measured error of the held-out pairs (split-half)"
+    decision["n_pairs_without_error"] = int(len(held) - len(keep))
+    out.update({"improves": bool(decision["improves"]), "decision": decision})
+    return out
 
 
 def apply_depth_correction(world_points, depth, cam_center, a, b):
@@ -1109,8 +1480,8 @@ def chunk_tri_angle(depth, conf, extrinsic):
     return float(np.median(steps)) / med_depth
 
 
-def flag_sick_chunks(tri_angle, anchor_iqr, fx_median=None,
-                     parallax_floor_ratio=10.0, anchor_z_cut=3.5, zoom_z_cut=3.5):
+def flag_sick_chunks(tri_angle, anchor_iqr, zoom=None,
+                     parallax_floor_ratio=10.0, anchor_z_cut=3.5):
     """Health gate over a session's own chunks. Returns {k: [reasons]} for the
     chunks whose numbers say their geometry cannot be trusted. Two independent
     signals, thresholds derived from the SESSION itself (no external truth):
@@ -1152,22 +1523,18 @@ def flag_sick_chunks(tri_angle, anchor_iqr, fx_median=None,
                         f"is not one number")
     # 3. Optical ZOOM: the per-frame focal the model itself estimates. A zoom
     #    segment magnifies without adding baseline — no parallax, no 3D — and it
-    #    also breaks DA3's metric depth (assumed focal). Robust z (same 3.5 cut)
-    #    of the chunk-median fx across chunks: the body is stable to ~2% while a
-    #    real zoom is +25..140% (measured on test4: fx 550 body vs 704-1334 tail).
-    fxm = {k: v for k, v in (fx_median or {}).items() if v is not None and np.isfinite(v)}
-    if len(fxm) >= 3:
-        vals = np.array(list(fxm.values()), np.float64)
-        med = float(np.median(vals))
-        mad = float(np.median(np.abs(vals - med)))
-        if mad > 0:
-            for k, v in fxm.items():
-                z = abs(v - med) / (1.4826 * mad)
-                if z > float(zoom_z_cut):
-                    sick.setdefault(k, []).append(
-                        f"optical ZOOM: chunk-median focal {v:.0f} vs session {med:.0f} "
-                        f"(robust z={z:.1f}) — magnification adds no baseline: no "
-                        f"parallax, no 3D information, and DA3 metric depth breaks")
+    #    also breaks DA3's metric depth (assumed focal). The label is the zoom
+    #    rule's own verdict (``zoom``: {chunk: zoom_anchor_test(...)} — USER
+    #    2026-10-07, plan point 18: significant AND >= factor x the chunk's fx
+    #    error), never a second criterion: the robust z > 3.5 is gone.
+    for k, zt in sorted((zoom or {}).items(), key=lambda kv: int(kv[0])):
+        if zt and zt.get("zoomed"):
+            sick.setdefault(int(k), []).append(
+                f"optical ZOOM: chunk-median focal {zt['fx_chunk_median']:.0f} vs session "
+                f"{zt['fx_rest_median']:.0f} (CI [{zt['ci_low']:+.1f}, {zt['ci_high']:+.1f}] px, "
+                f"|Δ| beyond {zt['error_factor']:g} x its error by {zt['error_margin_px']:.1f} px)"
+                f" — magnification adds no baseline: no parallax, no 3D information, and "
+                f"DA3 metric depth breaks")
     return sick
 
 
@@ -1192,20 +1559,26 @@ def flag_suspect_chunks(anchor_iqr, sick=None, spread_cut=0.30):
 
 def frame_owner(chunk_indices, n_frames):
     """owner[g] = index of the chunk that WRITES frame g's points to the cloud.
-    Every frame is written by exactly ONE chunk (the one whose centre is nearest)
-    — overlap frames used to be written by BOTH chunks, putting two displaced
-    copies of the same pixels into the cloud (the mechanical half of the
-    duplicated-objects problem)."""
+    Every frame is written by exactly ONE chunk — overlap frames used to be written by
+    BOTH chunks, putting two displaced copies of the same pixels into the cloud (the
+    mechanical half of the duplicated-objects problem). The block two chunks share is
+    split at its MIDPOINT: the first half is written by the earlier chunk, the second by
+    the later one — each chunk writes half of what they share (USER 2026-10-07, "50 % de
+    quién"). On the uniform layouts this rule was validated on (equal chunks, 50 % overlap)
+    the midpoint IS the old nearest-centre rule; on the co-visibility planner's unequal
+    chunks the nearest-centre rule handed the WHOLE shared block to the smaller chunk
+    (pccr 2026-08-31: chunk 0 wrote 63/63 frames, chunk 1 only 50/139)."""
     owner = np.full(int(n_frames), -1, np.int32)
-    centers = [(s0 + e0) / 2.0 for s0, e0 in chunk_indices]
-    for g in range(int(n_frames)):
-        best, bd = -1, None
-        for k, (s0, e0) in enumerate(chunk_indices):
-            if s0 <= g < e0:
-                d = abs(g - centers[k])
-                if bd is None or d < bd:
-                    best, bd = k, d
-        owner[g] = best
+    ranges = [(int(s0), int(e0)) for s0, e0 in chunk_indices]
+    for k, (s0, e0) in enumerate(ranges):
+        owner[s0:e0] = k                                  # provisional: the later chunk
+    for k in range(len(ranges) - 1):
+        a, b = ranges[k + 1][0], ranges[k][1]            # the block chunks k and k+1 share
+        if b > a:
+            # first half → k, second half → k+1; the frame AT the midpoint goes to the earlier
+            # chunk — exactly the nearest-centre rule's tie on a uniform layout, so the validated
+            # 60/30 sessions keep their ownership bit for bit
+            owner[a:a + (b - a) // 2 + 1] = k
     return owner
 
 
@@ -1364,7 +1737,8 @@ def seam_overlap(chunk_indices, k):
 
 
 def surface_pair_correspondences(wp_src, conf_src, wp_dst, conf_dst, w2c_dst, K_dst,
-                                 max_samples=8000, seed=0, conf_min_norm=0.0):
+                                 max_samples=8000, seed=0, conf_min_norm=0.0,
+                                 return_keys=False):
     """EXACT-surface 3D correspondences between two frames: project src's valid
     points into dst's camera and pair them with dst's OWN 3D point at the hit
     pixel. Returns (p_src[n,3], q_dst[n,3]) or None when starved — the rigid
@@ -1377,7 +1751,13 @@ def surface_pair_correspondences(wp_src, conf_src, wp_dst, conf_dst, w2c_dst, K_
     what the intra-chunk field and the pose graph FIT on *and* what their held-out
     pairs JUDGE with, so an unconfident point biases the correction and corrupts
     its own examiner. `conf > 1e-5` alone is the SKY MASK, not a quality gate.
-    0.0 keeps the historical behaviour."""
+    0.0 keeps the historical behaviour.
+
+    Past ``max_samples`` the source pixels are chosen by their STABLE KEY (plan point
+    11): pixel (``seed``, flat index) — the fork passes the source frame's global
+    keyframe index as ``seed``. ``return_keys``: also return each pair's key (uint64),
+    for a stable sub-selection downstream."""
+    from loop_utils.stable_sample import pixel_keys, stable_pick
     H, W = wp_dst.shape[:2]
     p = np.asarray(wp_src, np.float64).reshape(-1, 3)
     c = np.asarray(conf_src, np.float32).reshape(-1)
@@ -1393,8 +1773,12 @@ def surface_pair_correspondences(wp_src, conf_src, wp_dst, conf_dst, w2c_dst, K_
                 idx = idx[keep]
     if len(idx) < 500:
         return None
+    keys = pixel_keys(int(seed), idx)
     if len(idx) > max_samples:
-        idx = np.random.default_rng(seed).choice(idx, max_samples, replace=False)
+        # stable per-pixel choice (plan point 11): ``seed`` is the frame key of the
+        # source frame (the fork passes its global keyframe index)
+        sel = stable_pick(keys, max_samples)
+        idx, keys = idx[sel], keys[sel]
     p = p[idx]
     w2c = np.asarray(w2c_dst, np.float64)
     X = p @ w2c[:3, :3].T + w2c[:3, 3]
@@ -1408,12 +1792,14 @@ def surface_pair_correspondences(wp_src, conf_src, wp_dst, conf_dst, w2c_dst, K_
     inb = (u >= 0) & (u < W) & (v >= 0) & (v < H)
     if inb.sum() < 300:
         return None
-    u, v, p_in = u[inb], v[inb], p[m][inb]
+    u, v, p_in, k_in = u[inb], v[inb], p[m][inb], keys[m][inb]
     q = np.asarray(wp_dst, np.float64)[v, u]
     cq = np.asarray(conf_dst, np.float32).reshape(H, W)[v, u]
     good = cq > 1e-5
     if good.sum() < 300:
         return None
+    if return_keys:
+        return p_in[good], q[good], k_in[good]
     return p_in[good], q[good]
 
 

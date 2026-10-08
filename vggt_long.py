@@ -112,6 +112,15 @@ def _stac_images_to_u8(predictions):
         predictions['images'] = _stac_images_u8(predictions['images'])
 
 
+# ── shared reproducibility primitives (docs/plan_determinismo.md) ─────────────────────
+# The server's repro.py (stamps, deterministic torch, the environment record, lossless pose
+# text) through loop_utils.stac_repro — one implementation for the whole pipeline; the sky
+# segmenter pinned by loop_utils.sky_mask (point 20); the run stamp in loop_utils.fork_stamp
+# (point 9).
+from loop_utils.stac_repro import repro as _stac_repro
+from loop_utils.sky_mask import SKYSEG_SHA256, skyseg_path as _stac_skyseg_path
+
+
 class VGGT_Long:
     def __init__(self, image_dir, save_dir, config, selected_frames=None):
         self.config = config
@@ -133,8 +142,11 @@ class VGGT_Long:
             self.chunk_size = self.config['Model'].get('chunk_size')
             self.overlap = self.config['Model'].get('overlap')
         self.seed = 42
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+        # STAC (plan point 12): CUDA only, ONE autocast dtype (base_model.AMP_DTYPE) — a
+        # CPU or fp16 fallback would be another reconstruction, so a card without them FAILS
+        from base_models.base_model import require_amp_card
+        self.device = "cuda"
+        self.dtype = require_amp_card()
         self.sky_mask = self.config['Model'].get('mask_sky', True)  # STAC: remove sky from
                                                                     # the reconstruction with
                                                                     # skyseg.onnx. Default ON.
@@ -203,20 +215,43 @@ class VGGT_Long:
         # STAC patch (resume): if loop_closures.txt already exists, load the pairs and
         # SKIP the DINOv2/SALAD feature extraction (~20 min). Pairs are written as
         # "i, j, sim[, source]" lines; "#" lines are headers/the image-path list.
-        # The optional 4th column is the candidate SOURCE (salad | instance |
-        # manual — claude_stac.txt §4.4): the server appends instance/manual
-        # candidates to this same file, and a resumed run consumes them.
+        # Plan point 8 (2026-10-07): the file carries the stamp of the keyframes, weights,
+        # code and parameters it was computed from (loop_bridges.salad_loop_stamp) and is
+        # reused ONLY when this run's stamp is the same — its pairs are POSITIONS in a
+        # keyframe list, and the map worker keeps it across new chunk plans. Otherwise it is
+        # deleted (with the SALAD calibration and the post-hoc candidates) and SALAD runs
+        # again. The server's instance / manual candidates live in their OWN stamped file
+        # (loop_closures_posthoc.txt), consumed only while it matches the SALAD stamp. Fresh
+        # or reused, the candidates are READ from the files (exact similarities): one path.
         loop_txt = os.path.join(self.output_dir, "loop_closures.txt")
-        if not self.useDBoW and os.path.exists(loop_txt):
-            from loop_utils.loop_bridges import load_loop_candidates
+        if not self.useDBoW:
+            from loop_utils.loop_bridges import (load_loop_candidates, write_loop_stamp,
+                                                 salad_loop_stamp, reconcile_loop_files,
+                                                 reconcile_posthoc)
+            now = salad_loop_stamp(self.img_list, self.config)
+            rec = reconcile_loop_files(loop_txt, now, log=print)
+            fresh = not os.path.exists(loop_txt)
+            if fresh:
+                self.loop_detector.run()
+                if not os.path.exists(loop_txt):
+                    raise RuntimeError(f"the SALAD loop detector wrote no {loop_txt} — "
+                                       f"no candidate list to stamp")
+                # the bar SALAD applied is recorded with the stamp (not compared: it is a
+                # function of what the stamp holds)
+                write_loop_stamp(loop_txt, dict(
+                    now, salad_threshold=self.loop_detector.applied_threshold,
+                    salad_threshold_source=self.loop_detector.threshold_source))
+                reconcile_posthoc(loop_txt, log=print)
             cands = load_loop_candidates(loop_txt)
             self.loop_cands = cands
             self.loop_list = [(c["i"], c["j"]) for c in cands]
             srcs = {}
             for c in cands:
                 srcs[c["source"]] = srcs.get(c["source"], 0) + 1
-            print(f"[STAC resume] loop_closures.txt found — {len(cands)} candidate(s) "
-                  f"loaded by source {srcs}, DINOv2 extraction skipped")
+            print(f"[STAC loops] {len(cands)} candidate(s) by source {srcs} "
+                  + ("(SALAD run now, stamped)" if fresh else
+                     "(loop_closures.txt reused — its stamp matches; DINOv2 extraction skipped)")
+                  + f"; post-hoc file: {rec['posthoc']}")
             return
 
         if self.useDBoW: # DBoW2
@@ -240,65 +275,34 @@ class VGGT_Long:
 
                 self.retrieval.save_up_to(frame_id)
 
-        else: # DNIO v2
-            self.loop_detector.run()
-            self.loop_list = self.loop_detector.get_loop_list()
-            self.loop_cands = [{"i": int(i), "j": int(j), "sim": float(s), "source": "salad"}
-                               for i, j, s in (self.loop_detector.loop_closures or [])]
 
     def _stac_mask_sky(self, predictions, chunk_image_paths):
         """STAC: zero per-pixel confidence at sky regions so the cloud builder's
         confidence filter (keeps world_points_conf >= thr) drops sky points. Uses
         VGGT-Long's OWN skyseg.onnx — the same mechanism loop_utils.visual_util applies
         for visualization (`world_points_conf *= non_sky`), wired into the
-        reconstruction here. Per-frame masks are cached under <save_dir>/sky_masks/;
-        skyseg.onnx is fetched once next to this file. No-op (and harmless) indoors,
-        where the segmenter finds no sky. Failures degrade to 'no masking', never crash."""
+        reconstruction here. No-op (and harmless) indoors, where the segmenter finds
+        no sky.
+
+        Plan point 20 (2026-10-07, loop_utils.sky_mask): the model is PINNED by its sha256
+        (never downloaded) and a frame's mask is cached under
+        <save_dir>/sky_masks/<model sha>-<segmenter code sha>/<frame>_<image sha>.png —
+        reused only for the same model, the same segmenting code and the same image bytes
+        (the old cache keyed on the frame's NAME alone survived new plans, models and
+        re-extracted frames). The segmenter runs on the CPU provider with one thread, the
+        mask is always read back from its PNG, and anything that fails STOPS the run: a
+        frame silently left unmasked is a different cloud."""
         if not self.sky_mask:
             return
         wpc = predictions.get('world_points_conf', None)
         if wpc is None or getattr(wpc, 'ndim', 0) != 3:
             return
-        try:
-            import onnxruntime
-            from loop_utils.visual_util import segment_sky, download_file_from_url
-        except Exception as _e:
-            print(f"[STAC sky] skyseg unavailable ({_e}) — skipping sky mask")
-            return
-        S, H, W = wpc.shape
-        onnx_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skyseg.onnx")
-        if not os.path.exists(onnx_path):
-            print("[STAC sky] downloading skyseg.onnx ...")
-            try:
-                download_file_from_url(
-                    "https://huggingface.co/JianyuanWang/skyseg/resolve/main/skyseg.onnx",
-                    onnx_path)
-            except Exception as _e:
-                print(f"[STAC sky] skyseg.onnx download failed ({_e}) — skipping sky mask")
-                return
-        sky_dir = os.path.join(os.path.dirname(self.result_unaligned_dir), "sky_masks")
-        os.makedirs(sky_dir, exist_ok=True)
-        n = 0
-        for i, p in enumerate(chunk_image_paths[:S]):
-            mask_fp = os.path.join(sky_dir, os.path.splitext(os.path.basename(p))[0] + ".png")
-            try:
-                if os.path.exists(mask_fp):
-                    sky = cv2.imread(mask_fp, cv2.IMREAD_GRAYSCALE)  # 255=non-sky, 0=sky
-                else:
-                    if self.skyseg_session is None:
-                        self.skyseg_session = onnxruntime.InferenceSession(onnx_path)
-                    sky = segment_sky(p, self.skyseg_session, mask_fp)
-                if sky is None:
-                    continue
-                if sky.shape[0] != H or sky.shape[1] != W:
-                    sky = cv2.resize(sky, (W, H), interpolation=cv2.INTER_NEAREST)
-                nonsky = (sky > 0.1).astype(wpc.dtype)  # 1=keep (non-sky), 0=drop (sky)
-                wpc[i] *= nonsky
-                n += 1
-            except Exception as _e:
-                print(f"[STAC sky] frame {os.path.basename(p)} skip ({_e})")
+        from loop_utils.sky_mask import apply_sky_masks
+        from loop_utils.visual_util import segment_sky
+        apply_sky_masks(wpc, chunk_image_paths,
+                        os.path.join(os.path.dirname(self.result_unaligned_dir), "sky_masks"),
+                        model_path=_stac_skyseg_path(), segment=segment_sky, log=print)
         predictions['world_points_conf'] = wpc
-        print(f"[STAC sky] masked sky on {n}/{S} chunk frames")
 
     def _stac_layout_stamp(self):
         """This run's chunk layout as the products stamp it. Written only on an
@@ -322,6 +326,106 @@ class VGGT_Long:
                 f"{what} was written for the chunk layout {prev}, this run's layout is "
                 f"{now} — the outputs on disk are of ANOTHER chunk plan; re-run with "
                 f"replace, or let the map worker wipe them")
+
+    # ── THE FORK STAMP (docs/plan_determinismo.md point 9, loop_utils.fork_stamp) ───────
+    # computed once in run() — the keyframes' images, the Omega weights, the DA3 anchors,
+    # skyseg.onnx, the fork's code + the Omega package + the server modules it imports, the
+    # whole fork config, the frame list, the loop candidates and the numerics environment —
+    # and held against fork_stamp.json: products of another stamp are DELETED and the run
+    # recomputes from the start. Its digest travels in every artifact written afterwards.
+
+    def _stac_stamp_digest(self):
+        st = getattr(self, '_stac_run_stamp', None)
+        return None if st is None else str(st["sha256"])
+
+    def _stac_with_stamp(self, doc):
+        """``doc`` with this run's fork-stamp digest (when the run computed one)."""
+        d = self._stac_stamp_digest()
+        if d is not None:
+            doc["fork_stamp"] = d
+        return doc
+
+    def _stac_check_fork_stamp(self, doc, what):
+        """A resume artifact of ANOTHER run stamp stops the run: after the reconcile in
+        run() every product on disk is this stamp's, so a mismatch is a broken invariant
+        (a stage driven alone, without run(), has no stamp and passes)."""
+        from loop_utils.fork_stamp import check_artifact
+        check_artifact(doc, self._stac_stamp_digest(), what, error=_StacPlanMismatch)
+
+    def _stac_environment_key(self):
+        """What the run's numerics depend on beyond code / config / inputs (plan point 12):
+        the card model and its driver, torch / CUDA / cuDNN, the autocast dtype and the torch
+        numerics settings — part of the run stamp, so a product made on another card or library is
+        never resumed."""
+        repro = _stac_repro()
+        card = repro.card_identity(0)
+        drivers = {c["uuid"]: c["driver_version"] for c in repro.gpu_cards()}
+        if card["uuid"] not in drivers:
+            raise RuntimeError(f"[STAC env] nvidia-smi does not list the card {card['uuid']} — "
+                               f"its driver cannot be stamped (plan point 12)")
+        return {"card": card["key"], "driver": drivers[card["uuid"]],
+                "torch": str(torch.__version__),
+                "cuda": str(torch.version.cuda),
+                "cudnn": int(torch.backends.cudnn.version() or 0),
+                "amp_dtype": str(self.dtype), "numerics": repro.torch_numerics_record()}
+
+    def _stac_require_deterministic_numerics(self, where):
+        """The process runs with repro's deterministic torch settings (set in __main__): a
+        library that turned TF32 / benchmarking back on, or deterministic algorithms off, is
+        refused (plan point 12)."""
+        rec = _stac_repro().torch_numerics_record()
+        want = {"deterministic_algorithms": True, "deterministic_warn_only": False,
+                "cudnn_deterministic": True, "cudnn_benchmark": False,
+                "cudnn_allow_tf32": False, "matmul_allow_tf32": False}
+        bad = {k: rec[k] for k, v in want.items() if rec[k] != v}
+        if bad:
+            raise RuntimeError(f"[STAC env] {where}: torch numerics {bad} — the fork runs with "
+                               f"deterministic algorithms STRICT and TF32 off "
+                               f"(repro.enable_deterministic_torch, plan point 12)")
+        return rec
+
+    def _stac_write_environment(self):
+        """omega_environment.json (plan point 12): repro.environment_record(gpu=True) — card,
+        driver, torch / CUDA / cuDNN, BLAS core, CPU, libraries, git state of the repo and
+        every fork — plus the numerics torch runs with NOW (checked: deterministic STRICT, TF32
+        off) and the fixed autocast dtypes. Deterministic content: no time, host or pid."""
+        import json as _json
+        repro = _stac_repro()
+        rec = repro.environment_record(gpu=True)
+        rec["torch_numerics"] = self._stac_require_deterministic_numerics("after the model load")
+        rec["amp_dtype"] = str(self.dtype)
+        rec["salad_amp_dtype"] = "torch.float16"      # LoopModels.LoopModel (fixed, CUDA only)
+        rec["fork_stamp"] = self._stac_stamp_digest()
+        path = os.path.join(self.output_dir, "omega_environment.json")
+        with open(path + ".tmp", "w") as f:
+            _json.dump(rec, f, indent=1, sort_keys=True)
+        os.replace(path + ".tmp", path)
+        g = rec.get("gpu") or {}
+        print(f"[STAC env] {g.get('name')} (driver {g.get('driver_version')}), torch "
+              f"{(rec.get('torch') or {}).get('version')}, amp {self.dtype}, deterministic "
+              f"STRICT, TF32 off → omega_environment.json")
+
+    def _stac_verify_run_stamp(self):
+        """Compute this run's stamp and reconcile the run directory with it
+        (loop_utils.fork_stamp.reconcile): the same stamp resumes the products on disk; any
+        difference deletes them (and the anchors the old run extracted itself) and the run
+        starts over. The digest travels in every artifact written from here on."""
+        from loop_utils import fork_stamp as FS
+        saved = FS.read_saved(self.output_dir)
+        anchor_dir = (self.config['Model'].get('metric_lock') or {}).get('anchor_dir')
+        now = FS.run_stamp(
+            img_list=self.img_list, img_dir=self.img_dir, config=self.config,
+            loop_cands=getattr(self, 'loop_cands', None), output_dir=self.output_dir,
+            skyseg=(_stac_skyseg_path() if self.sky_mask else None),
+            exclude_anchors=FS.run_products(saved)["anchors"],
+            environment=self._stac_environment_key())
+        res = FS.reconcile(self.output_dir, now, anchor_dir=anchor_dir, saved=saved, log=print)
+        self._stac_run_stamp = now
+        print(f"[STAC stamp] fork stamp {now['sha256'][:12]}… ({len(now['inputs'])} input(s), "
+              f"{len(now['code'])} code file(s)) — "
+              + ("same stamp: the products on disk are resumed" if res["resumed"] else
+                 f"new stamp: {len(res['deleted'])} product(s) of another stamp deleted"))
+        return now
 
     def process_single_chunk(self, range_1, chunk_idx=None, range_2=None, is_loop=False,
                              extra_1=None, extra_2=None):
@@ -357,6 +461,8 @@ class VGGT_Long:
         if os.path.exists(save_path):
             try:
                 predictions = np.load(save_path, allow_pickle=True).item()
+                # plan point 9: an inference of another stamp (code / weights / mask / config)
+                self._stac_check_fork_stamp(predictions, save_path)
                 _n_on_disk = int(np.asarray(predictions['depth']).shape[0]
                                  if np.asarray(predictions['depth']).ndim == 3
                                  else np.asarray(predictions['depth']).shape[1])
@@ -432,6 +538,8 @@ class VGGT_Long:
             _stac_images_to_u8(predictions)
             if self._stac_layout_stamp() is not None:
                 predictions['_stac_range'] = [int(range_1[0]), int(range_1[1])]
+        if self._stac_stamp_digest() is not None:
+            predictions['_stac_fork_stamp'] = self._stac_stamp_digest()   # plan point 9
 
         np.save(save_path, predictions)
 
@@ -448,8 +556,10 @@ class VGGT_Long:
         from loop_utils.metric_lock import (chunk_scale, chunk_anchor_ratios,
                                             apply_scale, apply_scale_drift,
                                             real_frame_number,
-                                            seam_relative_scale, solve_scale_graph,
+                                            seam_relative_scale, seam_scale_error,
+                                            solve_scale_graph,
                                             solve_scale_drift, scale_drift_gate,
+                                            zoom_anchor_test,
                                             chunk_tri_angle, flag_sick_chunks,
                                             flag_suspect_chunks)
         anchor_dir = ml['anchor_dir']
@@ -468,6 +578,10 @@ class VGGT_Long:
             except Exception:
                 _prev_doc = None
             self._stac_check_layout_stamp(_prev_doc, _prev_path)
+            # plan point 9: which chunks are already scaled is known only to the run that
+            # scaled them — a lock of another stamp stops the run
+            self._stac_check_fork_stamp(_prev_doc if isinstance(_prev_doc, dict) else None,
+                                        _prev_path)
             try:
                 already = {int(k) for k, v in _json.load(open(_prev_path))
                            .get("chunks", {}).items() if v.get("s") is not None
@@ -477,7 +591,7 @@ class VGGT_Long:
             except Exception:
                 already = set()
 
-        report = {"chunks": {}, "loops": {}, "seams": {}}
+        report = self._stac_with_stamp({"chunks": {}, "loops": {}, "seams": {}})
         if self._stac_layout_stamp() is not None:
             report["chunk_indices"] = self._stac_layout_stamp()
         scales = {}
@@ -485,8 +599,11 @@ class VGGT_Long:
         seam_rel = {}
         anchors_pos = {}     # chunk -> [(u in [0,1], ratio)] positioned DA3 anchors
         seam_obs = {}        # seam k -> [(u_k, u_{k+1}, r)] per-shared-frame scale
+        seam_frames = {}     # seam k -> [global frame] of each seam observation
+        seam_err = {}        # seam k -> [measured error (log) of each observation]
         tri_map = {}         # chunk -> triangulation angle (health gate signal 1)
         fx_map = {}          # chunk -> median estimated focal (zoom detector)
+        fx_frames = {}       # chunk -> per-frame focals (the zoom rule's sample)
         prev_shared = None   # (chunk_idx, {global_frame: depth}) for the seam ratio
         # 1) main chunks: DA3 absolute scale per chunk + RELATIVE scale per seam
         # (same frame, same pixels, in both neighbours — the precise sensor)
@@ -519,7 +636,9 @@ class VGGT_Long:
                                          data.get("world_points_conf"),
                                          data.get("extrinsic"))
             if data.get("intrinsic") is not None:
-                fx_map[k] = float(np.median(np.asarray(data["intrinsic"])[:, 0, 0]))
+                _fxk = np.asarray(data["intrinsic"], np.float64)[:, 0, 0]
+                fx_map[k] = float(np.median(_fxk))
+                fx_frames[k] = _fxk
             # seam with the previous chunk: ratio over ALL shared frames —
             # kept per frame WITH its position inside both chunks (the drift
             # model needs to know WHERE on each chunk the seam was measured)
@@ -538,6 +657,9 @@ class VGGT_Long:
                             u_cur = ((g - start) / (S_k - 1) if S_k > 1 else 0.5)
                             seam_obs.setdefault(k - 1, []).append(
                                 (u_prev, u_cur, r))
+                            seam_frames.setdefault(k - 1, []).append(int(g))
+                            seam_err.setdefault(k - 1, []).append(
+                                seam_scale_error(prev_shared[1][g], depth_k[local]))
                 if rs:
                     seam_rel[k - 1] = float(np.median(rs))
                     report["seams"][str(k - 1)] = {"rel": seam_rel[k - 1],
@@ -559,24 +681,46 @@ class VGGT_Long:
         # the seam graph carries scale into them from their neighbours (seam
         # ratios are relative depth on shared frames — zoom does not break
         # them the way it breaks DA3's absolute metre).
+        # USER 2026-10-07 (plan point 18): a chunk is ZOOMED only when its focal differs from
+        # the rest of the session SIGNIFICANTLY (the whole 95 % bootstrap interval of the
+        # median difference off zero) AND by >= improvement_error_factor (the user's 2) x the
+        # chunk's own measured fx error (the scatter of its per-frame focals) — the old
+        # robust-z cut over a MAD of five chunk medians is gone. A majority needs three
+        # chunks: with two, the odd one cannot be named.
         zoom_chunks = set()
-        if ml.get('zoom_scale_fix', True) and len(fx_map) >= 3:
-            _fxv = np.array(list(fx_map.values()), np.float64)
-            _fmed = float(np.median(_fxv))
-            _fmad = float(np.median(np.abs(_fxv - _fmed)))
-            if _fmad > 0:
-                for k, v in fx_map.items():
-                    z = abs(v - _fmed) / (1.4826 * _fmad)
-                    if z > 3.5 and k in scales:
-                        zoom_chunks.add(k)
-                        report["chunks"].setdefault(str(k), {})[
-                            "zoom_anchor_excluded"] = True
-                        scales.pop(k, None)
-                        n_anchor_map.pop(k, None)
-                        print(f"[metric-lock] chunk {k}: optical ZOOM (fx {v:.0f} "
-                              f"vs session {_fmed:.0f}, z={z:.1f}) — DA3 anchors "
-                              f"EXCLUDED, scale comes from the seam graph "
-                              f"(neighbours)")
+        if ml.get('zoom_scale_fix', True) and len(fx_frames) >= 3:
+            from loop_utils.loop_bridges import cfg_req
+            _gcfg = self._stac_graph_cfg()
+            _conf = float(cfg_req(_gcfg, "heldout_confidence", "graph"))
+            _fac = float(cfg_req(_gcfg, "improvement_error_factor", "graph"))
+            report["zoom"] = {}
+            from loop_utils.metric_lock import inference_focal_error
+            _inf_err = inference_focal_error(fx_frames, self.chunk_indices)
+            if _inf_err is not None:
+                print(f"[metric-lock] Omega's focal error between inferences (the same frames in "
+                      f"two chunks): {_inf_err:.2f} px — a chunk's focal must depart by more than "
+                      f"that to read as a zoom")
+            for k in sorted(fx_frames):
+                _rest = np.concatenate([fx_frames[j] for j in sorted(fx_frames) if j != k])
+                zt = zoom_anchor_test(fx_frames[k], _rest, error_factor=_fac,
+                                      confidence=_conf, inference_error_px=_inf_err)
+                report["zoom"][str(k)] = zt
+                if zt["zoomed"] and k in scales:
+                    zoom_chunks.add(k)
+                    report["chunks"].setdefault(str(k), {})[
+                        "zoom_anchor_excluded"] = True
+                    scales.pop(k, None)
+                    n_anchor_map.pop(k, None)
+                    print(f"[metric-lock] chunk {k}: optical ZOOM (fx {zt['fx_chunk_median']:.0f} "
+                          f"vs session {zt['fx_rest_median']:.0f}, CI [{zt['ci_low']:+.1f}, "
+                          f"{zt['ci_high']:+.1f}] px, |Δ| {abs(zt['diff_px']):.1f} >= "
+                          f"{_fac:g} x {zt['fx_error_px']:.2f} px) — DA3 anchors EXCLUDED, "
+                          f"scale comes from the seam graph (neighbours)")
+                elif "diff_px" in zt:
+                    print(f"[metric-lock] chunk {k}: fx {zt['fx_chunk_median']:.1f} vs session "
+                          f"{zt['fx_rest_median']:.1f} (CI [{zt['ci_low']:+.2f}, "
+                          f"{zt['ci_high']:+.2f}] px, error {zt['fx_error_px']:.2f} px, "
+                          f"margin {zt['error_margin_px']:+.2f} px) — not zoomed")
 
         # 2) fuse both sensors: seams make neighbours CONSISTENT (0.1-1% noise),
         # anchors pin the global metre (±8-15% each). Weighted LS in log space.
@@ -640,7 +784,13 @@ class VGGT_Long:
         drift_frames = None
         n_chunks_all = len(self.chunk_indices)
         if ml.get('scale_drift', True) and not already and anchors_pos and seam_obs:
-            ok, info = scale_drift_gate(anchors_pos, scales, seam_obs, n_chunks_all)
+            from loop_utils.loop_bridges import cfg_req
+            _gcfg = self._stac_graph_cfg()
+            ok, info = scale_drift_gate(
+                anchors_pos, scales, seam_obs, n_chunks_all,
+                seam_frames=seam_frames, seam_err=seam_err,
+                error_factor=float(cfg_req(_gcfg, "improvement_error_factor", "graph")),
+                confidence=float(cfg_req(_gcfg, "heldout_confidence", "graph")))
             report["drift"] = dict(info, verdict="APPLY" if ok else "SKIP")
             if ok:
                 s0, s1 = solve_scale_drift(anchors_pos, seam_obs, n_chunks_all,
@@ -740,7 +890,7 @@ class VGGT_Long:
                     (np.percentile(r, 75) - np.percentile(r, 25)) / np.median(r))
             else:
                 anchor_iqr[k_int] = None
-        sick = flag_sick_chunks(tri_map, anchor_iqr, fx_median=fx_map)
+        sick = flag_sick_chunks(tri_map, anchor_iqr, zoom=report.get("zoom"))
         suspect = flag_suspect_chunks(anchor_iqr, sick=sick,
                                       spread_cut=float(ml.get('suspect_spread', 0.30)))
         # resume: chunks whose unaligned npy is already consumed cannot be re-evaluated
@@ -752,6 +902,8 @@ class VGGT_Long:
             except Exception:
                 _prev_health_doc = None
             self._stac_check_layout_stamp(_prev_health_doc, _health_path)
+            self._stac_check_fork_stamp(_prev_health_doc if isinstance(_prev_health_doc, dict)
+                                        else None, _health_path)          # plan point 9
             try:
                 _prev_health = _prev_health_doc
                 for k_str, rs in (_prev_health.get("sick") or {}).items():
@@ -776,7 +928,7 @@ class VGGT_Long:
             _tt = ", ".join(f"{k}:{v:.2f}" for k, v in sorted(self._stac_chunk_trust.items()))
             print(f"[health] chunk trust (measured, 0.5 = as good as the session's "
                   f"median): {_tt}")
-        _health_doc = {}
+        _health_doc = self._stac_with_stamp({})
         if self._stac_layout_stamp() is not None:
             _health_doc["chunk_indices"] = self._stac_layout_stamp()
         with open(_health_path, "w") as f:
@@ -1020,6 +1172,14 @@ class VGGT_Long:
         thr = getattr(self, '_stac_write_thr', {}).get(K)
         if thr is None:
             thr = self._stac_conf_threshold(confs)
+        _ratio = float(self.config['Model']['Pointcloud_Save']['sample_ratio'])
+        if _ratio != 1.0:
+            # the origins below are 1:1 with the PLY only when every point is written, and
+            # the vendor's reservoir sampler draws from the process-global RNG — a different
+            # subset whenever anything before it drew a different count (plan point 11)
+            raise RuntimeError(f"Model.Pointcloud_Save.sample_ratio is {_ratio:g} — the STAC "
+                               f"chunk writer needs 1.0 (origins 1:1 with the PLY, no random "
+                               f"subsample)")
         save_confident_pointcloud_batch(
             points=points,
             colors=colors,
@@ -1036,6 +1196,7 @@ class VGGT_Long:
         copy — EXACT pixel-to-pixel correspondences, robust to the intra-frame
         non-rigid noise (IRLS Cauchy)."""
         from loop_utils.metric_lock import robust_rigid
+        from loop_utils.stable_sample import pixel_keys
         fits, report_seams = {}, {}
         prev_tail = None      # (k, {g: (points [HW,3] f32, conf [HW] f32)})
         for k, (start, end) in enumerate(self.chunk_indices):
@@ -1065,7 +1226,8 @@ class VGGT_Long:
                         d = p_dst[ok].astype(np.float64) - p_src[ok].astype(np.float64)
                         entry["before_m"] = float(np.median(np.linalg.norm(d, axis=1)))
                         before_all.append(entry["before_m"])
-                    fit = robust_rigid(p_src[ok], p_dst[ok])
+                    fit = robust_rigid(p_src[ok], p_dst[ok],
+                                       keys=pixel_keys(int(g), np.flatnonzero(ok)))
                     if fit is not None:
                         R_, t_, res_, n_ = fit
                         sf[g] = (R_, t_)
@@ -1131,7 +1293,13 @@ class VGGT_Long:
         if os.path.exists(seams_path):
             try:
                 prev = _json.load(open(seams_path))
-                if prev.get("chunk_indices") == [list(ci) for ci in self.chunk_indices]:
+            except ValueError as _e:
+                prev = None
+                print(f"[elastic] elastic_seams.json unreadable ({_e}) — refitting")
+            if prev is not None:
+                self._stac_check_fork_stamp(prev, seams_path)              # plan point 9
+            try:
+                if prev is not None and prev.get("chunk_indices") == [list(ci) for ci in self.chunk_indices]:
                     fits = {int(j): {int(g): (np.asarray(v["R"], np.float64),
                                               np.asarray(v["t"], np.float64))
                                      for g, v in d.items() if "R" in v}
@@ -1139,7 +1307,7 @@ class VGGT_Long:
                     report = prev        # a resumed run judges proportion too
                     print(f"[elastic] resume: fits loaded from elastic_seams.json "
                           f"({sum(len(d) for d in fits.values())} frame fits)")
-                else:
+                elif prev is not None:
                     print("[elastic] elastic_seams.json belongs to another chunk plan "
                           "— refitting")
             except Exception as _e:
@@ -1147,7 +1315,7 @@ class VGGT_Long:
         if fits is None:
             fits, report = self._stac_elastic_fit_seams()
             with open(seams_path, "w") as f:
-                _json.dump(report, f, indent=1)
+                _json.dump(self._stac_with_stamp(report), f, indent=1)
 
         # Tame the raw fits WITHOUT an absolute ceiling (USER 2026-09-16:
         # *"podría haber una corrección de más de 30 cm y ser perfectamente
@@ -1291,6 +1459,7 @@ class VGGT_Long:
                                             robust_rigid, filter_pair_fits,
                                             solve_chunk_field, blend_chunk_fields,
                                             chunk_field_verdict, se3_matrices)
+        from loop_utils.stable_sample import stable_pick
         N = len(self.img_list)
 
         ic_path = os.path.join(self.output_dir, "intra_chunk.json")
@@ -1298,11 +1467,14 @@ class VGGT_Long:
         if os.path.exists(ic_path):
             try:
                 prev = _json.load(open(ic_path))
+            except ValueError as _e:
+                prev = None
+                print(f"[intra-chunk] intra_chunk.json unreadable ({_e}) — remeasuring")
+            if prev is not None:
+                self._stac_check_fork_stamp(prev, ic_path)                 # plan point 9
                 if prev.get("chunk_indices") == [list(ci) for ci in self.chunk_indices]:
                     xi = np.asarray(prev["xi"], np.float64)
                     print("[intra-chunk] resume: solution loaded from intra_chunk.json")
-            except Exception as _e:
-                print(f"[intra-chunk] intra_chunk.json unreadable ({_e}) — remeasuring")
 
         if xi is None:
             fit_offsets = (1, 2, 3, 5, 8, 12)
@@ -1342,13 +1514,17 @@ class VGGT_Long:
                         pq = surface_pair_correspondences(
                             cache[f][0], cache[f][1],
                             cache[g][0], cache[g][1], cache[g][2], cache[g][3],
-                            conf_min_norm=self._stac_pose_conf_floor())
+                            seed=start + f,       # stable pixel keys of the source keyframe
+                            conf_min_norm=self._stac_pose_conf_floor(), return_keys=True)
                         if pq is None:
                             continue
                         if d in holdout_offsets:
-                            held.append((f, g, pq[0][:2000], pq[1][:2000]))
+                            # 2000 judge pairs chosen by their stable pixel key (plan point
+                            # 11 — the first 2000 of a key-ordered list would be the top rows)
+                            _hs = stable_pick(pq[2], 2000)
+                            held.append((f, g, pq[0][_hs], pq[1][_hs]))
                             continue
-                        fit = robust_rigid(pq[0], pq[1], sample=8000)
+                        fit = robust_rigid(pq[0], pq[1], sample=8000, keys=pq[2])
                         if fit is not None:
                             fits.append((f, g, fit[0], fit[1], fit[2], fit[3]))
                 del cache
@@ -1382,8 +1558,9 @@ class VGGT_Long:
                   f"earned; blended max correction "
                   f"{float(np.max(np.linalg.norm(xi[:, 3:], axis=1))) * 100:.1f} cm")
             with open(ic_path, "w") as f_:
-                _json.dump({"chunk_indices": [list(ci) for ci in self.chunk_indices],
-                            "xi": xi.tolist(), "chunks": report}, f_, indent=1)
+                _json.dump(self._stac_with_stamp(
+                    {"chunk_indices": [list(ci) for ci in self.chunk_indices],
+                     "xi": xi.tolist(), "chunks": report}), f_, indent=1)
 
         X = se3_matrices(xi)
         if self._stac_authority_cfg():
@@ -1454,8 +1631,10 @@ class VGGT_Long:
             return
         import json as _json
         from loop_utils.metric_lock import (depth_pair_samples, pair_depth_relation,
+                                            pair_relation_error,
                                             solve_depth_graph, apply_depth_correction,
                                             frame_owner)
+        from loop_utils.loop_bridges import cfg_req
         N = len(self.img_list)
         owner = frame_owner(self.chunk_indices, N)
 
@@ -1464,11 +1643,14 @@ class VGGT_Long:
         if os.path.exists(dg_path):
             try:
                 prev = _json.load(open(dg_path))
+            except ValueError as _e:
+                prev = None
+                print(f"[depth-graph] depth_graph.json unreadable ({_e}) — remeasuring")
+            if prev is not None:
+                self._stac_check_fork_stamp(prev, dg_path)                 # plan point 9
                 if prev.get("chunk_indices") == [list(ci) for ci in self.chunk_indices]:
                     sol = (np.asarray(prev["a"], np.float64), np.asarray(prev["b"], np.float64))
                     print(f"[depth-graph] resume: solution loaded from depth_graph.json")
-            except Exception as _e:
-                print(f"[depth-graph] depth_graph.json unreadable ({_e}) — remeasuring")
 
         if sol is None:
             # per-frame owned view: points+conf+pose+K of each frame's canonical copy
@@ -1499,7 +1681,11 @@ class VGGT_Long:
             # judge of whether the per-frame model actually explains the data.
             fit_offsets = (1, 2, 3, 5, 8, 12)
             holdout_offsets = (4, 10)
-            meas, held, before_all = [], [], []
+            # the reference depth the held-out disagreement is read at (the verdict's own)
+            import inspect as _inspect
+            from loop_utils.metric_lock import depth_graph_verdict
+            _zref = float(_inspect.signature(depth_graph_verdict).parameters["zref"].default)
+            meas, held, held_err, before_all = [], [], [], []
             for f in sorted(cache):
                 for d in fit_offsets + holdout_offsets:
                     g = f + d
@@ -1507,7 +1693,8 @@ class VGGT_Long:
                         continue
                     zs = depth_pair_samples(cache[f][0], cache[f][1],
                                             cache[g][0], cache[g][1],
-                                            cache[g][2], cache[g][3])
+                                            cache[g][2], cache[g][3],
+                                            seed=f)   # stable pixel keys of keyframe f
                     if zs is None:
                         continue
                     rel = pair_depth_relation(zs[0], zs[1])
@@ -1517,6 +1704,9 @@ class VGGT_Long:
                     (meas if d in fit_offsets else held).append((f, g, al, be))
                     if d in fit_offsets:
                         before_all.append(before)
+                    else:
+                        # the held-out pair's own measured resolution (plan point 19)
+                        held_err.append(pair_relation_error(zs[0], zs[1], _zref))
             del cache
             if len(meas) < N // 4 or len(held) < N // 8:
                 print(f"[depth-graph] too thin ({len(meas)} fit / {len(held)} held-out "
@@ -1536,7 +1726,9 @@ class VGGT_Long:
             #      bounded a_f cannot produce the offset warp.
             # A rung applies only if it is BOTH bounded and improving; otherwise
             # try the next; no rung → geometry untouched.
-            from loop_utils.metric_lock import depth_graph_verdict
+            _gcfg = self._stac_graph_cfg()
+            _conf = float(cfg_req(_gcfg, "heldout_confidence", "graph"))
+            _fac = float(cfg_req(_gcfg, "improvement_error_factor", "graph"))
             print(f"[depth-graph] {len(meas)} fit + {len(held)} held-out pairs — "
                   f"disagreement before {np.median(before_all) * 100:.2f}% median")
             ladder = []
@@ -1545,12 +1737,14 @@ class VGGT_Long:
             verdict, model = "SKIP", None
             for rung, kw in (("affine", {}), ("scale-only", {"scale_only": True})):
                 a_r, b_r = solve_depth_graph(meas, N, **kw)
-                v = depth_graph_verdict(a_r, b_r, meas, held)
+                v = depth_graph_verdict(a_r, b_r, meas, held, held_err=held_err,
+                                        error_factor=_fac, confidence=_conf)
                 ladder.append(dict(v, model=rung))
                 print(f"[depth-graph] {rung}: held-out {v['med_before'] * 100:.2f}% -> "
                       f"{v['med_after'] * 100:.2f}% | a[{a_r.min():.4f},{a_r.max():.4f}] "
                       f"b[{b_r.min() * 100:.1f},{b_r.max() * 100:.1f}]cm | "
-                      f"bounded={v['bounded']} improves={v['improves']}")
+                      f"bounded={v['bounded']} improves={v['improves']} "
+                      f"({v['decision']['reason']})")
                 if v["bounded"] and v["improves"]:
                     a, b = a_r, b_r
                     verdict, model = "APPLY", rung
@@ -1562,7 +1756,8 @@ class VGGT_Long:
                       f"scan's depth disagreement — geometry left UNTOUCHED (an "
                       f"unearned correction is a warp, not a fix). See depth_graph.json.")
             with open(dg_path, "w") as f_:
-                _json.dump({"chunk_indices": [list(ci) for ci in self.chunk_indices],
+                _json.dump({**self._stac_with_stamp({}),
+                            "chunk_indices": [list(ci) for ci in self.chunk_indices],
                             "verdict": verdict, "model": model,
                             "ladder": ladder,
                             "a": a.tolist(), "b": b.tolist(),
@@ -1962,7 +2157,8 @@ class VGGT_Long:
             _p1 = np.asarray(pm1, np.float64).reshape(-1, 3)
             _p2 = np.asarray(pm2, np.float64).reshape(-1, 3)
             _ok = (np.asarray(c1).reshape(-1) > 1e-5) & (np.asarray(c2).reshape(-1) > 1e-5)
-            fit = robust_rigid(_p2[_ok], _p1[_ok])
+            fit = robust_rigid(_p2[_ok], _p1[_ok],
+                               keys=self._stac_seam_keys(chunk_idx, pm1, _ok))
             if fit is not None:
                 R, t, res, n = fit
                 seq.append((1.0, R, t))
@@ -2052,9 +2248,12 @@ class VGGT_Long:
             wp = wp[0] if wp.ndim == 5 else wp
             local = int(g) - self._o.chunk_indices[k][0]
             cf = np.asarray(d['world_points_conf']).reshape(wp.shape[:3])[local].reshape(-1)
-            p = wp[local].reshape(-1, 3)[cf > 1e-5].astype(np.float64)
-            if len(p) > n:
-                p = p[np.random.default_rng(seed).choice(len(p), int(n), replace=False)]
+            from loop_utils.stable_sample import pixel_keys, stable_pick
+            idx = np.flatnonzero(cf > 1e-5)
+            if len(idx) > n:
+                # stable per-pixel choice (plan point 11); ``seed`` salts it
+                idx = idx[stable_pick(pixel_keys(int(g), idx), int(n), salt=seed)]
+            p = wp[local].reshape(-1, 3)[idx].astype(np.float64)
             s, R, t = self._cum[k]
             return float(s) * (p @ np.asarray(R).T) + np.asarray(t)
 
@@ -2204,6 +2403,12 @@ class VGGT_Long:
         mod.extract_anchor_depths(frames_dir=ae['frames_dir'], output_dir=ae['output_dir'],
                                   anchor_files=missing, model_id=ae['model_id'],
                                   python=ae['python'], log=print)
+        # plan point 9: anchors this run extracted are its PRODUCTS, not its inputs — recorded
+        # in fork_stamp.json (left out of a resume's stamp, deleted with a stale run's products)
+        if self._stac_stamp_digest() is not None:
+            from loop_utils.fork_stamp import record_run_products
+            record_run_products(self.output_dir, anchors=[
+                f"frame_{real_frame_number(m)}.npz" for m in missing])
 
     def _stac_lock_bridges(self):
         """Metric-lock every bridge: own DA3 anchors when present, else the
@@ -2262,15 +2467,16 @@ class VGGT_Long:
     def _stac_scale_close(self, meas_sim3):
         """§5.1–5.3: re-solve the scale graph WITH the loop rows and apply the
         residual factor δ_k = s_v2/s_v1 to every chunk (and to bridges locked
-        from their parents). Scale breaks are diagnosed, everything lands in
-        scale_graph.json. Resume-safe (metric_lock.json + npy stamp)."""
+        from their parents). Each loop row enters with its measured scale
+        disagreement in quadrature to its σ (plan point 17 — no break threshold)
+        and is diagnosed; everything lands in scale_graph.json, with the scale
+        each bridge still disagrees by after the close (its pose-edge σ term).
+        Resume-safe (metric_lock.json + npy stamp)."""
         import json as _json
-        from loop_utils.loop_bridges import cfg_req, loop_scale_row
+        from loop_utils.loop_bridges import cfg_req, loop_scale_row, scale_row_sigma
         from loop_utils.metric_lock import (solve_scale_graph, scale_break_diagnosis,
                                             apply_scale, seam_residuals)
         scfg = self._stac_scale_cfg() or {}
-        lcfg = self._stac_loops_cfg()
-        ml = self.config['Model'].get('metric_lock') or {}
         inputs = getattr(self, '_stac_scale_inputs', None)
         s_v1 = getattr(self, '_stac_scales_applied', None)
         n_chunks = len(self.chunk_indices)
@@ -2280,22 +2486,42 @@ class VGGT_Long:
             print("[scale-graph] metric lock did not run this session (resume) — loop "
                   "rows cannot be added to a lock that was applied in a previous run; "
                   "the scale graph stays as locked")
+            # plan point 17: the scale each bridge still disagrees with the closed chunks
+            # enters its pose-edge σ — read back exactly as the run that closed the scale
+            # wrote it (scale_graph.json, this run stamp); without that record it is measured
+            # on the chunks as they are now (declared)
+            self._stac_bridge_scale_resid = {}
+            if os.path.exists(sg_path):
+                _sg = _json.load(open(sg_path))
+                self._stac_check_fork_stamp(_sg, sg_path)
+                self._stac_bridge_scale_resid = {
+                    int(k): float(v) for k, v in (_sg.get("bridge_scale_residual_log") or {}).items()}
+                print(f"[scale-graph] {len(self._stac_bridge_scale_resid)} bridge scale "
+                      f"residual(s) read back from scale_graph.json")
+            else:
+                self._stac_bridge_scale_resid = {
+                    li: float(loop_scale_row(m["s_ab"])) for li, m in enumerate(meas_sim3)
+                    if m.get("ok")}
+                print(f"[scale-graph] no scale_graph.json — {len(self._stac_bridge_scale_resid)} "
+                      f"bridge scale disagreement(s) measured on the chunks as they are")
             return
         sigma_loop = float(cfg_req(scfg, "sigma_loop", "scale"))
-        tol_log = float(cfg_req(lcfg, "scale_tol_log", "loops"))
-        sb_factor = float(cfg_req(lcfg, "scale_break_sigma_factor", "loops"))
         loop_rel, loop_rows = {}, []
+        self._stac_loop_scale_meas = {}     # bridge -> log r measured on the v1 chunks
         for li, ((item, pred, meta), meas) in enumerate(zip(self.loop_predict_list, meas_sim3)):
             ka, kb = int(item[0]), int(item[2])
-            if not meas.get("ok") or ka == kb:
+            if not meas.get("ok"):
                 continue
             # measured on v1-locked chunks → express in RAW terms for the joint solve
             log_r_meas = loop_scale_row(meas["s_ab"])
+            self._stac_loop_scale_meas[li] = (ka, kb, float(log_r_meas))
+            if ka == kb:
+                continue                  # an intra-chunk bridge gives no scale row
             log_r_raw = log_r_meas + np.log(s_v1[kb]) - np.log(s_v1[ka])
-            sig = sigma_loop
-            is_break = abs(log_r_meas) > tol_log
-            if is_break:
-                sig *= sb_factor
+            # USER 2026-10-07 (plan point 17): no threshold, no factor — the row's measured
+            # scale disagreement is added IN QUADRATURE to its σ (continuous); the old
+            # σ x scale_break_sigma_factor beyond |log r| > scale_tol_log is gone
+            sig = scale_row_sigma(sigma_loop, log_r_meas)
             key = (ka, kb)
             if key in loop_rel:           # several bridges between the same chunks: mean
                 prev = loop_rel[key]
@@ -2304,7 +2530,8 @@ class VGGT_Long:
                 loop_rel[key] = (log_r_raw, sig)
             loop_rows.append({"bridge": li, "chunks": [ka, kb], "s_ab": meas["s_ab"],
                               "log_r_measured": float(log_r_meas), "sigma": float(sig),
-                              "scale_break": bool(is_break)})
+                              "sigma_loop": sigma_loop,
+                              "sigma_rule": "hypot(sigma_loop, |log r measured|)"})
         absolute = list(inputs.get("absolute") or [])
         s_v2 = solve_scale_graph(inputs["s_da3"], inputs["n_anchors"], inputs["seam_rel"],
                                  n_chunks, sigma_seam=inputs["sigma_seam"],
@@ -2322,22 +2549,23 @@ class VGGT_Long:
                                   n_chunks, sigma_seam=inputs["sigma_seam"],
                                   sigma_anchor=inputs["sigma_anchor"],
                                   loop_rel={}, absolute=[])
+        # every loop row's disagreement is DIAGNOSED (report only): where along the seams it
+        # would sit — no threshold decides which rows are 'breaks' any more (point 17)
         breaks = []
         for row in loop_rows:
-            if row["scale_break"]:
-                d = scale_break_diagnosis(inputs["s_da3"], inputs["n_anchors"], inputs["seam_rel"],
-                                          n_chunks, loop_rel, tuple(row["chunks"]),
-                                          inputs["sigma_seam"], inputs["sigma_anchor"],
-                                          absolute=absolute,
-                                          localisation_gap=float(cfg_req(
-                                              scfg, "break_localisation_gap", "scale")))
-                d["bridge"] = row["bridge"]
-                breaks.append(d)
-                print(f"[scale-graph] SCALE BREAK on loop {row['chunks']}: suspect seam "
-                      f"{d['suspect_seam']}->{(d['suspect_seam'] or 0) + 1}, jump "
-                      f"{d['jump_pct']:.2f}% "
-                      f"({'localised' if d.get('localised') else 'AMBIGUOUS — one cycle, weak absolute witnesses'}; "
-                      f"see scale_graph.json)")
+            d = scale_break_diagnosis(inputs["s_da3"], inputs["n_anchors"], inputs["seam_rel"],
+                                      n_chunks, loop_rel, tuple(row["chunks"]),
+                                      inputs["sigma_seam"], inputs["sigma_anchor"],
+                                      absolute=absolute,
+                                      localisation_gap=float(cfg_req(
+                                          scfg, "break_localisation_gap", "scale")))
+            d["bridge"] = row["bridge"]
+            d["log_r_measured"] = row["log_r_measured"]
+            breaks.append(d)
+            print(f"[scale-graph] loop {row['chunks']}: scale disagreement "
+                  f"{(np.exp(row['log_r_measured']) - 1) * 100:+.2f}% (σ {row['sigma']:.4f}); "
+                  f"most likely seam {d['suspect_seam']}->{(d['suspect_seam'] or 0) + 1}, "
+                  f"{'localised' if d.get('localised') else 'not localised'} — scale_graph.json")
         delta = {}
         for k in range(n_chunks):
             if (s_v1.get(k) is None or not np.isfinite(s_v2[k]) or s_v2[k] <= 0
@@ -2371,6 +2599,12 @@ class VGGT_Long:
                 meta["lock"]["delta_parents"] = f
         self._stac_scales_applied = {k: float(s_v1.get(k, 1.0) * delta[k]) for k in range(n_chunks)}
         self._stac_scale_delta = delta
+        # what each bridge STILL disagrees with the closed chunks it is about to constrain as a
+        # pose edge (log units): its measurement minus the relative factor the close applied.
+        # _stac_verify_loops adds it to the edge σ in quadrature (plan point 17)
+        self._stac_bridge_scale_resid = {
+            li: float(lr - (np.log(delta[kb_]) - np.log(delta[ka_])))
+            for li, (ka_, kb_, lr) in (getattr(self, '_stac_loop_scale_meas', {}) or {}).items()}
         if self._stac_authority_cfg():
             _acfg = self._stac_authority_cfg()
             _used = max(abs(float(np.log(v))) for v in delta.values()) if delta else 0.0
@@ -2381,7 +2615,7 @@ class VGGT_Long:
                                          "used_max_log": _used})
         # verifier bookkeeping: s_frames from the drift stage (when it ran)
         s_frames = getattr(self, '_stac_drift_frames', None)
-        rep = {"version": 1,
+        rep = {"version": 1, **self._stac_with_stamp({}),
                "n_chunks": n_chunks,
                **({"chunk_indices": self._stac_layout_stamp()}
                   if self._stac_layout_stamp() is not None else {}),
@@ -2398,7 +2632,11 @@ class VGGT_Long:
                "seam_residuals_log_v1": seam_residuals([s_v1.get(k, 1.0) for k in range(n_chunks)],
                                                         inputs["seam_rel"]),
                "seam_residuals_log_v2": seam_residuals(s_v2, inputs["seam_rel"]),
-               "scale_breaks": breaks,
+               "scale_diagnoses": breaks,
+               # plan point 17: what each bridge still disagrees in scale with the closed
+               # chunks (log), the term its pose-edge σ takes in quadrature
+               "bridge_scale_residual_log": {str(k): float(v) for k, v in
+                                             self._stac_bridge_scale_resid.items()},
                "s_frames": ({str(k): [float(x) for x in v] for k, v in s_frames.items()}
                             if s_frames else None)}
         with open(sg_path, "w") as f:
@@ -2463,8 +2701,12 @@ class VGGT_Long:
                 sa = fr.get(str(ni), {}).get("structural")
                 sb = fr.get(str(nj), {}).get("structural")
                 sem = {"a": sa, "b": sb}
+            # plan point 17: the scale this bridge still disagrees with the closed chunks
+            # (measured by the Sim3 pass, net of the close) enters its σ in quadrature —
+            # the rigid measurement here has s_ab = 1 by construction
+            _sres = (getattr(self, '_stac_bridge_scale_resid', {}) or {}).get(li)
             v = verify_loop(meas, lcfg, semantic=sem, spatial=meta.get("gate"),
-                            reference_m=reference_m)
+                            reference_m=reference_m, scale_disagreement_log=_sres)
             if not meas.get("ok"):
                 # starved exact fit → the VENDOR coarse fit, recorded as low confidence
                 coarse = self._stac_vendor_bridge_fit(item, pred, meta)
@@ -2492,7 +2734,7 @@ class VGGT_Long:
                     "sides": meas.get("sides"), "verdict": v, "status": v["status"],
                     "stage": "verification", "intra_chunk": ka == kb}
             edges.append(edge)
-            if v["status"] in ("accepted", "scale_break") and gcfg is not None:
+            if v["status"] == "accepted" and gcfg is not None:
                 # KEYFRAME edge for the SE(3) graph (§4.3): the relative pose
                 # between the two window centres as ONE Omega pass measured it
                 # (the bridge's own metric-locked extrinsics); σ_t = the verified
@@ -2527,7 +2769,7 @@ class VGGT_Long:
                            "bridge": li, "status": v["status"], "chunks": [ka, kb]}
                 self._stac_loop_edges_kf.append(kf_edge)
                 edge["keyframe_edge"] = kf_edge
-            if v["status"] in ("accepted", "scale_break") and ka != kb:
+            if v["status"] == "accepted" and ka != kb:
                 self._stac_loop_edges.append({"a": ka, "b": kb, "R_ab": np.asarray(meas["R_ab"]),
                                               "t_ab": np.asarray(meas["t_ab"]),
                                               "sigma_m": float(v["sigma_m"]),
@@ -2546,37 +2788,15 @@ class VGGT_Long:
             print(f"[loop-verify] bridge {li} chunks {ka}<->{kb} ({cand['source']} "
                   f"{cand['i']}<->{cand['j']}): {tag} {sig_txt}"
                   f"{'; '.join(v.get('reasons', []))}")
-        # ── σ from AGREEMENT: two independent bridges over the same chunk pair
-        # disagree by exactly as much as the measurement is uncertain. That
-        # disagreement is an error bar nobody had to invent (USER 2026-09-16);
-        # it replaces trusting a single fit's own optimism. The larger of the
-        # two — held-out error and cross-bridge spread — is what the edge
-        # carries, because a pair can agree by sharing the same systematic.
-        groups = {}
+        # NO "σ from agreement" (USER 2026-10-07): it compared the bridges' chunk-to-chunk
+        # translations at the chunk's ORIGIN, where 8°–45° of disagreement became metres
+        # (pccr: 556 cm for all three start↔end bridges, the good one included). Every edge
+        # keeps its own σ, measured at its place; whether bridges of one chunk pair agree is
+        # judged by their CYCLES in the pose graph (loop_judge.consistent_closures).
         for e in self._stac_loop_edges:
-            groups.setdefault((int(e["a"]), int(e["b"])), []).append(e)
-        kf_by_bridge = {int(k["bridge"]): k for k in self._stac_loop_edges_kf}
-        for (ka_, kb_), grp in groups.items():
-            if len(grp) < 2:
-                continue
-            T = np.asarray([np.asarray(e["t_ab"], np.float64).ravel() for e in grp])
-            d = [float(np.linalg.norm(T[i] - T[j]))
-                 for i in range(len(T)) for j in range(i + 1, len(T))]
-            spread = float(np.median(d))
-            for e in grp:
-                before = float(e["sigma_m"])
-                if spread > before:
-                    e["sigma_m"] = spread
-                    e["sigma_source"] = "cross_bridge_spread"
-                    kf = kf_by_bridge.get(int(e["bridge"]))
-                    if kf is not None:
-                        kf["sigma_m"] = spread
-                        kf["sigma_deg"] = self._stac_sigma_deg(spread, float(kf["range_m"]))
-                        kf["sigma_source"] = "cross_bridge_spread"
-                else:
-                    e.setdefault("sigma_source", "holdout_residual")
-            print(f"[loop-verify] chunks {ka_}<->{kb_}: {len(grp)} independent bridge(s) "
-                  f"agree to {spread*100:.1f} cm → σ = max(held-out, agreement)")
+            e.setdefault("sigma_source", "holdout_residual")
+        for k in self._stac_loop_edges_kf:
+            k.setdefault("sigma_source", "holdout_residual")
         n_good = sum(1 for e in self._stac_loop_edges if e["sigma_m"] <= max_sig)
         self.loop_enable_opt = bool(self.loop_enable and n_good > 0)
         gate_mod = self._stac_server_module("reconstruction.loops.spatial_gate")
@@ -2623,6 +2843,7 @@ class VGGT_Long:
         if os.path.exists(rep_path):
             try:
                 prev = _json.load(open(rep_path))
+                self._stac_check_fork_stamp(prev, rep_path)                # plan point 9
                 if prev.get("chunk_indices") == [list(ci) for ci in self.chunk_indices]:
                     self._stac_uncert = {int(k): v for k, v in prev["frames"].items()}
                     self._stac_uncert_median = float(prev["session_median_m"])
@@ -2666,10 +2887,11 @@ class VGGT_Long:
         self._stac_uncert = per_frame
         self._stac_uncert_median = session_med
         with open(rep_path, "w") as f:
-            _json.dump({"version": 1, "chunk_indices": [list(ci) for ci in self.chunk_indices],
-                        "session_median_m": session_med, "n_shared_frames": len(per_frame),
-                        "frames": {str(k): v for k, v in per_frame.items()},
-                        "note": "frames predicted once carry the session median"}, f, indent=1)
+            _json.dump(self._stac_with_stamp(
+                {"version": 1, "chunk_indices": [list(ci) for ci in self.chunk_indices],
+                 "session_median_m": session_med, "n_shared_frames": len(per_frame),
+                 "frames": {str(k): v for k, v in per_frame.items()},
+                 "note": "frames predicted once carry the session median"}), f, indent=1)
         print(f"[uncertainty] {len(per_frame)} shared frame(s): two-copy disagreement median "
               f"{session_med * 100:.2f} cm → uncert/, uncertainty.json")
 
@@ -2713,6 +2935,8 @@ class VGGT_Long:
         for e_idx, (a, b) in enumerate(ranges):
             path = os.path.join(edir, f"chunk_{e_idx}.npy")
             if os.path.exists(path):
+                # plan point 9: an ensemble pass of another run stamp is never reused
+                self._stac_check_fork_stamp(np.load(path, allow_pickle=True).item(), path)
                 continue
             pred = self.model.infer_chunk(self.img_list[a:b])
             for key in list(pred.keys()):
@@ -2720,6 +2944,8 @@ class VGGT_Long:
                     pred[key] = pred[key].cpu().numpy().squeeze(0)
             pred['depth'] = np.squeeze(pred['depth'])
             pred['_stac_range'] = [int(a), int(b)]
+            if self._stac_stamp_digest() is not None:
+                pred['_stac_fork_stamp'] = self._stac_stamp_digest()
             np.save(path, pred)
             torch.cuda.empty_cache()
         print(f"[uncertainty] ensemble pass: {len(ranges)} chunk(s) with boundaries shifted "
@@ -2738,6 +2964,7 @@ class VGGT_Long:
         from loop_utils.metric_lock import (robust_rigid, real_frame_number, frame_owner,
                                             apply_scale)
         from loop_utils.loop_bridges import robust_sim3
+        from loop_utils.stable_sample import pixel_keys, stable_pick
         edir = os.path.join(self.output_dir, "_tmp_results_ensemble")
         udir = os.path.join(self.output_dir, "uncert")
         N = len(self.img_list)
@@ -2750,7 +2977,7 @@ class VGGT_Long:
             wp = np.asarray(pred['world_points']); wp = wp[0] if wp.ndim == 5 else wp
             cf = np.asarray(pred['world_points_conf']).reshape(wp.shape[:3])
             # owner copies of the same frames under the FINAL chain
-            P, Q = [], []
+            P, Q, KEYS = [], [], []
             owners = {}
             for local, g in enumerate(range(a, b)):
                 k = int(owner[g])
@@ -2760,11 +2987,15 @@ class VGGT_Long:
                 lk = g - self.chunk_indices[k][0]
                 ok = (cf[local] > 1e-5) & (cfk[lk] > 1e-5)
                 idx = np.flatnonzero(ok.reshape(-1))
+                _keys = pixel_keys(int(g), idx)
                 if len(idx) > 4000:
-                    idx = np.random.default_rng(0).choice(idx, 4000, replace=False)
+                    _sel = stable_pick(_keys, 4000)      # stable per-pixel choice (point 11)
+                    idx, _keys = idx[_sel], _keys[_sel]
                 P.append(wp[local].reshape(-1, 3)[idx]); Q.append(wpk[lk].reshape(-1, 3)[idx])
+                KEYS.append(_keys)
                 owners[g] = (wpk[lk].astype(np.float32), cfk[lk])
-            fit = robust_sim3(np.concatenate(P), np.concatenate(Q), min_points=1000)
+            fit = robust_sim3(np.concatenate(P), np.concatenate(Q), min_points=1000,
+                              keys=np.concatenate(KEYS))
             if fit is None:
                 print(f"[uncertainty] ensemble chunk {e_idx}: glue starved — skipped (declared)")
                 continue
@@ -2917,35 +3148,63 @@ class VGGT_Long:
                 pq = surface_pair_correspondences(cache[f][0], cache[f][1],
                                                   cache[g][0], cache[g][1],
                                                   cache[g][2], cache[g][3],
-                                                  max_samples=n_samp,
+                                                  max_samples=n_samp, seed=f,
                                                   conf_min_norm=self._stac_pose_conf_floor())
                 if pq is not None:
                     pairs.append((f, g, pq[0], pq[1]))
         return pairs
 
+    def _stac_solver_device(self):
+        """The pose-graph solver runs on the card (USER 2026-10-06: on CPU a dense 12k x 12k
+        Cholesky per LM iteration took minutes) — and ONLY there (plan point 12: a CPU fallback
+        gives other float64 last bits and possibly another LM accept/stop). No CUDA: FAIL."""
+        if not torch.cuda.is_available():
+            raise RuntimeError("[pose-graph] no CUDA device — the keyframe pose graph is solved "
+                               "on the card only (plan point 12: no CPU fallback)")
+        return "cuda"
+
     def _stac_pose_graph(self):
         """§4.3: the keyframe SE(3) graph over the ALIGNED chunks — odometry
-        from the chain (σ from seam residuals + §4.8 uncertainty) and the
+        from the chain (σ measured from the held-out surface pairs) and the
         verified loop edges (σ measured); solved by loop_utils.pose_graph.
         No gravity prior (a handheld camera pitches — "camera down = consensus
-        down" bent the chain, pccr 2026-09-13). The §4.7 drift budget, the loop
-        gain, the held-out surface pairs and the authority are MEASURED and
-        declared in pose_graph.json; under ``Model.graph.gate_mode`` =
-        ``advisory`` (USER 2026-09-09: "siempre debe aplicarse la corrección
-        de duplicados, no importa lo mucho que haya que corregir") the
-        measured closure is applied whenever a verified edge exists — under
-        ``veto`` (evaluation) any failed gate keeps identity. Applied as a
-        RIGID move per frame (points and camera together, both copies of a
-        shared frame) — depth per ray and provenance invariant. Resume-safe
-        (pose_graph.json + npy stamp)."""
+        down" bent the chain, pccr 2026-09-13).
+
+        WHAT DECIDES (USER 2026-10-07, docs/plan_determinismo.md points 1 and 2):
+        EVERY closure is a judge, once — the graph is solved n times, each time
+        leaving ONE closure out, and that closure's residual is measured at the
+        chain and at the solution that never saw it (leave-one-out: n judges = n
+        closures, no split that changes with the edge count or the chunk pairs).
+        The graph is applied only when metric_lock.decide_change says so — all
+        three at once: (a) significant, the whole 95 % bootstrap interval of the
+        paired change on the improving side; (b) at least
+        min_judge_closures(confidence) judges (5 at 0.95); (c) the median
+        improvement >= improvement_error_factor (the user's 2) x the LARGEST σ of
+        the bridges (loop_judge.judge_leave_one_out). Only then is the final
+        graph solved, with ALL the closures; when the rule does not pass it is
+        not solved at all. With fewer than 5 closures the graph cannot be
+        judged: declared BEFORE solving, not solved, not applied. A solve that
+        does not converge is not a solution: a leave-one-out solve that did not
+        converge cannot testify (discarded and counted), a final solve that did
+        not converge is never applied.
+
+        Once the rule passed, the §4.7 drift budget, the loop gain, the held-out
+        surface pairs and the authority are MEASURED and declared in
+        pose_graph.json (advisory);
+        under ``Model.graph.gate_mode`` = ``veto`` (evaluation) any failed gate
+        keeps identity too. Applied as a RIGID move per frame (points and camera
+        together, both copies of a shared frame) — depth per ray and provenance
+        invariant. Resume-safe (pose_graph.json, stamped with this run's fork
+        stamp, + npy stamp)."""
         gcfg = self._stac_graph_cfg()
         if gcfg is None or self._stac_loops_cfg() is None or len(self.chunk_indices) < 1:
             return
         import json as _json
         from loop_utils.loop_bridges import cfg_req
-        from loop_utils.pose_graph import PoseGraph
         from loop_utils.metric_lock import frame_owner, se3_matrices
-        from loop_utils.lie import se3_log, se3_inv
+        from loop_utils.lie import se3_log
+        from loop_utils.loop_judge import (build_keyframe_graph, consistent_closures,
+                                           judge_leave_one_out, min_judge_closures)
         N = len(self.img_list)
         owner = frame_owner(self.chunk_indices, N)
         pg_path = os.path.join(self.output_dir, "pose_graph.json")
@@ -2955,24 +3214,41 @@ class VGGT_Long:
         if os.path.exists(pg_path):
             try:
                 prev = _json.load(open(pg_path))
+            except ValueError as _e:
+                prev = None
+                print(f"[pose-graph] pose_graph.json unreadable ({_e}) — re-solving")
+            if prev is not None:
+                self._stac_check_fork_stamp(prev, pg_path)
                 if prev.get("chunk_indices") == [list(ci) for ci in self.chunk_indices] \
                         and prev.get("verdict") in ("APPLY", "IDENTITY"):
                     X = se3_matrices(np.asarray(prev["xi"], np.float64)) if prev["verdict"] == "APPLY" \
                         else np.tile(np.eye(4), (N, 1, 1))
                     print(f"[pose-graph] resume: {prev['verdict']} loaded from pose_graph.json")
-            except (ValueError, KeyError) as _e:
-                print(f"[pose-graph] pose_graph.json unreadable ({_e}) — re-solving")
         if X is None:
             edges_kf = list(getattr(self, '_stac_loop_edges_kf', []) or [])
-            if not edges_kf:
-                report = {"verdict": "IDENTITY", "reason": "no verified loop edge — nothing "
-                                                            "closes; odometry alone would only "
-                                                            "smooth what the seams already fixed",
-                          "chunk_indices": [list(ci) for ci in self.chunk_indices],
-                          "n_loop_edges": 0}
-                with open(pg_path, "w") as f:
-                    _json.dump(report, f, indent=1)
-                print(f"[pose-graph] IDENTITY: {report['reason']}")
+            confidence = float(cfg_req(gcfg, "heldout_confidence", "graph"))
+            err_factor = float(cfg_req(gcfg, "improvement_error_factor", "graph"))
+            min_judge = min_judge_closures(confidence)
+            chunk_idx_doc = [list(ci) for ci in self.chunk_indices]
+
+            def _identity(reason, **extra):
+                rep_ = self._stac_with_stamp(dict({"verdict": "IDENTITY", "reason": reason,
+                                                   "chunk_indices": chunk_idx_doc,
+                                                   "n_loop_edges": len(edges_kf),
+                                                   "min_judges": min_judge,
+                                                   "heldout_confidence": confidence,
+                                                   "improvement_error_factor": err_factor},
+                                                  **extra))
+                with open(pg_path, "w") as f_:
+                    _json.dump(rep_, f_, indent=1)
+                print(f"[pose-graph] IDENTITY: {reason}")
+
+            if len(edges_kf) < min_judge:
+                # USER 2026-10-07 (point 2): with fewer closures than judges the graph cannot
+                # be judged — declared BEFORE solving; nothing is solved, nothing applied
+                judged = judge_leave_one_out(edges_kf, None, None, error_factor=err_factor,
+                                             confidence=confidence, owner=owner)
+                _identity(judged["reason"], solved=False, leave_one_out_closures=judged)
                 return
             # 1) initial poses per frame (owner copy, current chain)
             T0 = np.zeros((N, 4, 4))
@@ -2983,20 +3259,14 @@ class VGGT_Long:
                     if owner[g] == k:
                         T0[g] = self._stac_aligned_pose(k, local, ext[local])
             self._stac_drop_aligned_cache()
-            # 2) the held-out pairs FIRST: they are the judge of the graph AND
-            #    the measurement of how much the chain is worth per link
+            # 2) the held-out pairs FIRST: they measure how much the chain is worth
+            #    per link (the odometry σ) and are declared as a gate
             held = self._stac_holdout_pairs(gcfg)
             odo = self._stac_odometry_sigma(held, T0, owner)
             if odo is None:
-                report = {"verdict": "IDENTITY",
-                          "reason": "no held-out surface pair measures the chain — its "
-                                    "odometry cannot be weighed against the loop edges "
-                                    "(nothing is assumed in its place)",
-                          "chunk_indices": [list(ci) for ci in self.chunk_indices],
-                          "n_loop_edges": len(edges_kf)}
-                with open(pg_path, "w") as f:
-                    _json.dump(report, f, indent=1)
-                print(f"[pose-graph] IDENTITY: {report['reason']}")
+                _identity("no held-out surface pair measures the chain — its odometry cannot "
+                          "be weighed against the loop edges (nothing is assumed in its place)",
+                          solved=False)
                 return
             sig_t, sig_r, odo_rep = odo
             seam_res = getattr(self, '_stac_seam_residuals', {}) or {}
@@ -3005,47 +3275,46 @@ class VGGT_Long:
                 print(f"[pose-graph] odometry σ chunk {k_}: {sig_t[k_] * 100:.2f} cm / "
                       f"{sig_r[k_]:.3f}° per link from {_ck['n_pairs']} held-out pair(s)"
                       f"{' (session median)' if _ck.get('fallback') else ''}")
-            # the solver is torch: on the card when there is one (USER 2026-10-06 — on CPU
-            # a dense 12k x 12k Cholesky per LM iteration took minutes, up to 1000 of them)
-            _dev = "cuda" if torch.cuda.is_available() else "cpu"
+            _dev = self._stac_solver_device()
             print(f"[pose-graph] solver on {_dev}: {N} keyframes, {6 * N} unknowns")
-            pg = PoseGraph(T0, gcfg, device=_dev)
-            for g in range(N - 1):
-                Z = se3_inv(T0[g]) @ T0[g + 1]
-                k_o = int(owner[g])
-                s_t, s_deg = float(sig_t[k_o]), float(sig_r[k_o])
-                if owner[g] != owner[g + 1]:
-                    # the link that crosses ownership carries the seam's own
-                    # measured residual on top of the chain's
-                    s_t = np.sqrt(s_t ** 2 + float(seam_res.get(k_o, 0.0)) ** 2)
-                pg.add_relative(g, g + 1, Z, s_deg, s_t, huber=False, tag="odo")
-            # THE JUDGE (USER 2026-10-06): a share of the closures themselves is held out of
-            # the solve and measured before/after — loop_utils/loop_judge.py
-            from loop_utils.loop_judge import loop_residuals_m, split_loop_edges
-            from loop_utils.loop_judge import min_judge_closures
-            _min_judge = min_judge_closures(float(cfg_req(gcfg, "heldout_confidence", "graph")))
-            fit_edges, judge_edges, split_rep = split_loop_edges(
-                edges_kf, owner, float(cfg_req(gcfg, "loop_holdout_frac", "graph")),
-                int(cfg_req(gcfg, "loop_holdout_min_edges", "graph")), min_judge=_min_judge)
-            split_rep["min_judge"] = _min_judge
-            print(f"[pose-graph] loop edges: {split_rep['n_fit']} fitted, {split_rep['n_judge']} "
-                  f"held out as the judge"
-                  + (f" — {split_rep['reason']}" if split_rep.get("reason")
-                     else f" (every {split_rep['every_kth']}th by chunk pair; every pair keeps a fitted edge)"))
-            loop_ids = []
-            for e in fit_edges:
-                eid = pg.add_relative(int(e["i"]), int(e["j"]), np.asarray(e["Z"]),
-                                      float(e["sigma_deg"]), float(e["sigma_m"]), huber=True,
-                                      tag=f"loop:{e['bridge']}")
-                loop_ids.append((eid, e))
+
+            # 2b) CYCLE CONSISTENCY (USER 2026-10-07): the closures of one chunk pair must agree
+            #     with each other at their own place; the largest consistent set enters the graph,
+            #     each closure with its own σ — a disagreeing bridge never bends the chain
+            edges_kf, cycles = consistent_closures(edges_kf, T0, owner, sig_t, sig_r, confidence,
+                                                   log=print)
+            if len(edges_kf) < min_judge:
+                judged = judge_leave_one_out(edges_kf, None, None, error_factor=err_factor,
+                                             confidence=confidence, owner=owner)
+                _identity(judged["reason"], solved=False, odometry_sigma=odo_rep,
+                          cycle_consistency=cycles, leave_one_out_closures=judged)
+                return
+
+            # 3) THE JUDGE (USER 2026-10-07, points 1-2): leave-one-out — every closure is left
+            #    out of ONE solve and measured at the chain and at the solution that never saw it
+            def _solve_without(rest):
+                pg_q, _ = build_keyframe_graph(T0, owner, sig_t, sig_r, seam_res, gcfg, rest, _dev)
+                pg_q.solve(log=lambda *_a, **_k: None)
+                return pg_q.corrections(), bool(pg_q.report.get("converged"))
+
+            judged = judge_leave_one_out(edges_kf, T0, _solve_without, error_factor=err_factor,
+                                         confidence=confidence, owner=owner)
+            if not judged["improves"]:
+                # the rule did not pass: the final graph is NOT solved, nothing is applied
+                _identity(f"leave-one-out closures: {judged['reason']}", solved=False,
+                          odometry_sigma=odo_rep, cycle_consistency=cycles,
+                          leave_one_out_closures=judged)
+                return
+            # 4) the FINAL graph: ALL the closures (the rule passed)
+            pg, loop_ids = build_keyframe_graph(T0, owner, sig_t, sig_r, seam_res, gcfg,
+                                                edges_kf, _dev)
             before_loop = pg.edge_residuals("loop")
             loop_before = float(np.sum([r["t_m"] for r in before_loop.values()])) if before_loop else 0.0
-            # 3) ONE solve; the §4.7 drift budget δ(L) = max(floor, rate·L) per
-            # loop is DECLARED, never a veto: a closure is a measurement (the
-            # exact bridge, per-pixel correspondences), the budget a prior on
-            # how much Omega usually drifts — when they disagree the
-            # measurement stands and the report says by how much (pccr
-            # 2026-09-13: four real start↔end closures of 36–57 cm over an
+            # the §4.7 drift budget δ(L) = max(floor, rate·L) per loop is DECLARED,
+            # never a veto: a closure is a measurement (the exact bridge, per-pixel
+            # correspondences), the budget a prior on how much Omega usually drifts —
+            # when they disagree the measurement stands and the report says by how
+            # much (pccr 2026-09-13: four real start↔end closures of 36–57 cm over an
             # 18 m walk were vetoed one by one and the duplicates stayed).
             gate_mode = str(cfg_req(gcfg, "gate_mode", "graph"))
             budget_cfg = (self._stac_loops_cfg() or {}).get("spatial") or {}
@@ -3072,8 +3341,9 @@ class VGGT_Long:
                           f"> drift budget {delta * 100:.0f} cm (walk {L:.1f} m) — declared")
             after_loop_res = edge_res
             loop_after = float(np.sum([r["t_m"] for r in after_loop_res.values()])) if after_loop_res else 0.0
-            # 4) gates — measured; advisory or veto per Model.graph.gate_mode
+            # 5) gates — measured and declared (advisory), or vetoing under gate_mode veto
             from loop_utils.metric_lock import heldout_change
+
             def _held_vals(Xm):
                 vals = []
                 for f_, g_, p, q in held:
@@ -3084,23 +3354,13 @@ class VGGT_Long:
             _hv_b, _hv_a = _held_vals(np.tile(np.eye(4), (N, 1, 1))), _held_vals(Xc)
             held_before = float(np.median(_hv_b)) if _hv_b else float("nan")
             held_after = float(np.median(_hv_a)) if _hv_a else float("nan")
-            # the judge reads only the pairs the correction can have changed: two frames
-            # that received the SAME rigid correction keep their disagreement exactly,
-            # and on pccr they were most pairs — the paired median sat at 0 while the
-            # held-out median went 4.46 → 4.63 cm, blind to damage on a subset
+            # the local pairs are read only where the correction can have changed them: two
+            # frames that received the SAME rigid correction keep their disagreement exactly
             _moved = [k for k, (f_, g_, _p, _q) in enumerate(held)
                       if np.abs(np.linalg.inv(Xc[f_]) @ Xc[g_] - np.eye(4)).max() > 1e-9]
-            held_chg = heldout_change(
-                [_hv_b[k] for k in _moved], [_hv_a[k] for k in _moved],
-                confidence=float(cfg_req(gcfg, "heldout_confidence", "graph")))
+            held_chg = heldout_change([_hv_b[k] for k in _moved], [_hv_a[k] for k in _moved],
+                                      confidence=confidence)
             held_chg["n_pairs_changed"] = len(_moved)
-            # the held-out CLOSURES at the chain and at the solution: paired, bootstrapped
-            _jb = loop_residuals_m(judge_edges, T0)
-            _ja = loop_residuals_m(judge_edges, T0, Xc)
-            judge_chg = heldout_change(_jb, _ja, confidence=float(cfg_req(gcfg, "heldout_confidence", "graph")))
-            judge_before = float(np.median(_jb)) if _jb else float("nan")
-            judge_after = float(np.median(_ja)) if _ja else float("nan")
-            ok_judge = bool(judge_chg["improves"]) if judge_edges else None
             gain = (1.0 - loop_after / loop_before) if loop_before > 0 else 0.0
             min_gain = float(cfg_req(gcfg, "min_loop_gain", "graph"))
             n_active = sum(1 for eid, _ in loop_ids if pg._edges[eid]["active"])
@@ -3124,12 +3384,6 @@ class VGGT_Long:
                     f"degradation beyond the sample's own noise (paired change CI "
                     f"[{held_chg['ci_low'] * 100:+.2f}, {held_chg['ci_high'] * 100:+.2f}] cm, "
                     f"n={held_chg['n']})")
-            if judge_edges and not ok_judge:
-                gate_warnings.append(
-                    f"held-out loop closures {judge_before * 100:.1f}→{judge_after * 100:.1f} cm — "
-                    f"no improvement beyond their own noise (paired change CI "
-                    f"[{judge_chg['ci_low'] * 100:+.1f}, {judge_chg['ci_high'] * 100:+.1f}] cm, "
-                    f"n={judge_chg['n']})")
             if frac > 1.0:
                 gate_warnings.append(f"authority {frac * 100:.0f}% (max {a_max_m} m / {a_max_deg}°)")
             for ob in over_budget:
@@ -3140,29 +3394,14 @@ class VGGT_Long:
                 gate_warnings.append(f"the graph did not converge in {pg.report['iterations']} "
                                      f"iteration(s) (stop={pg.report['stop']}) — its iterate is "
                                      f"not a solution")
-            # WHAT DECIDES (USER 2026-10-06, after a day of pccr 2408): a solve that did not
-            # converge is not a solution (USER 2026-09-28) — refused always. Then THE JUDGE:
-            # the held-out loop closures must IMPROVE beyond their own noise — they measure
-            # the global drift a closure corrects, which the local surface pairs cannot see
-            # (those vetoed the only correction that mattered on pccr 2408); and applying
-            # unjudged is how bridges disagreeing by metres would bend the chain (zaragoza).
-            # With too few closures to hold any out, the local held-out pairs judge as on
-            # 2026-09-28 (declared). The local pairs are always measured and declared.
-            # USER 2026-10-06: the judge needs at least min_judge_closures(confidence) held-out
-            # closures to testify (5 at 0.95); with fewer the correction CANNOT be judged and is
-            # NOT applied — no fallback to the local pairs, which measure smoothness, not drift.
-            if len(judge_edges) >= _min_judge:
-                judge_rule = (f"held-out loop closures ({len(judge_edges)} >= {_min_judge}) must "
-                              f"improve beyond their own noise")
-                refused = (not converged) or (not ok_judge)
-            else:
-                judge_rule = (f"only {len(judge_edges)} held-out loop closure(s) — {_min_judge} are "
-                              f"needed to tell a correction from luck at "
-                              f"{float(cfg_req(gcfg, 'heldout_confidence', 'graph')):.2f}: NOT applied")
-                refused = True
-                gate_warnings.append(judge_rule)
-            if gate_mode == "veto":
-                refused = refused or (not ok_held)
+            judge_rule = (f"leave-one-out: each of the {len(edges_kf)} closure(s) judged once — "
+                          f"PASSED (significant at {confidence:g}, {judged['n_judges']} >= "
+                          f"{min_judge} judges, median improvement >= {err_factor:g} x the "
+                          f"median own σ of the cycle-consistent closures "
+                          f"{judged['error_m'] * 100:.2f} cm); the final graph uses all the "
+                          f"cycle-consistent closures")
+            # a solve that did not converge is not a solution (USER 2026-09-28): never applied
+            refused = not converged
             if gate_mode == "veto":
                 verdict = "APPLY" if (n_active > 0 and not gate_warnings) else "IDENTITY"
             else:
@@ -3171,46 +3410,42 @@ class VGGT_Long:
                 print(f"[pose-graph] ⚠ gate: {w} — "
                       f"{'veto' if gate_mode != 'advisory' else ('NOT applied' if refused else 'declared, closure applied')}")
             xi = np.array([se3_log(M) for M in Xc])
-            report = {"chunk_indices": [list(ci) for ci in self.chunk_indices],
-                      "verdict": verdict, "gate_mode": gate_mode, "gate_warnings": gate_warnings,
-                      "converged": converged,
-                      "odometry_sigma": odo_rep,
-                      "gates": {"loop_gain": {"value": gain, "min": min_gain, "passed": ok_gain,
-                                              "loop_residual_before_m": loop_before,
-                                              "loop_residual_after_m": loop_after},
-                                "holdout_surface_pairs": {"n_pairs": len(held),
-                                                          "median_before_m": held_before,
-                                                          "median_after_m": held_after,
-                                                          "measured_bar": held_chg,
-                                                          "passed": ok_held},
-                                "holdout_loop_closures": {"n_fit": len(fit_edges), "n_judge": len(judge_edges),
-                                                          "median_before_m": judge_before,
-                                                          "median_after_m": judge_after,
-                                                          "measured_bar": judge_chg,
-                                                          "passed": ok_judge, "split": split_rep,
-                                                          "per_edge": [{"bridge": int(e.get("bridge", -1)),
-                                                                        "i": int(e["i"]), "j": int(e["j"]),
-                                                                        "chunks": [int(owner[int(e["i"])]), int(owner[int(e["j"])])],
-                                                                        "before_m": b_, "after_m": a_}
-                                                                       for e, b_, a_ in zip(judge_edges, _jb, _ja)]}},
-                      "judge": judge_rule,
-                      "authority": {"stage": "pose_graph", "max_m": a_max_m, "max_deg": a_max_deg,
-                                    "used_max_m": float(t_mag.max()), "used_max_deg": float(r_mag.max()),
-                                    "fraction_used": frac, "saturated": bool(saturated),
-                                    "exceeded": bool(frac > 1.0)},
-                      "n_loop_edges": len(loop_ids), "n_loop_edges_active": n_active,
-                      "over_budget": over_budget,
-                      "solver": {k: v for k, v in pg.report.items() if k != "per_edge"},
-                      "loop_edges_after": {str(k): v for k, v in after_loop_res.items()},
-                      "xi": xi.tolist() if verdict == "APPLY" else None}
+            report = self._stac_with_stamp(
+                {"chunk_indices": chunk_idx_doc,
+                 "verdict": verdict, "gate_mode": gate_mode, "gate_warnings": gate_warnings,
+                 "solved": True, "converged": converged,
+                 "odometry_sigma": odo_rep,
+                 "cycle_consistency": cycles,
+                 "leave_one_out_closures": judged,
+                 "gates": {"loop_gain": {"value": gain, "min": min_gain, "passed": ok_gain,
+                                         "loop_residual_before_m": loop_before,
+                                         "loop_residual_after_m": loop_after},
+                           "holdout_surface_pairs": {"n_pairs": len(held),
+                                                     "median_before_m": held_before,
+                                                     "median_after_m": held_after,
+                                                     "measured_bar": held_chg,
+                                                     "passed": ok_held}},
+                 "judge": judge_rule,
+                 "authority": {"stage": "pose_graph", "max_m": a_max_m, "max_deg": a_max_deg,
+                               "used_max_m": float(t_mag.max()), "used_max_deg": float(r_mag.max()),
+                               "fraction_used": frac, "saturated": bool(saturated),
+                               "exceeded": bool(frac > 1.0)},
+                 "n_loop_edges": len(loop_ids), "n_loop_edges_active": n_active,
+                 "min_judges": min_judge, "heldout_confidence": confidence,
+                 "improvement_error_factor": err_factor,
+                 "over_budget": over_budget,
+                 "solver": {k: v for k, v in pg.report.items() if k != "per_edge"},
+                 "loop_edges_after": {str(k): v for k, v in after_loop_res.items()},
+                 "xi": xi.tolist() if verdict == "APPLY" else None})
             with open(pg_path, "w") as f:
                 _json.dump(report, f, indent=1)
             print(f"[pose-graph] loop residual {loop_before * 100:.1f} → {loop_after * 100:.1f} cm "
-                  f"(gain {gain * 100:.0f}%, min {min_gain * 100:.0f}%) | held-out closures "
-                  f"{judge_before * 100:.1f} → {judge_after * 100:.1f} cm ({len(judge_edges)}, "
-                  f"{'IMPROVE' if ok_judge else ('no verdict' if ok_judge is None else 'NO improvement')}) "
-                  f"| held-out pairs {held_before * 100:.2f} → {held_after * 100:.2f} cm | authority "
-                  f"{frac * 100:.0f}% of {a_max_m * 100:.0f} cm / {a_max_deg:.1f}° "
+                  f"(gain {gain * 100:.0f}%, min {min_gain * 100:.0f}%) | leave-one-out "
+                  f"{judged['n_judges']} judge(s) PASSED (median Δ "
+                  f"{judged['decision']['median_delta'] * 100:+.2f} cm vs {err_factor:g} x "
+                  f"{judged['error_m'] * 100:.2f} cm) | held-out pairs {held_before * 100:.2f} → "
+                  f"{held_after * 100:.2f} cm | authority {frac * 100:.0f}% of "
+                  f"{a_max_m * 100:.0f} cm / {a_max_deg:.1f}° "
                   f"{'SATURATED ' if saturated else ''}→ {verdict} ({gate_mode})")
             X = Xc if verdict == "APPLY" else np.tile(np.eye(4), (N, 1, 1))
             self._stac_authority_record("pose_graph", frac, saturated)
@@ -3339,6 +3574,18 @@ class VGGT_Long:
         ov = seam_overlap(self.chunk_indices, k)
         return (ov, d1['world_points'][-ov:], d2['world_points'][:ov],
                 d1['world_points_conf'][-ov:], d2['world_points_conf'][:ov])
+
+    def _stac_seam_keys(self, k, pm, ok_flat):
+        """Stable keys (plan point 11, loop_utils.stable_sample) of the valid pixels of
+        seam k's shared block: pixel (global keyframe, flat index), the block starting
+        at chunk k+1's first frame. ``pm``: the block's world points (ov, H, W, 3);
+        ``ok_flat``: the validity mask over the flattened block."""
+        from loop_utils.stable_sample import block_pixel_keys
+        pm = np.asarray(pm)
+        pm = pm[0] if pm.ndim == 5 else pm
+        return block_pixel_keys(int(self.chunk_indices[k + 1][0]),
+                                np.flatnonzero(np.asarray(ok_flat).reshape(-1)),
+                                int(pm.shape[1]) * int(pm.shape[2]))
 
     def process_long_sequence(self):
         num_chunks = self._stac_build_layout()
@@ -3477,7 +3724,8 @@ class VGGT_Long:
                 _ok = (_c1 > 1e-5) & (_c2 > 1e-5)
                 if mask is not None:
                     _ok &= np.asarray(mask).reshape(-1).astype(bool)
-                _fit = robust_rigid(_p2[_ok], _p1[_ok])
+                _fit = robust_rigid(_p2[_ok], _p1[_ok],
+                                    keys=self._stac_seam_keys(chunk_idx, point_map1, _ok))
                 if _fit is not None:
                     R, t, _res, _n = _fit[0], _fit[1], _fit[2], _fit[3]
                     s = 1.0
@@ -3805,6 +4053,9 @@ class VGGT_Long:
         print('Done.')
 
     def run(self):
+        # plan point 12: the process runs with repro's deterministic torch settings (set in
+        # __main__ by repro.enable_deterministic_torch) — refused here when they are not on
+        self._stac_require_deterministic_numerics("at the start of the run")
         print(f"Loading images from {self.img_dir}...")
         self.img_list = sorted(glob.glob(os.path.join(self.img_dir, "*.jpg")) +
                                glob.glob(os.path.join(self.img_dir, "*.png")))
@@ -3863,21 +4114,8 @@ class VGGT_Long:
             _ld.image_paths = _kf
             print(f"[STAC] Loop detector pinned to {len(_kf)} frames (aligned with chunks)")
 
-        # STAC patch (resume): only skip if VGGT-Long FULLY completed — camera_poses.txt
-        # AND the chunk clouds: pcd/*_pcd.ply, or the chunk_*.ply the server's post-process
-        # copied next to this directory (the cascade cleanup deletes pcd/ at the end of EVERY
-        # completed run, so the pcd test alone never fired on a resume and Omega was inferred
-        # again over a finished session — zaragoza 2026-10-05, 18 min of GPU and new epoch-0
-        # geometry under a session already at epoch 2). A run that saved poses but no PLY
-        # (the old single-chunk bug) is still NOT complete and re-runs over its cached chunks.
-        _poses_done = os.path.exists(os.path.join(self.output_dir, "camera_poses.txt"))
-        _clouds_done = (glob.glob(os.path.join(self.pcd_dir, "*_pcd.ply"))
-                        or glob.glob(os.path.join(os.path.dirname(os.path.abspath(self.output_dir)),
-                                                  "chunk_*.ply")))
-        if _poses_done and _clouds_done:
-            print("[STAC resume] camera_poses.txt + chunk clouds exist — VGGT-Long already complete, skipping")
-            return
-
+        # the loop candidates first: with a stamped loop_closures.txt that matches this run
+        # (plan point 8) this is instant, and the candidates are part of the run's stamp
         if self.loop_enable:
             self.get_loop_pairs()
 
@@ -3887,6 +4125,27 @@ class VGGT_Long:
             else:
                 del self.loop_detector  # Save GPU Memory
         torch.cuda.empty_cache()
+
+        # STAC (plan point 9): the run's stamp — code, config and inputs — held against the
+        # products on disk BEFORE any of them is resumed or skipped over
+        self._stac_verify_run_stamp()
+
+        # STAC patch (resume): only skip if VGGT-Long FULLY completed — camera_poses.txt
+        # AND the chunk clouds: pcd/*_pcd.ply, or the chunk_*.ply the server's post-process
+        # copied next to this directory (the cascade cleanup deletes pcd/ at the end of EVERY
+        # completed run, so the pcd test alone never fired on a resume and Omega was inferred
+        # again over a finished session — zaragoza 2026-10-05, 18 min of GPU and new epoch-0
+        # geometry under a session already at epoch 2). A run that saved poses but no PLY
+        # (the old single-chunk bug) is still NOT complete and re-runs over its cached chunks.
+        # Since 2026-10-07 the products are those of THIS stamp (checked just above).
+        _poses_done = os.path.exists(os.path.join(self.output_dir, "camera_poses.txt"))
+        _clouds_done = (glob.glob(os.path.join(self.pcd_dir, "*_pcd.ply"))
+                        or glob.glob(os.path.join(os.path.dirname(os.path.abspath(self.output_dir)),
+                                                  "chunk_*.ply")))
+        if _poses_done and _clouds_done:
+            print("[STAC resume] camera_poses.txt + chunk clouds exist — VGGT-Long already complete, skipping")
+            return
+
         print('Loading model...')
         self.model.load()
         _rep = getattr(self.model, "load_report", None)
@@ -3894,6 +4153,11 @@ class VGGT_Long:
             import json as _json
             with open(os.path.join(self.output_dir, "omega_load.json"), "w") as _f:
                 _json.dump(_rep, _f, indent=1)
+        # STAC (plan point 12): the card, driver, torch / CUDA / cuDNN, BLAS, CPU, library
+        # versions, git state of the repo and the forks, and the numerics torch runs with —
+        # recorded once the model sits on the card (no time, host or pid: two runs on the
+        # same machine and code write the same file)
+        self._stac_write_environment()
 
         if self.config['Model']['calib']:
             calib_path = Path(self.img_dir).parent / 'calib.txt'
@@ -3999,23 +4263,17 @@ class VGGT_Long:
                 if chunk_intrinsics is not None:
                     all_intrinsics[idx] = chunk_intrinsics[i]
 
-        poses_path = os.path.join(self.output_dir, 'camera_poses.txt')
-        with open(poses_path, 'w') as f:
-            for pose in all_poses:
-                flat_pose = pose.flatten()
-                f.write(' '.join([str(x) for x in flat_pose]) + '\n')
-
-        print(f"Camera poses saved to {poses_path}")
-        if all_intrinsics[0] is not None:
-            intrinsics_path = os.path.join(self.output_dir, 'intrinsic.txt')
-            with open(intrinsics_path, 'w') as f:
-                for intrinsic in all_intrinsics:
-                    fx = intrinsic[0, 0]
-                    fy = intrinsic[1, 1]
-                    cx = intrinsic[0, 2]
-                    cy = intrinsic[1, 2]
-                    f.write(f'{fx} {fy} {cx} {cy}\n')
-            print(f"Camera intrinsics saved to {intrinsics_path}")
+        # STAC (plan point 45, loop_utils.camera_files): float64 text that reads back EXACTLY
+        # (repr of each float64 value, written atomically). str() of a float32 pose printed its
+        # float32 shortest repr, which np.loadtxt reads back as a DIFFERENT float64; every
+        # stage re-reading camera_poses.txt started from rounded poses.
+        from loop_utils.camera_files import write_camera_files
+        _written = write_camera_files(
+            self.output_dir, all_poses,
+            all_intrinsics if all_intrinsics[0] is not None else None)
+        print(f"Camera poses saved to {_written['poses']}")
+        if "intrinsics" in _written:
+            print(f"Camera intrinsics saved to {_written['intrinsics']}")
 
         ply_path = os.path.join(self.output_dir, 'camera_poses.ply')
         with open(ply_path, 'w') as f:
@@ -4100,16 +4358,15 @@ def copy_file(src_path, dst_dir):
         print(f"Copy Error: {e}")
 
 if __name__ == '__main__':
-    # STAC (2026-09-28): identical keyframes → bit-identical Omega output. cuBLAS
-    # reads its workspace config when its handle is created (map_worker also puts it
-    # in the environment); warn_only keeps an op without a deterministic kernel from
-    # aborting the run — it is then NAMED in the log instead of silently varying.
-    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
-    torch.use_deterministic_algorithms(True, warn_only=True)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    torch.manual_seed(42)
-    np.random.seed(42)
+    # STAC (2026-09-28): identical keyframes → bit-identical Omega output. Since
+    # 2026-10-07 (docs/plan_determinismo.md point 12) through the server's ONE
+    # implementation, repro.enable_deterministic_torch: deterministic algorithms STRICT
+    # (an op without a deterministic kernel STOPS the run — warn_only let it vary with a
+    # line in the log), cuDNN deterministic and not benchmarking, TF32 OFF for cuDNN and
+    # matmul (Ampere ran the dense head's convolutions in TF32 by default), torch / numpy /
+    # random seeded (42, the vendor's seed), cuBLAS workspace pinned (':4096:8', the value
+    # map_worker launches with; another value fails). Called before torch touches CUDA.
+    _stac_repro().enable_deterministic_torch(42)
     torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS", "8")))
 
     parser = argparse.ArgumentParser(description='VGGT-Long')

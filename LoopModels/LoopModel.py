@@ -60,6 +60,8 @@ class LoopDetector:
         self.image_paths = None
         self.descriptors = None
         self.loop_closures = None
+        self.applied_threshold = None
+        self.threshold_source = None
     
     def _input_transform(self, image_size=None):
         """Create image transformation function"""
@@ -97,7 +99,12 @@ class LoopDetector:
 
         model.load_state_dict(torch.load(self.ckpt_path))
         model = model.eval()
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # STAC (plan point 12): the descriptors are computed on the card ONLY — a CPU
+        # fallback gives other kernels, other last bits, possibly another candidate list
+        if not torch.cuda.is_available():
+            raise RuntimeError("SALAD loop detection needs a CUDA device (plan point 12: no "
+                               "CPU fallback)")
+        device = torch.device('cuda')
         model = model.to(device)
         print(f"Model loaded: {self.ckpt_path}")
         
@@ -150,7 +157,7 @@ class LoopDetector:
             batch_tensor = torch.stack(batch_imgs).to(self.device)
             
             with torch.no_grad():
-                with torch.autocast(device_type='cuda' if torch.cuda.is_available() else 'cpu', dtype=torch.float16):
+                with torch.autocast(device_type='cuda', dtype=torch.float16):
                     batch_descriptors = self.model(batch_tensor).cpu()
             
             descriptors.append(batch_descriptors)
@@ -237,6 +244,7 @@ class LoopDetector:
         # value stays the fallback and is reported beside it
         ref_path = self.config['Loop']['SALAD'].get('revisit_reference')
         threshold = float(self.similarity_threshold)
+        threshold_source = "configured"
         if ref_path and os.path.exists(ref_path):
             with open(ref_path) as _f:
                 ref = json.load(_f)
@@ -246,6 +254,7 @@ class LoopDetector:
             crep["configured_threshold"] = threshold
             if cal is not None:
                 threshold = cal
+                threshold_source = "calibrated"
                 print(f"[loops] SALAD bar CALIBRATED on {crep['n_revisit_pairs']} geometric "
                       f"revisit pair(s): {cal:.3f} (Youden J {crep['youden_j']:.2f}, TPR "
                       f"{crep['tpr']:.2f}, FPR {crep['fpr']:.3f}; revisit median "
@@ -259,6 +268,9 @@ class LoopDetector:
                 with open(os.path.join(os.path.dirname(str(self.output)),
                                        "salad_calibration.json"), "w") as _f:
                     json.dump(crep, _f, indent=1)
+        # the bar this run applied, recorded in the stamp of loop_closures.txt (plan point 8)
+        self.applied_threshold = float(threshold)
+        self.threshold_source = threshold_source
         loop_closures = []
         k = min(self.top_k, n)
         for i in range(n):
@@ -297,7 +309,9 @@ class LoopDetector:
                 f.write(f"# NMS filtering applied, threshold: {self.nms_threshold}\n")
             f.write("\n# Loop pairs:\n")
             for i, j, sim in self.loop_closures:
-                f.write(f"{i}, {j}, {sim:.4f}\n")
+                # STAC (plan points 8/45): the similarity as exact text — a resumed run reads
+                # back the very candidates this run holds (4 decimals did not)
+                f.write(f"{i}, {j}, {repr(float(sim))}\n")
             f.write("\n# Image path list:\n")
             for i, path in enumerate(self.image_paths):
                 f.write(f"# {i}: {path}\n")

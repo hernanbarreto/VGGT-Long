@@ -62,7 +62,7 @@ def test_exact_bridge_edge_residual_at_noise_level():
     assert meas["residual_m"] < 0.05
     assert meas["n_corr"] >= cfg["min_correspondences"]
     v = lb.verify_loop(meas, cfg)
-    assert v["status"] in ("accepted", "scale_break")
+    assert v["status"] == "accepted"
     assert v["sigma_m"] >= meas["residual_m"]
 
 
@@ -82,7 +82,10 @@ def test_starved_bridge_is_declared_not_hidden():
 
 # ── §12.2 verification ──────────────────────────────────────────────────────
 
-def test_scale_out_of_tolerance_is_a_scale_break_not_a_discard():
+def test_a_scale_disagreement_widens_sigma_in_quadrature_never_a_break():
+    """USER 2026-10-07 (docs/plan_determinismo.md point 17): no scale-break threshold, no σ
+    factor — the bridge's measured scale disagreement (log s_ab) displaces the surfaces it was
+    fitted on by |log s_ab| x their lever arm, and that is added IN QUADRATURE to σ."""
     sess = session()
     chunks, ci, errors = make_chunks(sess, scale_err=[1.0] + [1.15] * 20)
     ka, kb = 0, len(ci) - 1
@@ -91,13 +94,15 @@ def test_scale_out_of_tolerance_is_a_scale_break_not_a_discard():
     meas = lb.measure_bridge(bridge, lb.bridge_layout(item, ci), chunks[ka], chunks[kb],
                              fork_loops_cfg(), rigid=False)
     cfg = fork_loops_cfg()
+    assert "scale_tol_log" not in cfg and "scale_break_sigma_factor" not in cfg
     v = lb.verify_loop(meas, cfg)
-    assert v["status"] == "scale_break"
-    # σ is the SPLIT-HALF held-out residual (USER 2026-09-16), not the fit's
-    # own optimistic residual — the break factor multiplies THAT
+    assert v["status"] == "accepted"
+    # σ is the SPLIT-HALF held-out residual (USER 2026-09-16) with the scale term in quadrature
     _base = meas.get("holdout_residual_m", meas["residual_m"])
-    assert v["sigma_m"] == pytest.approx(_base * cfg["scale_break_sigma_factor"])
-    assert v["checks"]["scale"]["passed"] is False
+    d = abs(np.log(meas["s_ab"]))
+    assert d > 0.1                                    # the 15 % the chunks were given
+    assert v["sigma_m"] == pytest.approx(np.hypot(_base, d * meas["range_m"]))
+    assert v["checks"]["scale"]["sigma_scale_m"] == pytest.approx(d * meas["range_m"])
 
 
 def test_a_broken_bridge_is_kept_and_pays_in_sigma():
@@ -119,7 +124,7 @@ def test_a_broken_bridge_is_kept_and_pays_in_sigma():
                                 cfg, rigid=True)
     v = lb.verify_loop(meas, cfg, reference_m=meas_ok["residual_m"])
     v_ok = lb.verify_loop(meas_ok, cfg, reference_m=meas_ok["residual_m"])
-    assert v["status"] in ("accepted", "scale_break")
+    assert v["status"] == "accepted"
     assert v["checks"]["geometric"]["passed"] is True      # the fit EXISTS
     # …and the broken one is the one that gets distrusted, by measurement
     assert v["sigma_m"] > v_ok["sigma_m"]
@@ -163,7 +168,10 @@ def test_candidate_file_round_trip(tmp_path):
                                  {"i": 131, "j": 5, "sim": None, "source": "instance"}])
     back = lb.load_loop_candidates(p)
     assert [(c["i"], c["j"], c["source"]) for c in back] == [(140, 12, "salad"), (131, 5, "instance")]
-    assert back[0]["sim"] == pytest.approx(0.91) and back[1]["sim"] is None
+    assert back[0]["sim"] == 0.91 and back[1]["sim"] is None          # exact text (point 8/45)
+    # the post-hoc candidate lives in its own stamped file (plan point 8)
+    assert "instance" not in (tmp_path / "loop_closures.txt").read_text()
+    assert "instance" in (tmp_path / "loop_closures_posthoc.txt").read_text()
 
 
 # ── §12.4 scale graph ───────────────────────────────────────────────────────

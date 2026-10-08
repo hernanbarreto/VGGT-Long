@@ -12,6 +12,25 @@ import sys
 #   - infer_chunk(): perform inference on a list of images
 # -------------------------------------------------------
 
+# STAC (docs/plan_determinismo.md point 12): ONE autocast dtype on every card. The vendor
+# picked bf16 on compute capability >= 8 and fp16 below it, and VGGT-Omega's own forward
+# picks bf16 when the card supports it — the dtype followed the card. bf16 is what every
+# validated run used (A6000 sm_86, A100 sm_80); a card without bf16 FAILS instead of
+# silently running another precision.
+AMP_DTYPE = torch.bfloat16
+
+
+def require_amp_card():
+    """The card the fork runs on: CUDA, with bf16. No CPU fallback, no fp16 fallback."""
+    if not torch.cuda.is_available():
+        raise RuntimeError("the fork runs on a CUDA card only (plan point 12: no CPU fallback)")
+    if not torch.cuda.is_bf16_supported():
+        raise RuntimeError(f"{torch.cuda.get_device_name(0)} does not support bfloat16 — the "
+                           f"fork's autocast dtype is fixed to {AMP_DTYPE} (plan point 12: no "
+                           f"fp16 fallback)")
+    return AMP_DTYPE
+
+
 class Base3DModel(ABC):
     def __init__(self, config, device="cuda"):
         """
@@ -21,9 +40,11 @@ class Base3DModel(ABC):
             device (str): Device to place the model on ("cuda" or "cpu").
         """
         self.config = config
+        if device != "cuda":
+            raise RuntimeError(f"device {device!r} — the fork runs on a CUDA card only "
+                               f"(plan point 12)")
         self.device = device
-        # Automatically select bfloat16 for newer GPUs (SM >= 8), otherwise use float16.
-        self.dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+        self.dtype = require_amp_card()
         self.model = None
         self.k = None
         self.update = True

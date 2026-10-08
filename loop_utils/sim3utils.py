@@ -949,7 +949,7 @@ def weighted_align_point_maps(point_map1, conf1, point_map2, conf2, mask, conf_t
     # ── per-frame correspondences (subsampled per frame: thousands of points give a fully
     #    stable Sim3, and it bounds the O(frames²) RANSAC scoring cost) ──
     cap = int(config['Model'].get('align_points_per_frame', 4000))
-    rng = np.random.RandomState(0)
+    from loop_utils.stable_sample import pixel_keys, stable_pick
     per_frame = []   # (frame_idx, pts1, pts2, weights)
     for i in range(b):
         valid_mask = (conf1[i] > conf_threshold) & (conf2[i] > conf_threshold)
@@ -961,7 +961,10 @@ def weighted_align_point_maps(point_map1, conf1, point_map2, conf2, mask, conf_t
         p1, p2 = point_map1[i][idx], point_map2[i][idx]
         w = np.sqrt(conf1[i][idx] * conf2[i][idx])
         if len(p1) > cap:
-            sel = rng.choice(len(p1), cap, replace=False)
+            # STAC (plan point 11): the cap keeps the pixels whose STABLE KEY (frame,
+            # flat index) ranks first — one pixel crossing the threshold no longer
+            # re-draws the frame's whole sample (the RandomState(0) draw did)
+            sel = stable_pick(pixel_keys(i, np.flatnonzero(np.asarray(valid_mask).reshape(-1))), cap)
             p1, p2, w = p1[sel], p2[sel], w[sel]
         per_frame.append((i, p1, p2, w))
     if len(per_frame) == 0:
