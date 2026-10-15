@@ -208,6 +208,16 @@ class VGGT_Long:
                     config=self.config
                 )
 
+        # Plan point 16 (DECIDIDO USER 2026-10-08): the SALAD bar this pass's candidates are
+        # held to is ONE record from ONE function (loop_bridges.salad_applied_threshold) — set
+        # here for a pass that runs no SALAD detector (loop closure off, DBoW retrieval) and
+        # replaced by get_loop_pairs with the bar the stamp of loop_closures.txt records. The
+        # spatial gate and the loop report read it through _stac_salad_bar_record(); nothing
+        # hand-writes the record.
+        from loop_utils.loop_bridges import salad_applied_threshold
+        self._stac_salad_bar = salad_applied_threshold(None, use_dbow=self.useDBoW,
+                                                       loop_enable=self.loop_enable)
+
         print('init done.')
 
     def get_loop_pairs(self):
@@ -227,7 +237,7 @@ class VGGT_Long:
         if not self.useDBoW:
             from loop_utils.loop_bridges import (load_loop_candidates, write_loop_stamp,
                                                  salad_loop_stamp, reconcile_loop_files,
-                                                 reconcile_posthoc)
+                                                 reconcile_posthoc, salad_applied_threshold)
             now = salad_loop_stamp(self.img_list, self.config)
             rec = reconcile_loop_files(loop_txt, now, log=print)
             fresh = not os.path.exists(loop_txt)
@@ -245,16 +255,33 @@ class VGGT_Long:
             cands = load_loop_candidates(loop_txt)
             self.loop_cands = cands
             self.loop_list = [(c["i"], c["j"]) for c in cands]
+            # Plan point 16 (DECIDIDO USER 2026-10-08): the bar the candidates were held to,
+            # read from the STAMP — fresh or reused, the one path above, so loop_edges.json
+            # carries the same record whichever way this pass got its candidates (run history
+            # never leaks into a product). Captured HERE: the detector is deleted right after
+            # this call (GPU memory) and the spatial gate, which records each candidate's
+            # margin to the bar, runs after the metric lock. On the fresh pass the detector
+            # that ran cross-checks the stamp it was just written to — a disagreement fails
+            # the pass (a resumed run would read another bar than the one applied).
+            self._stac_salad_bar = salad_applied_threshold(
+                loop_txt, detector=self.loop_detector if fresh else None)
             srcs = {}
             for c in cands:
                 srcs[c["source"]] = srcs.get(c["source"], 0) + 1
+            _bar = self._stac_salad_bar
             print(f"[STAC loops] {len(cands)} candidate(s) by source {srcs} "
                   + ("(SALAD run now, stamped)" if fresh else
                      "(loop_closures.txt reused — its stamp matches; DINOv2 extraction skipped)")
-                  + f"; post-hoc file: {rec['posthoc']}")
+                  + f"; post-hoc file: {rec['posthoc']}; SALAD bar "
+                  + (f"{_bar['threshold']:.4f} ({_bar['source']}, the stamp of loop_closures.txt"
+                     + (", cross-checked against the detector that ran)" if fresh else ")")
+                     if _bar.get("threshold") is not None else
+                     f"NOT readable — {_bar.get('reason')} (margins will say so)"))
             return
 
         if self.useDBoW: # DBoW2
+            # plan point 16: the SALAD bar record of a DBoW pass ("no SALAD bar applies") was
+            # set by __init__ from the same function; DBoW writes no stamp to read it from
             for frame_id, img_path in tqdm(enumerate(self.img_list)):
                 image_ori = np.array(Image.open(img_path))
                 if len(image_ori.shape) == 2:
@@ -683,7 +710,8 @@ class VGGT_Long:
         # them the way it breaks DA3's absolute metre).
         # USER 2026-10-07 (plan point 18): a chunk is ZOOMED only when its focal differs from
         # the rest of the session SIGNIFICANTLY (the whole 95 % bootstrap interval of the
-        # median difference off zero) AND by >= improvement_error_factor (the user's 2) x the
+        # median difference off zero) AND by >= improvement_error_factor (the user's factor,
+        # read from the config — 1.1 since 2026-10-07) x the
         # chunk's own measured fx error (the scatter of its per-frame focals) — the old
         # robust-z cut over a MAD of five chunk medians is gone. A majority needs three
         # chunks: with two, the odd one cannot be named.
@@ -2257,16 +2285,32 @@ class VGGT_Long:
             s, R, t = self._cum[k]
             return float(s) * (p @ np.asarray(R).T) + np.asarray(t)
 
+    def _stac_salad_bar_record(self):
+        """Plan point 16: the ONE record of the SALAD bar this pass's candidates were held to
+        ({threshold, source, reason}, loop_bridges.salad_applied_threshold) — set by __init__
+        for a pass that runs no SALAD detector and by get_loop_pairs from the stamp of
+        loop_closures.txt. A runner built without __init__ (the fork's own stage tests) gets
+        that function's 'no file read' record: nothing hand-writes it anywhere."""
+        bar = getattr(self, '_stac_salad_bar', None)
+        if bar is None:
+            from loop_utils.loop_bridges import salad_applied_threshold
+            bar = self._stac_salad_bar = salad_applied_threshold(None)
+        return bar
+
     def _stac_plan_bridges(self, loop_results):
         """§4.2 step 0 / §4.5: every candidate passes the spatial-plausibility
         gate BEFORE a bridge is spent on it. Returns [(item, cand, gate)] for
         the survivors; rejected candidates go to the loop report."""
-        from loop_utils.loop_bridges import cfg_req
+        from loop_utils.loop_bridges import cfg_req, salad_gate_input
         lcfg = self._stac_loops_cfg()
         gate_mod = self._stac_server_module("reconstruction.loops.spatial_gate")
         by_pair = {}
         for c in getattr(self, 'loop_cands', []) or []:
             by_pair[(int(c['i']), int(c['j']))] = c
+        # Plan point 16 (DECIDIDO USER 2026-10-08): every candidate records its margin to the
+        # SALAD bar it was held to (similarity − applied threshold). The bar is the stamp's,
+        # captured by get_loop_pairs; without it the margin is None WITH its reason.
+        salad_bar = self._stac_salad_bar_record()
         planned, rejected = [], []
         view = None
         if gate_mod is not None:
@@ -2285,8 +2329,15 @@ class VGGT_Long:
                 cand = {"i": ci, "j": cj, "sim": None, "source": "salad"}
             gate = {"verdict": "off", "rules": {}}
             if view is not None:
+                salad_in, salad_why = salad_gate_input(cand, salad_bar)
                 gate = gate_mod.gate_frame_pair(int(cand['i']), int(cand['j']), view,
-                                                lcfg['spatial'])
+                                                lcfg['spatial'], salad=salad_in)
+                if salad_why is not None:
+                    # the gate wrote rules.salad with similarity / threshold / margin None
+                    # (it always does when salad= is given); the fork adds WHY there is no
+                    # margin (point 16: a candidate without a readable bar says so, never
+                    # silently None)
+                    gate["rules"]["salad"]["reason"] = salad_why
             if gate.get("verdict") == "reject":
                 rejected.append({"item": [int(item[0]), list(item[1]), int(item[2]), list(item[3])],
                                  "candidate": cand, "gate": gate, "status": "rejected",
@@ -2800,9 +2851,14 @@ class VGGT_Long:
         n_good = sum(1 for e in self._stac_loop_edges if e["sigma_m"] <= max_sig)
         self.loop_enable_opt = bool(self.loop_enable and n_good > 0)
         gate_mod = self._stac_server_module("reconstruction.loops.spatial_gate")
+        # plan point 16: the SALAD bar the candidates were held to (threshold and how it was
+        # decided — configured / calibrated — from the stamp of loop_closures.txt; or None
+        # with the reason), beside every edge's margin. The same record on a fresh and on a
+        # resumed pass: it is a product, not run history.
         save_loop_report(os.path.join(self.output_dir, "loop_edges.json"), edges,
                          extra={"spatial_gate": "on" if gate_mod is not None else "off",
                                 "semantics": semantics is not None,
+                                "salad_threshold": self._stac_salad_bar_record(),
                                 "max_edge_sigma_m": max_sig,
                                 "n_edges_usable": n_good,
                                 "loop_enable_opt": self.loop_enable_opt,
@@ -3179,8 +3235,11 @@ class VGGT_Long:
         three at once: (a) significant, the whole 95 % bootstrap interval of the
         paired change on the improving side; (b) at least
         min_judge_closures(confidence) judges (5 at 0.95); (c) the median
-        improvement >= improvement_error_factor (the user's 2) x the LARGEST σ of
-        the bridges (loop_judge.judge_leave_one_out). Only then is the final
+        improvement >= improvement_error_factor (the user's factor, 1.1 since
+        2026-10-07, read from the config) x the MEDIAN own σ of the closures that
+        passed the cycle-consistency filter — never the largest of all, one bad
+        bridge set pccr's bar at 2 x 556 cm (loop_judge.judge_leave_one_out).
+        Only then is the final
         graph solved, with ALL the closures; when the rule does not pass it is
         not solved at all. With fewer than 5 closures the graph cannot be
         judged: declared BEFORE solving, not solved, not applied. A solve that

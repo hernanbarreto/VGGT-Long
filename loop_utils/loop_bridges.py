@@ -31,6 +31,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from typing import List, Optional, Sequence
 
@@ -744,3 +745,106 @@ def reconcile_posthoc(loop_txt: str, log=print) -> str:
     log(f"[STAC loops] {POSTHOC_NAME}: {len(cands)} post-hoc candidate(s) deleted — {why} "
         f"(plan point 8)")
     return "deleted"
+
+
+# ── the SALAD bar each candidate is held to (plan point 16) ─────────────────────────────
+#
+# DECIDIDO (USER 2026-10-08, docs/plan_determinismo.md point 16): rule 0 (the user's 1 m) and
+# the SALAD bar calibrated per session stay, and EVERY candidate records its margin to that
+# bar (similarity − threshold) in loop_edges.json. The fork's production call of
+# spatial_gate.gate_frame_pair passed no ``salad=``, so margins.salad was always None. The bar
+# a candidate was held to is ONE number per pass, read from ONE place: the ``salad_threshold``
+# the stamp of loop_closures.txt records (get_loop_pairs writes it from the detector's
+# applied_threshold on the pass that ran SALAD; a reused file carries that same line). Fresh
+# or reused, the candidates AND their bar are read from the file — the one path of plan point
+# 8 — so loop_edges.json holds the same record whichever way the pass got its candidates (run
+# history never leaks into a reconstruction product). On the fresh pass the detector that ran
+# is a CROSS-CHECK, not a second source: the bar it applied must be the bar its stamp reads
+# back, or the pass fails — a resumed run would otherwise hold the candidates to another bar
+# than the run that produced them. The detector object is deleted right after the candidates
+# are read (GPU memory), so the bar is captured there, once, and carried to the gate. A pass
+# with no bar — loop closure off, DBoW retrieval, a file stamped before the bar was recorded
+# (pre-2026-10-07) — gets margin None WITH THE REASON: never a crash, never an invented bar.
+
+SALAD_SOURCE = "salad"
+
+
+def _finite_float(x) -> Optional[float]:
+    """``x`` as a float when it is one and FINITE (NaN and ±inf refused alike), else None."""
+    try:
+        f = float(x) if x is not None else None
+    except (TypeError, ValueError):
+        return None
+    return f if f is not None and math.isfinite(f) else None
+
+
+def salad_applied_threshold(loop_txt: Optional[str], detector=None, use_dbow: bool = False,
+                            loop_enable: bool = True) -> dict:
+    """The SALAD bar this pass's candidates were held to: {threshold, source, reason}, read
+    from the stamp of ``loop_txt`` (``salad_threshold`` / ``salad_threshold_source``:
+    configured | calibrated). ``threshold`` is None, with ``reason``, when no bar applies or
+    none can be read — loop closure disabled, DBoW retrieval, no file, no stamp, a stamp
+    without the key (a file stamped before 2026-10-07) or a non-finite value; none of those
+    raises. ``detector``: the LoopDetector that ran THIS pass — a cross-check, never a source:
+    its ``applied_threshold`` / ``threshold_source`` must be exactly what the stamp reads back
+    (RuntimeError otherwise: the stamp a resumed run will read is not what this run applied)."""
+    none = {"threshold": None, "source": None}
+    if not loop_enable:
+        return dict(none, reason="loop closure disabled (Model.loop_enable false) — the SALAD "
+                                 "detector did not run")
+    if use_dbow:
+        return dict(none, reason="DBoW retrieval — no SALAD bar applies")
+    if not loop_txt:
+        rec = dict(none, reason="no loop candidate file read this pass")
+    elif not os.path.exists(loop_txt):
+        rec = dict(none, reason=f"{os.path.basename(loop_txt)} does not exist")
+    else:
+        st = read_loop_stamp(loop_txt)
+        if st is None:
+            rec = dict(none, reason=f"{os.path.basename(loop_txt)} carries no readable stamp")
+        else:
+            t = st.get("salad_threshold")
+            tf = _finite_float(t)
+            if tf is None:
+                rec = dict(none, reason=(f"the stamp of {os.path.basename(loop_txt)} records "
+                                         f"no salad_threshold ({t!r}) — reused from a run that "
+                                         f"did not record its bar"))
+            else:
+                rec = {"threshold": tf, "source": st.get("salad_threshold_source"),
+                       "reason": None}
+    if detector is not None:
+        applied = _finite_float(getattr(detector, "applied_threshold", None))
+        applied_src = getattr(detector, "threshold_source", None)
+        if applied != rec["threshold"] or applied_src != rec["source"]:
+            raise RuntimeError(
+                f"the SALAD detector applied the bar {applied!r} ({applied_src!r}) but the stamp "
+                f"of {os.path.basename(loop_txt) if loop_txt else '(no loop candidate file)'} "
+                f"reads back {rec['threshold']!r} ({rec['source']!r})"
+                + (f" — {rec['reason']}" if rec.get("reason") else "")
+                + ": a resumed run would hold the candidates to another bar than the run that "
+                  "produced them (plan point 16)")
+    return rec
+
+
+def salad_gate_input(cand: dict, bar: Optional[dict]):
+    """What the spatial gate's ``salad=`` receives for ``cand`` and why its margin may be None:
+    ({similarity, threshold}, reason). A SALAD candidate with a similarity and a readable bar
+    → both numbers, reason None (spatial_gate.salad_margin computes similarity − threshold).
+    Otherwise the missing side is None and ``reason`` says which: a post-hoc candidate (the
+    server's instance / manual loops carry no SALAD similarity — no SALAD bar applies to
+    them), a SALAD candidate without a similarity (not in loop_closures.txt), or a bar that
+    could not be read (``bar['reason']``). Never raises."""
+    src = str((cand or {}).get("source", SALAD_SOURCE) or SALAD_SOURCE)
+    simf = _finite_float((cand or {}).get("sim"))
+    bar = bar or {}
+    thr = bar.get("threshold")
+    if src != SALAD_SOURCE:
+        return ({"similarity": simf, "threshold": None},
+                f"not a SALAD candidate (source {src}) — no SALAD bar applies")
+    if simf is None:
+        return ({"similarity": None, "threshold": thr},
+                "the candidate carries no SALAD similarity (not read from loop_closures.txt)")
+    if thr is None:
+        return ({"similarity": simf, "threshold": None},
+                str(bar.get("reason") or "no SALAD bar recorded for this pass"))
+    return ({"similarity": simf, "threshold": float(thr)}, None)
