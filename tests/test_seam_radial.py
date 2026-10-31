@@ -157,6 +157,8 @@ def test_same_K_noisy_depth_common_K_is_the_identity(tmp_path, synth):
     # state is reproduced to the float32 rounding of the points (≈ 1e-7 relative), no more
     assert cm["rule"]["median_before_m"] == pytest.approx(cm["rule"]["median_after_m"], rel=0, abs=1e-6)
     assert cm["rule"]["improves_by_rule"] is False
+    assert doc["session_rule"]["common_K_session_median"]["improves_by_rule"] is False
+    assert doc["session_rule"]["common_K_intake_probe"]["verdict"] is None       # not run: declared
     assert before["held_norm_median_m"] < 0.05       # 0.3 % depth noise on a ~5 m corridor
     # no intake probe for this session: declared, not run
     assert s["states"]["common_K_intake_probe"]["run"] is False
@@ -208,6 +210,10 @@ def test_focal_error_shows_in_the_lateral_residual_and_both_counterfactuals_lowe
         assert st["rule"]["n_judges_frames"] == 30
     # the session median K by owner is the TRUE K here (chunk 0 owns 46 frames, chunk 1 44)
     assert np.allclose(s["states"]["common_K_session_median"]["K"], sess.K)
+    # the pooled SESSION rule (what the in-run judgement would say) improves for the common K
+    sr = doc["session_rule"]
+    assert sr["common_K_session_median"]["improves_by_rule"] is True and sr["common_K_session_median"]["n_seams"] == 1
+    assert sr["common_K_intake_probe"]["improves_by_rule"] is True
     assert np.allclose(s["states"]["common_K_intake_probe"]["K"], sess.K)
     assert doc["intake_probe_K"]["scale"] == [1.0, 1.0]
     # the whole-chunk re-unprojection with the common K does not worsen chunk 1's own pairs

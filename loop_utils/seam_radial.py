@@ -728,9 +728,16 @@ def measure_seam(layout: Sequence[Tuple[int, int]], k: int, d1: dict, d2: dict, 
                                                               factor=params["improvement_error_factor"],
                                                               confidence=params["heldout_confidence"])}
     counter["affine_seam"] = st
+    judged = {}
+    if before_norm is not None:
+        for name, st in counter.items():
+            if st.get("run", True) and not st.get("starved") and st.get("_held_norm") is not None:
+                judged[name] = {"before": before_norm, "after": st["_held_norm"][judge_pos],
+                                "frames": int(layout[k + 1][0]) + judge_frames}      # global shared frames
     for s in [states["before"]] + list(counter.values()):
         s.pop("_held_norm", None)
     rec["states"] = {"before": states["before"], **counter}
+    rec["_judged"] = judged                        # for the pooled session rule (not written)
     rec["split"] = {"rule": "stable_pick of half the valid correspondences by their pixel key (salt "
                             f"{SALT_FIT}) fits; the rest is held out; the judged held-out subset is a stable "
                             f"pick of {judge_samples} (salt {SALT_JUDGE}) when larger",
@@ -852,7 +859,30 @@ def run_instrument(run_dir: Path, out_dir: Optional[Path] = None, *, radius_bins
         seams.append(rec)
         cache[k + 1] = d2
         del d1
+    # THE SESSION RULE per counterfactual: every seam's judged held-out residuals pooled, the judges
+    # being the shared frames of every seam — the same aggregation loop_utils.common_k applies in-run
+    # (phase 2), so the offline verdict says what the in-run judgement would say
+    session_rule: Dict[str, Any] = {}
+    for name in STATES[1:]:
+        parts = [s_["_judged"][name] for s_ in seams if s_.get("_judged") and name in s_["_judged"]]
+        if not parts:
+            session_rule[name] = {"verdict": None, "reason": "no seam could be judged (not run / starved)"}
+            continue
+        b = np.concatenate([p_["before"] for p_ in parts])
+        a = np.concatenate([p_["after"] for p_ in parts])
+        cl = np.concatenate([p_["frames"] for p_ in parts])
+        err = judge_error_per_judge(b, cl)
+        rule = rule_verdict(b, a, cl, error_m=err["error_m"], factor=params["improvement_error_factor"],
+                            confidence=params["heldout_confidence"])
+        rule["error_source"] = ("median over the shared frames of every seam (the judges) of each frame's own "
+                                "standard error of its median held-out residual (before)")
+        rule["n_judges_frames"] = err["n_judges"]
+        rule["n_seams"] = len(parts)
+        session_rule[name] = rule
+    for s_ in seams:
+        s_.pop("_judged", None)
     doc = {"version": 1, "tool": "loop_utils.seam_radial", "state": state, "params": params,
+           "session_rule": session_rule,
            "bins": {"radius": [float(x) for x in radius_bins], "depth_m": [float(x) for x in depth_bins]},
            "judge_samples": int(judge_samples),
            "session_median_K": {k_: v for k_, v in sm.items() if k_ != "K"} | {"K": sm["K"].tolist()},
