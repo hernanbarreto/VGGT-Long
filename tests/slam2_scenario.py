@@ -31,7 +31,7 @@ for p in (_FORK, _SERVER, _SERVER / "tests"):
 
 STAMP_KEYS = ("fork_stamp", "_stac_fork_stamp")
 
-SEAMS_OFF = {"focal_model": "none", "common_K_source": "session_median"}
+SEAMS_OFF = {"focal_model": "none", "common_K_source": "session_median", "judge_samples": 20000}
 GATE_OFF = {"mode": "off", "layer": 4, "min_score": 0.5, "top_fraction": 0.25,
             "salad_similarity_threshold": None,
             "calibration": {"select": "max_auc_lower_ci", "target_precision": 0.95,
@@ -117,6 +117,8 @@ def run_scenario(root: Path, *, seams=None, gate=None) -> Path:
                                                  "layout": bridge_layout(item, ci)}))
     r._stac_ensure_bridge_anchors()
     r._stac_lock_bridges()
+    if hasattr(r, "_stac_common_K_bridges"):        # phase 2 and later (no-op with the section absent)
+        r._stac_common_K_bridges()
     meas = r._stac_measure_loops(rigid=False)
     r._stac_scale_close(meas)
     seq, seam_report = r._stac_seam_chain("final")

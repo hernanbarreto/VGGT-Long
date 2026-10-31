@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
+import numpy as np
+
 from loop_utils.loop_bridges import cfg_req
 
 SEAMS_PATH = "seams"
@@ -57,8 +59,20 @@ def seams_cfg(config: dict) -> Optional[Dict[str, Any]]:
         return None
     if not isinstance(se, dict):
         raise RuntimeError(f"config section Model.{SEAMS_PATH} must be a mapping (or absent = off)")
-    return {"focal_model": _choice(se, "focal_model", SEAMS_PATH, FOCAL_MODELS),
-            "common_K_source": _choice(se, "common_K_source", SEAMS_PATH, COMMON_K_SOURCES)}
+    out = {"focal_model": _choice(se, "focal_model", SEAMS_PATH, FOCAL_MODELS),
+           "common_K_source": _choice(se, "common_K_source", SEAMS_PATH, COMMON_K_SOURCES),
+           # BOUND: held-out correspondences per seam entering the rule (a stable pick when more)
+           "judge_samples": _number(se, "judge_samples", SEAMS_PATH, lo=100, integer=True)}
+    # written by the map worker ONLY for common_K_source intake_probe when the session has
+    # intake/focal_probe.json: the probe's K carried to the Ω grid (+ its record). Not mandatory:
+    # absent, the fork declares the variant not run (never a default K)
+    if "intake_probe_K" in se:
+        K = np.asarray(se["intake_probe_K"], np.float64)
+        if K.shape != (3, 3) or not np.all(np.isfinite(K)):
+            raise RuntimeError(f"config key Model.{SEAMS_PATH}.intake_probe_K must be a finite 3x3 matrix")
+        out["intake_probe_K"] = K.tolist()
+        out["intake_probe"] = dict(se.get("intake_probe") or {})
+    return out
 
 
 def attention_gate_cfg(config: dict) -> Optional[Dict[str, Any]]:

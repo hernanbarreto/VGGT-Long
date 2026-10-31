@@ -982,6 +982,23 @@ class VGGT_Long:
         else:
             print(f"[health] ✅ all {len(self.chunk_indices)} chunks healthy "
                   f"(parallax + anchor coherence)")
+        # the chunks the lock declared ZOOMED (this run's detection, or the previous run's record
+        # on a resume) — they keep their own K under the common calibration (phase 2)
+        _zoom_now = set(int(k) for k in zoom_chunks)
+        for _k_str, _zt in (report.get("zoom") or {}).items():
+            if isinstance(_zt, dict) and _zt.get("zoomed"):
+                _zoom_now.add(int(_k_str))
+        if already and os.path.exists(_prev_path):
+            try:
+                for _k_str, _zt in (_json.load(open(_prev_path)).get("zoom") or {}).items():
+                    if isinstance(_zt, dict) and _zt.get("zoomed"):
+                        _zoom_now.add(int(_k_str))
+            except Exception:
+                pass
+        self._stac_zoom_chunks = _zoom_now
+        # claude_stac_slam2.txt phase 2: ONE calibration for every inference, judged, right after the
+        # lock (the zoom detector above read Ω's own focals) and before any bridge or seam
+        self._stac_common_K_chunks()
 
     def _stac_vio_rows(self, vio_cfg, report):
         """§5.2: one ABSOLUTE scale row per chunk from a VIO trajectory — the
@@ -3665,6 +3682,110 @@ class VGGT_Long:
         certify.keep_unaligned_chunks is on, so the reference's fork config does not change."""
         return bool(self.config['Model'].get('keep_unaligned_chunks', False))
 
+    def _stac_common_K_params(self):
+        """The rule's parameters the common-K judgement reads: the run's own Model.graph
+        (heldout_confidence, improvement_error_factor, the held-out pair offsets) and the pose
+        fits' confidence floor — never a default."""
+        from loop_utils.loop_bridges import cfg_req
+        g = self._stac_graph_cfg()
+        return {"heldout_confidence": float(cfg_req(g, "heldout_confidence", "graph")),
+                "improvement_error_factor": float(cfg_req(g, "improvement_error_factor", "graph")),
+                "holdout_offsets": [int(x) for x in cfg_req(g, "holdout_offsets", "graph")],
+                "holdout_stride": int(cfg_req(g, "holdout_stride", "graph")),
+                "holdout_samples": int(cfg_req(g, "holdout_samples", "graph")),
+                "pose_fit_conf_min_norm": float(self._stac_pose_conf_floor())}
+
+    def _stac_common_K_chunks(self):
+        """claude_stac_slam2.txt phase 2 (loop_utils.common_k): with Model.seams.focal_model
+        common_K, judge ONE session K on the locked chunks — the seams' held-out residual must
+        improve by the user's rule and the chunks' held-out pairs must not worsen by its mirror —
+        and, when it passes, re-unproject every non-zoom chunk npy with it (depth unchanged, rays
+        changed, c2w unchanged; world_points and intrinsic change together), refreshing the
+        intrinsics of record (save_camera_poses → intrinsic.txt, what F0 reads). Identity,
+        declared, otherwise. focal_model.json is the record (stamped, resume-safe)."""
+        cfg = (self._stac_slam2_cfg() or {}).get("seams")
+        if not cfg or cfg.get("focal_model") == "none":
+            return None
+        import json as _json
+        from loop_utils import common_k as CK
+        path = os.path.join(self.output_dir, CK.REPORT_NAME)
+        layout = [(int(a), int(b)) for a, b in self.chunk_indices]
+        zoom = sorted(set(int(k) for k in getattr(self, "_stac_zoom_chunks", set())))
+        doc = None
+        if os.path.exists(path):
+            try:
+                _prev = _json.load(open(path))
+            except Exception:
+                _prev = None
+            if isinstance(_prev, dict):
+                self._stac_check_layout_stamp(_prev, path)
+                self._stac_check_fork_stamp(_prev, path)        # another stamp stops the run
+                doc = _prev
+                print(f"[common-K] focal_model.json of this run read back: "
+                      f"{'APPLIED' if doc.get('applied') else 'IDENTITY'} — {doc.get('reason')}")
+        if doc is None:
+            doc = CK.judge_and_decide(layout, self._stac_load_chunk, seams_cfg=cfg,
+                                      params=self._stac_common_K_params(), zoom_chunks=zoom,
+                                      n_frames=len(self.img_list), log=print)
+            self._stac_drop_chunk_cache()
+            doc = self._stac_with_stamp(doc)
+            if self._stac_layout_stamp() is not None:
+                doc["chunk_indices"] = self._stac_layout_stamp()
+            with open(path, "w") as f:
+                _json.dump(doc, f, indent=1)
+        self._stac_common_K_state = doc
+        if not doc.get("applied"):
+            return doc
+        K = np.asarray(doc["K"], np.float64)
+        excluded = set(int(k) for k in (doc.get("chunks_excluded_zoom") or []))
+        n_done = 0
+        for k in range(len(layout)):
+            if k in excluded:
+                print(f"[common-K] chunk {k}: ZOOMED — keeps its own K (declared)")
+                continue
+            p = os.path.join(self.result_unaligned_dir, f"chunk_{k}.npy")
+            if not os.path.exists(p):
+                continue
+            data = np.load(p, allow_pickle=True).item()
+            mark = data.get(CK.MARK_KEY)
+            if isinstance(mark, dict) and mark.get("applied"):
+                continue                                  # resume: already re-unprojected
+            CK.reunproject_in_place(data, K, source=str(doc.get("source")))
+            np.save(p, data)
+            n_done += 1
+            # the intrinsics of record: the chunk's per-frame K is now the common one
+            for _i, (_rng, _Ks) in enumerate(list(getattr(self, "all_camera_intrinsics", []) or [])):
+                if tuple(int(x) for x in _rng) == layout[k]:
+                    self.all_camera_intrinsics[_i] = (_rng, np.asarray(data["intrinsic"]))
+        self._stac_drop_chunk_cache()
+        print(f"[common-K] APPLIED to {n_done} chunk(s) (fx {K[0, 0]:.2f} fy {K[1, 1]:.2f} cx {K[0, 2]:.2f} "
+              f"cy {K[1, 2]:.2f}; {len(excluded)} zoomed chunk(s) keep their own K)")
+        return doc
+
+    def _stac_common_K_bridges(self):
+        """Phase 2, the bridges: after their lock and before the loops are measured, every bridge
+        prediction (in memory) is re-unprojected with the applied common K — the frames of a zoomed
+        parent chunk keep their own — so loops and seams measure on the same calibration."""
+        doc = getattr(self, "_stac_common_K_state", None)
+        if not doc or not doc.get("applied"):
+            return
+        from loop_utils import common_k as CK
+        K = np.asarray(doc["K"], np.float64)
+        zoom = [int(k) for k in (doc.get("chunks_excluded_zoom") or [])]
+        n = 0
+        for item, pred, meta in self.loop_predict_list:
+            mark = pred.get(CK.MARK_KEY)
+            if isinstance(mark, dict) and mark.get("applied"):
+                continue
+            frames = CK.bridge_frames_to_reunproject(meta["layout"], zoom)
+            if not frames:
+                continue
+            CK.reunproject_in_place(pred, K, frames=frames, source=str(doc.get("source")))
+            meta["common_K"] = {"frames": len(frames), "of": int(meta["layout"]["n_frames"])}
+            n += 1
+        if n:
+            print(f"[common-K] APPLIED to {n} bridge(s) (the frames of zoomed parents keep their own K)")
+
     def process_long_sequence(self):
         self._stac_slam2_cfg()                 # phase 0: fail by name before any GPU work
         num_chunks = self._stac_build_layout()
@@ -3764,6 +3885,7 @@ class VGGT_Long:
                 # Sim3 measurement → loop rows close the scale graph (§5)
                 self._stac_ensure_bridge_anchors()
                 self._stac_lock_bridges()
+                self._stac_common_K_bridges()          # phase 2: loops measure on the same K
                 meas_sim3 = self._stac_measure_loops(rigid=False)
                 self._stac_scale_close(meas_sim3)
         else:

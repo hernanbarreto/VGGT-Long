@@ -51,6 +51,7 @@ def test_present_sections_are_read_whole():
 
 @pytest.mark.parametrize("seams, gate, named", [
     ({"focal_model": "common_K"}, None, "Model.seams.common_K_source"),
+    ({"focal_model": "common_K", "common_K_source": "session_median"}, None, "Model.seams.judge_samples"),
     ({"common_K_source": "session_median"}, None, "Model.seams.focal_model"),
     ({"focal_model": "affine", "common_K_source": "session_median"}, None, "Model.seams.focal_model"),
     ({"focal_model": "common_K", "common_K_source": "stray"}, None, "Model.seams.common_K_source"),

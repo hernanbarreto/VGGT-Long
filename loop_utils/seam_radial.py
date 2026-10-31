@@ -274,49 +274,7 @@ def _c2w4(ext_i: np.ndarray) -> np.ndarray:
     return M
 
 
-def unproject_chunk(d: dict, K: Optional[np.ndarray] = None, frames: Optional[Sequence[int]] = None
-                    ) -> np.ndarray:
-    """World points of a chunk from its depth and c2w with ``K`` (one 3x3 for every frame; None =
-    each frame's own K): the adapter's unprojection (x = (u − cx)·d/fx, y = (v − cy)·d/fy, z = d;
-    world = cam·Rᵀ + t), in float64. ``frames``: local indices to compute (default all)."""
-    dep = _depth(d).astype(np.float64)
-    ext = _ext(d)
-    Ks = _K(d)
-    S, H, W = dep.shape
-    vv, uu = np.meshgrid(np.arange(H, dtype=np.float64), np.arange(W, dtype=np.float64), indexing="ij")
-    idx = range(S) if frames is None else [int(i) for i in frames]
-    out = np.zeros((len(idx), H, W, 3), np.float64)
-    for j, i in enumerate(idx):
-        Ki = Ks[i] if K is None else np.asarray(K, np.float64)
-        fx, fy, cx, cy = Ki[0, 0], Ki[1, 1], Ki[0, 2], Ki[1, 2]
-        z = dep[i]
-        cam = np.stack([(uu - cx) * z / fx, (vv - cy) * z / fy, z], -1)
-        R, t = ext[i, :3, :3], ext[i, :3, 3]
-        out[j] = cam @ R.T + t
-    return out
-
-
-def session_median_K(chunk_Ks: Dict[int, np.ndarray], layout: Sequence[Tuple[int, int]], n_frames: int
-                     ) -> Dict[str, Any]:
-    """ONE session K: the median fx, fy, cx, cy of Ω over the frames by OWNER (frame_owner —
-    every frame counted once, from the chunk that writes it)."""
-    owner = frame_owner(layout, n_frames)
-    rows = []
-    for k, (a, b) in enumerate(layout):
-        Ks = chunk_Ks[k]
-        for local, g in enumerate(range(a, b)):
-            if owner[g] == k:
-                Ki = Ks[local]
-                rows.append([Ki[0, 0], Ki[1, 1], Ki[0, 2], Ki[1, 2]])
-    rows = np.asarray(rows, np.float64)
-    if rows.size == 0:
-        raise SeamRadialError("no owned frame carries intrinsics — the session median K cannot be formed")
-    med = np.median(rows, axis=0)
-    K = np.array([[med[0], 0.0, med[2]], [0.0, med[1], med[3]], [0.0, 0.0, 1.0]])
-    spread = MAD_TO_SIGMA * np.median(np.abs(rows - med), axis=0)
-    return {"K": K, "fx": float(med[0]), "fy": float(med[1]), "cx": float(med[2]), "cy": float(med[3]),
-            "n_frames": int(len(rows)),
-            "spread_sigma_px": {n: float(v) for n, v in zip(("fx", "fy", "cx", "cy"), spread)}}
+from loop_utils.common_k import session_median_K, unproject_chunk   # noqa: E402  (one implementation)
 
 
 def intake_probe_K(run_dir: Path, grid_hw: Tuple[int, int]) -> Dict[str, Any]:
