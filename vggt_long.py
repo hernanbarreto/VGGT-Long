@@ -3646,7 +3646,18 @@ class VGGT_Long:
                                 np.flatnonzero(np.asarray(ok_flat).reshape(-1)),
                                 int(pm.shape[1]) * int(pm.shape[2]))
 
+    def _stac_slam2_cfg(self):
+        """The VGGT-SLAM 2.0 sections (loop_utils.slam2_config): {'seams', 'attention_gate'},
+        each None when absent = off (f576cbf bit for bit). Validated once, by name, before the
+        first inference — a malformed section never costs a GPU pass."""
+        cached = getattr(self, '_stac_slam2', None)
+        if cached is None:
+            from loop_utils.slam2_config import validate
+            cached = self._stac_slam2 = validate(self.config)
+        return cached
+
     def process_long_sequence(self):
+        self._stac_slam2_cfg()                 # phase 0: fail by name before any GPU work
         num_chunks = self._stac_build_layout()
 
         for chunk_idx in range(len(self.chunk_indices)):

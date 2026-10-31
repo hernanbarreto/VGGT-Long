@@ -138,7 +138,12 @@ def test_loop_stage_end_to_end(tmp_path, synth):
     assert rep["spatial_gate"] == "on"
 
 
-def test_spatial_gate_rejects_far_apart_candidate(tmp_path, synth):
+def test_spatial_gate_measures_a_far_apart_candidate_instead_of_vetoing_it(tmp_path, synth):
+    """USER 2026-10-05 (stac-build CLAUDE.md): the FRUSTUM rule no longer vetoes a SALAD pair —
+    it judged the pair with the drifted poses the closure exists to fix. A candidate whose two
+    frames look at opposite sides of the block is MEASURED (its bridge spent, its σ and the
+    graph's vote decide), with the frustum verdict recorded. (Until 2026-10-31 this test asserted
+    the old veto and failed at f576cbf.)"""
     sess, chunks, ci, errors = synth
     r, save_dir = _make_runner(tmp_path, sess, chunks, ci)
     # frames 8 and 75 are on opposite sides of the block: never co-visible
@@ -149,8 +154,11 @@ def test_spatial_gate_rejects_far_apart_candidate(tmp_path, synth):
     paired = [tuple(res) + ((i, j),) for res in process_loop_list(ci, r.loop_list, half_window=10)]
     r._stac_metric_lock()
     planned = r._stac_plan_bridges(paired)
-    assert planned == []
-    assert r._stac_loops_rejected and r._stac_loops_rejected[0]["stage"] == "spatial_gate"
+    assert len(planned) == 1 and r._stac_loops_rejected == []
+    gate = planned[0][2]
+    assert gate["verdict"] != "reject"
+    assert gate.get("frustum_vetoes") is False
+    assert "frustum" in gate["rules"]
 
 
 def test_no_usable_edge_keeps_optimizer_off(tmp_path, synth):
