@@ -159,3 +159,21 @@ def test_two_runs_of_this_tree_agree_bit_for_bit(tmp_path):
     a = _run(_FORK, tmp_path / "a")
     b = _run(_FORK, tmp_path / "b")
     assert compare_products(a, b) == []
+
+
+# ── phase 1: the unaligned chunk npys survive the apply loop when the run says so ───────────
+
+def test_the_apply_loop_removes_the_unaligned_npys_unless_the_run_keeps_them():
+    import vggt_long as vl
+    src = (_FORK / "vggt_long.py").read_text()
+    body = src[src.index("    def process_long_sequence(self):"):src.index("    def run(self):")]
+    removals = [i for i in range(len(body)) if body.startswith("os.remove(os.path.join(self.result_unaligned_dir", i)]
+    assert len(removals) == 2, "the two incremental removals of the apply loop"
+    for i in removals:
+        guard = body[max(0, i - 200):i]
+        assert "if not self._stac_keep_unaligned():" in guard, body[i - 200:i + 80]
+    r = object.__new__(vl.VGGT_Long)
+    r.config = {"Model": {}}
+    assert r._stac_keep_unaligned() is False                 # absent = removed, as before
+    r.config = {"Model": {"keep_unaligned_chunks": True}}
+    assert r._stac_keep_unaligned() is True

@@ -3656,6 +3656,15 @@ class VGGT_Long:
             cached = self._stac_slam2 = validate(self.config)
         return cached
 
+    def _stac_keep_unaligned(self):
+        """claude_stac_slam2.txt phase 1: ``Model.keep_unaligned_chunks`` true keeps every
+        _tmp_results_unaligned/chunk_*.npy through the apply loop (in their final state: metric
+        lock + scale close, the state the exact seams read) for the offline seam instrument
+        (python -m loop_utils.seam_radial). Absent / false: removed incrementally as before
+        (USER 2026-10-05, the disk peak). The map worker writes the key only when
+        certify.keep_unaligned_chunks is on, so the reference's fork config does not change."""
+        return bool(self.config['Model'].get('keep_unaligned_chunks', False))
+
     def process_long_sequence(self):
         self._stac_slam2_cfg()                 # phase 0: fail by name before any GPU work
         num_chunks = self._stac_build_layout()
@@ -4076,10 +4085,14 @@ class VGGT_Long:
                 # written and nothing downstream reads unaligned (the TSDF reads
                 # _tmp_results_aligned). Incremental cleanup so the apply phase never holds
                 # ALL unaligned + ALL aligned at once (the ~2× peak that overflowed the disk).
-                try:
-                    os.remove(os.path.join(self.result_unaligned_dir, "chunk_0.npy"))
-                except OSError:
-                    pass
+                # claude_stac_slam2.txt phase 1: KEPT when Model.keep_unaligned_chunks is set —
+                # loop_utils.seam_radial reads them in exactly this state (locked + closed, the
+                # state the seams read); absent = removed as before
+                if not self._stac_keep_unaligned():
+                    try:
+                        os.remove(os.path.join(self.result_unaligned_dir, "chunk_0.npy"))
+                    except OSError:
+                        pass
 
 
             # STAC fix: ALWAYS load the freshly-aligned chunk_{chunk_idx+1} (saved at the
@@ -4094,10 +4107,11 @@ class VGGT_Long:
                 self._stac_write_chunk_outputs(aligned_chunk_data, chunk_idx + 1)
             # STAC: free this chunk's unaligned .npy immediately (see chunk_0 note above) —
             # incremental cleanup keeps the apply phase ~flat on disk instead of doubling.
-            try:
-                os.remove(os.path.join(self.result_unaligned_dir, f"chunk_{chunk_idx + 1}.npy"))
-            except OSError:
-                pass
+            if not self._stac_keep_unaligned():
+                try:
+                    os.remove(os.path.join(self.result_unaligned_dir, f"chunk_{chunk_idx + 1}.npy"))
+                except OSError:
+                    pass
 
         # STAC patches, in order: per-frame ELASTIC seam consensus (the two copies
         # of every shared frame coincide), per-frame DEPTH GRAPH (different frames
