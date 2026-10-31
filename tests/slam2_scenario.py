@@ -22,6 +22,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+from typing import Sequence
 
 _FORK = Path(__file__).resolve().parents[1]
 _SERVER = _FORK.parents[1] / "server"
@@ -32,11 +33,57 @@ for p in (_FORK, _SERVER, _SERVER / "tests"):
 STAMP_KEYS = ("fork_stamp", "_stac_fork_stamp")
 
 SEAMS_OFF = {"focal_model": "none", "common_K_source": "session_median", "judge_samples": 20000}
-GATE_OFF = {"mode": "off", "layer": 4, "min_score": 0.5, "top_fraction": 0.25,
+GATE_OFF = {"mode": "off", "layer": 2, "min_score": 0.5, "top_fraction": 0.25,     # 2: a GLOBAL block of the tiny model
             "salad_similarity_threshold": None,
             "calibration": {"select": "max_auc_lower_ci", "target_precision": 0.95,
                             "min_labels": 5, "n_negatives": 50, "n_boot": 2000,
                             "confidence": 0.95, "salad_grid": [0.55, 0.60, 0.65, 0.70]}}
+GATE_ON = dict(GATE_OFF, mode="gate")
+
+
+class FakeAttentionModel:
+    """A stand-in for the Ω adapter in a scenario without a card: an aggregator of three tiny
+    inter-frame blocks (global, register, global) — the gate reads its layout and refuses its
+    register block — and a CAPTURE that returns, for the requested layers, a qkv in the module's
+    layout whose q and k are the token features themselves (what a trained backbone's global
+    attention does for a repeated frame: identical queries and keys). ``capture`` feeds two
+    IDENTICAL frames of deterministic tokens — every candidate looks like a perfect revisit
+    (score 1), so the gated list equals the ungated one (the byte-for-byte test);
+    ``capture_pair`` takes two feature sets (a noise pair scores low). The hook path through the
+    real block classes is tested on its own (tests/test_attention_gate.py)."""
+
+    def __init__(self, dim=64, heads=2, n_reg=2, n_patches=12):
+        import torch
+        from tiny_omega import FakeAggregator      # tests/tiny_omega.py
+        torch.manual_seed(0)
+        self.model = type("M", (), {})()
+        self.model.aggregator = FakeAggregator(dim=dim, heads=heads, n_reg=n_reg)
+        self.dim, self.n_reg, self.n_patches = dim, n_reg, n_patches
+        self.preproc_mode, self.image_resolution, self.dtype, self.device = "max_size", 64, torch.float32, "cpu"
+
+    @property
+    def tokens_per_frame(self):
+        return 1 + self.n_reg + self.n_patches
+
+    def frame_features(self, seed=1234):
+        import torch
+        g = torch.Generator().manual_seed(int(seed))
+        return torch.randn(1, self.tokens_per_frame, self.dim, generator=g)
+
+    def capture_pair(self, frame_a, frame_b, layers):
+        import torch
+        from loop_utils.attention_gate import check_layer
+        tokens = torch.cat([frame_a, frame_b], dim=1)                 # [1, 2N, C]
+        qkv = torch.cat([tokens, tokens, tokens], dim=-1)             # q = k = v = the features
+        out = {}
+        for L in layers:
+            check_layer(self.model.aggregator, int(L))
+            out[int(L)] = qkv.clone()
+        return out
+
+    def capture(self, paths, layers):
+        f = self.frame_features()
+        return self.capture_pair(f, f, layers)                        # the same frame twice
 
 
 def make_runner(root: Path, sess, chunks, ci, *, seams=None, gate=None):
@@ -109,6 +156,11 @@ def run_scenario(root: Path, *, seams=None, gate=None) -> Path:
     paired = [tuple(res) + ((i, j),) for res in process_loop_list(ci, r.loop_list, half_window=10)]
     if hasattr(r, "_stac_slam2_cfg"):               # phase 0 and later: validated by name first
         r._stac_slam2_cfg()
+    if gate is not None and gate.get("mode") == "gate":
+        fake = FakeAttentionModel()
+        r.model = fake
+        r._stac_attention_capture = fake.capture
+        paired = r._stac_attention_gate(paired)
     r._stac_metric_lock()
     planned = r._stac_plan_bridges(paired)
     for item, cand, gate_rec in planned:
@@ -199,13 +251,18 @@ def _compare_values(path: str, a, b, diffs: list) -> None:
         diffs.append(f"{path}: {a!r} != {b!r}")
 
 
-def compare_products(dir_a: Path, dir_b: Path) -> list:
+def compare_products(dir_a: Path, dir_b: Path, ignore_names: Sequence[str] = ()) -> list:
     """Every .npy / .json under dir_a against dir_b: [] when identical bit for bit (arrays by
-    their bytes, dtype and shape; JSON by value), ignoring only the fork-stamp fields. A file
-    on one side only is a difference."""
+    their bytes, dtype and shape; JSON by value), ignoring only the fork-stamp fields — and the
+    files named in ``ignore_names`` (a record one side writes and the other does not, e.g. the
+    attention gate's own json when the branch under test is the gate). A file on one side only
+    is a difference."""
     dir_a, dir_b = Path(dir_a), Path(dir_b)
-    files_a = sorted(p.relative_to(dir_a) for p in dir_a.rglob("*") if p.suffix in (".npy", ".json"))
-    files_b = sorted(p.relative_to(dir_b) for p in dir_b.rglob("*") if p.suffix in (".npy", ".json"))
+    ign = set(ignore_names)
+    files_a = sorted(p.relative_to(dir_a) for p in dir_a.rglob("*")
+                     if p.suffix in (".npy", ".json") and p.name not in ign)
+    files_b = sorted(p.relative_to(dir_b) for p in dir_b.rglob("*")
+                     if p.suffix in (".npy", ".json") and p.name not in ign)
     diffs = []
     for rel in sorted(set(files_a) ^ set(files_b)):
         diffs.append(f"{rel}: on one side only")
@@ -231,11 +288,13 @@ def main(argv=None) -> int:
     ap.add_argument("--seams-none", action="store_true", help="a present but OFF Model.seams")
     ap.add_argument("--gate-off", action="store_true",
                     help="a present but OFF Model.loops.attention_gate")
+    ap.add_argument("--gate-pass-all", action="store_true",
+                    help="the gate ON with a tiny model whose every candidate passes (phase 3)")
     args = ap.parse_args(argv)
     out = Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    save_dir = run_scenario(out, seams=SEAMS_OFF if args.seams_none else None,
-                            gate=GATE_OFF if args.gate_off else None)
+    gate = GATE_ON if args.gate_pass_all else (GATE_OFF if args.gate_off else None)
+    save_dir = run_scenario(out, seams=SEAMS_OFF if args.seams_none else None, gate=gate)
     print(f"[slam2-scenario] products in {save_dir} (fork tree {_FORK})")
     return 0
 

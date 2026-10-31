@@ -42,7 +42,7 @@ def test_present_sections_are_read_whole():
     gate_on = dict(GATE_OFF, mode="gate", salad_similarity_threshold=0.60)
     v = validate(_cfg(seams=seams_on, gate=gate_on))
     assert v["seams"] == seams_on
-    assert v["attention_gate"]["mode"] == "gate" and v["attention_gate"]["layer"] == 4
+    assert v["attention_gate"]["mode"] == "gate" and v["attention_gate"]["layer"] == GATE_OFF["layer"]
     assert v["attention_gate"]["salad_similarity_threshold"] == 0.60
     assert v["attention_gate"]["calibration"]["salad_grid"] == [0.55, 0.60, 0.65, 0.70]
     off = validate(_cfg(seams=SEAMS_OFF, gate=GATE_OFF))

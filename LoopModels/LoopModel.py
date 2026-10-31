@@ -271,30 +271,8 @@ class LoopDetector:
         # the bar this run applied, recorded in the stamp of loop_closures.txt (plan point 8)
         self.applied_threshold = float(threshold)
         self.threshold_source = threshold_source
-        loop_closures = []
-        k = min(self.top_k, n)
-        for i in range(n):
-            row = sims_nonlocal[i]
-            if k <= 0 or not np.isfinite(row).any():
-                continue
-            order = np.argsort(-row)[:k]
-            for neighbor_idx in order:
-                similarity = float(row[neighbor_idx])
-                if not np.isfinite(similarity) or similarity <= threshold:
-                    continue
-                neighbor_idx = int(neighbor_idx)
-                if i < neighbor_idx:
-                    loop_closures.append((i, neighbor_idx, similarity))
-                else:
-                    loop_closures.append((neighbor_idx, i, similarity))
-
-        loop_closures = list(set(loop_closures))
-        loop_closures.sort(key=lambda x: x[2], reverse=True)
-        
-        if self.use_nms and self.nms_threshold > 0:
-            loop_closures = self._apply_nms_filter(loop_closures, self.nms_threshold)
-        
-        self.loop_closures = self._ensure_decending_order(loop_closures)
+        self.loop_closures = select_candidates(sims_nonlocal, threshold, self.top_k,
+                                               self.use_nms, self.nms_threshold)
         return self.loop_closures
 
 
@@ -349,6 +327,50 @@ class LoopDetector:
         self.save_results()
         
         return self.loop_closures
+
+
+def nonlocal_similarities(sims, min_gap):
+    """The detector's non-local similarity matrix: the self and odometry band (|i − j| < min_gap)
+    at −inf, everything else as given."""
+    n = np.asarray(sims).shape[0]
+    idx = np.arange(n)
+    local = np.abs(idx[:, None] - idx[None, :]) < int(min_gap)
+    return np.where(local, -np.inf, np.asarray(sims, np.float64))
+
+
+def select_candidates(sims_nonlocal, threshold, top_k, use_nms, nms_threshold):
+    """The detector's candidate list for a non-local similarity matrix and a bar: per frame the
+    top-k non-local neighbours above ``threshold`` (unordered pairs, deduplicated, sorted by
+    similarity), the NMS filter when on, in the (higher, lower, similarity) order the fork reads.
+    The statements of find_loop_closures, moved here so the attention calibration can count what
+    each SALAD bar would propose (claude_stac_slam2.txt phase 3) — bit for bit the same list."""
+    sims_nonlocal = np.asarray(sims_nonlocal)
+    n = sims_nonlocal.shape[0]
+    threshold = float(threshold)
+    loop_closures = []
+    k = min(int(top_k), n)
+    for i in range(n):
+        row = sims_nonlocal[i]
+        if k <= 0 or not np.isfinite(row).any():
+            continue
+        order = np.argsort(-row)[:k]
+        for neighbor_idx in order:
+            similarity = float(row[neighbor_idx])
+            if not np.isfinite(similarity) or similarity <= threshold:
+                continue
+            neighbor_idx = int(neighbor_idx)
+            if i < neighbor_idx:
+                loop_closures.append((i, neighbor_idx, similarity))
+            else:
+                loop_closures.append((neighbor_idx, i, similarity))
+
+    loop_closures = list(set(loop_closures))
+    loop_closures.sort(key=lambda x: x[2], reverse=True)
+
+    if use_nms and nms_threshold > 0:
+        loop_closures = LoopDetector._apply_nms_filter(None, loop_closures, nms_threshold)
+
+    return LoopDetector._ensure_decending_order(None, loop_closures)
 
 
 def main():

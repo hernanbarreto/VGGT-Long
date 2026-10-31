@@ -2328,7 +2328,8 @@ class VGGT_Long:
         # SALAD bar it was held to (similarity − applied threshold). The bar is the stamp's,
         # captured by get_loop_pairs; without it the margin is None WITH its reason.
         salad_bar = self._stac_salad_bar_record()
-        planned, rejected = [], []
+        # the attention gate's rejections (phase 3) travel with the spatial gate's into the report
+        planned, rejected = [], list(getattr(self, '_stac_attention_rejected', None) or [])
         view = None
         if gate_mod is not None:
             seq, seam_rep = self._stac_seam_chain("provisional")
@@ -3786,6 +3787,89 @@ class VGGT_Long:
         if n:
             print(f"[common-K] APPLIED to {n} bridge(s) (the frames of zoomed parents keep their own K)")
 
+    def _stac_attention_capture(self, paths, layers):
+        """One Ω pass over two keyframes capturing the qkv of the global ``layers``
+        (loop_utils.attention_gate.omega_pair_pass on the loaded adapter). Tests inject their
+        own capture here (a tiny model, no card)."""
+        from loop_utils.attention_gate import omega_pair_pass
+        return omega_pair_pass(self.model, paths, layers)
+
+    def _stac_attention_model(self):
+        """The Ω module whose aggregator the gate reads (the adapter's .model)."""
+        m = getattr(self, 'model', None)
+        return getattr(m, 'model', m)
+
+    def _stac_attention_gate(self, loop_results):
+        """claude_stac_slam2.txt phase 3 (loop_utils.attention_gate): with
+        Model.loops.attention_gate.mode gate, score every candidate pair from the backbone's
+        global attention at the configured layer and keep the ones whose min(score(A,B),
+        score(B,A)) clears min_score; the rest never get a bridge. attention_gate.json records
+        every candidate (stamped, resume-safe). Absent / off: the list is returned untouched."""
+        cfg = (self._stac_slam2_cfg() or {}).get("attention_gate")
+        if not cfg or cfg.get("mode") == "off":
+            return loop_results
+        import json as _json
+        from loop_utils import attention_gate as AG
+        layer = int(cfg["layer"])
+        min_score = float(cfg["min_score"])
+        top_fraction = float(cfg["top_fraction"])
+        path = os.path.join(self.output_dir, AG.GATE_NAME)
+        agg = AG.aggregator_of(self._stac_attention_model())
+        AG.check_layer(agg, layer)                      # a register block is refused by name
+        by_pair = {}
+        for c in getattr(self, 'loop_cands', []) or []:
+            by_pair[(int(c['i']), int(c['j']))] = c
+        prev = None
+        if os.path.exists(path):
+            try:
+                prev = _json.load(open(path))
+            except Exception:
+                prev = None
+            if isinstance(prev, dict):
+                self._stac_check_layout_stamp(prev, path)
+                self._stac_check_fork_stamp(prev, path)
+                prev = {(int(c["i"]), int(c["j"])): c for c in prev.get("candidates", [])}
+                print(f"[attention-gate] {len(prev)} candidate verdict(s) of this run read back from "
+                      f"{AG.GATE_NAME}")
+            else:
+                prev = None
+        records, kept, rejected = [], [], []
+        for item in loop_results:
+            i, j = int(item[-1][0]), int(item[-1][1])
+            rec = prev.get((i, j)) if prev else None
+            if rec is None:
+                cap = self._stac_attention_capture([self.img_list[i], self.img_list[j]], [layer])
+                sc = AG.scores_from_captures(agg, cap, top_fraction=top_fraction)[layer]
+                rec = {"i": i, "j": j, "chunks": [int(item[0]), int(item[2])],
+                       "windows": [list(item[1]), list(item[3])],
+                       "candidate": by_pair.get((i, j)),
+                       "score_ab": sc["score_ab"], "score_ba": sc["score_ba"], "score_min": sc["score_min"],
+                       "tokens_per_frame": sc["tokens_per_frame"],
+                       "pass": bool(sc["score_min"] >= min_score)}
+            records.append(rec)
+            if rec["pass"]:
+                kept.append(item)
+            else:
+                rejected.append({"item": [int(item[0]), list(item[1]), int(item[2]), list(item[3])],
+                                 "candidate": rec.get("candidate") or {"i": i, "j": j, "sim": None, "source": "salad"},
+                                 "attention": {"score_ab": rec["score_ab"], "score_ba": rec["score_ba"],
+                                               "score_min": rec["score_min"], "min_score": min_score,
+                                               "layer": layer},
+                                 "status": "rejected", "stage": "attention_gate"})
+            print(f"[attention-gate] candidate {i}<->{j}: score(A,B) {rec['score_ab']:.3f} score(B,A) "
+                  f"{rec['score_ba']:.3f} min {rec['score_min']:.3f} {'>=' if rec['pass'] else '<'} "
+                  f"{min_score:g} → {'PASS' if rec['pass'] else 'REJECTED (no bridge)'}")
+        doc = self._stac_with_stamp(AG.gate_record(records, layer=layer, min_score=min_score,
+                                                    top_fraction=top_fraction, mode=str(cfg["mode"]), agg=agg))
+        if self._stac_layout_stamp() is not None:
+            doc["chunk_indices"] = self._stac_layout_stamp()
+        with open(path, "w") as f:
+            _json.dump(doc, f, indent=1)
+        self._stac_attention_rejected = rejected
+        print(f"[attention-gate] layer {layer} (global): {len(kept)} of {len(loop_results)} candidate(s) pass "
+              f"min_score {min_score:g}, {len(rejected)} get no bridge → {AG.GATE_NAME}")
+        return kept
+
     def process_long_sequence(self):
         self._stac_slam2_cfg()                 # phase 0: fail by name before any GPU work
         num_chunks = self._stac_build_layout()
@@ -3850,6 +3934,10 @@ class VGGT_Long:
             print(loop_results)
             # return e.g. (31, (1574, 1594), 2, (129, 149))
             if _stac_loops:
+                # claude_stac_slam2.txt phase 3: the attention verifier reads the backbone over
+                # each candidate pair while the model is loaded — a candidate that fails the gate
+                # never costs a bridge (mode gate); absent / off: the list is untouched
+                loop_results = self._stac_attention_gate(loop_results)
                 # ── STAC F1 ── metric lock (anchors + seams) BEFORE the bridges, so
                 # the spatial gate sees a provisional metric chain and no bridge is
                 # spent on an implausible candidate (§4.2 step 0). The model stays
