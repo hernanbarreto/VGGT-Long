@@ -2513,16 +2513,41 @@ class VGGT_Long:
 
     def _stac_measure_loops(self, rigid):
         """Exact bridge↔chunk fits for every bridge (Sim3 → scale rows;
-        rigid → SE(3) pose edges). Chunks are loaded two at a time."""
+        rigid → SE(3) pose edges). Chunks are loaded two at a time.
+
+        The bridges are MEASURED in an order planned on the chunks they read — grouped by
+        chunk pair, the cached chunk next needed furthest in the future evicted first — and
+        returned in their own order: every measurement is its bridge's alone (measure_bridge
+        only reads the chunks). Station 2026-11-01: in list order the two passes loaded a 2 GB
+        chunk 58 times (~3.4 of their 3.6 min, the card idle); planned, 34."""
         from loop_utils.loop_bridges import measure_bridge
         lcfg = self._stac_loops_cfg()
-        out = []
-        for li, (item, pred, meta) in enumerate(self.loop_predict_list):
-            ka, kb = item[0], item[2]
-            da = self._stac_load_chunk(ka)
-            db = self._stac_load_chunk(kb)
-            meas = measure_bridge(pred, meta["layout"], da, db, lcfg, rigid=rigid)
-            out.append(meas)
+        items = list(self.loop_predict_list)
+        pairs = [(int(it[0][0]), int(it[0][2])) for it in items]
+        order = sorted(range(len(items)), key=lambda li: (min(pairs[li]), max(pairs[li]), li))
+        uses = [k for li in order for k in pairs[li]]          # the chunks in the order read
+        cache = {}
+        out = [None] * len(items)
+        at = 0
+        for li in order:
+            item, pred, meta = items[li]
+            for k in pairs[li]:
+                if k not in cache:
+                    if len(cache) >= 2:
+                        def _next_use(c, at=at):
+                            for j in range(at, len(uses)):
+                                if uses[j] == c:
+                                    return j
+                            return len(uses)
+                        keep = set(pairs[li])
+                        victim = max((c for c in cache if c not in keep), key=_next_use)
+                        del cache[victim]
+                    cache[k] = np.load(os.path.join(self.result_unaligned_dir, f"chunk_{k}.npy"),
+                                       allow_pickle=True).item()
+                at += 1
+            out[li] = measure_bridge(pred, meta["layout"], cache[pairs[li][0]],
+                                     cache[pairs[li][1]], lcfg, rigid=rigid)
+        cache.clear()
         self._stac_drop_chunk_cache()
         return out
 
