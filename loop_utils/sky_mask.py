@@ -20,6 +20,8 @@ Now:
 from __future__ import annotations
 
 import os
+import queue
+import threading
 from typing import Callable, Dict, Optional, Sequence
 
 import numpy as np
@@ -39,6 +41,15 @@ SKYSEG_ORIGIN = "huggingface.co/JianyuanWang/skyseg (file skyseg.onnx)"
 _NONSKY_BAR = 0.1
 
 _SHA_CACHE: Dict[tuple, str] = {}
+
+# the masks a chunk or a bridge still lacks are computed on SKY_THREADS threads, each with its
+# OWN session of ONE onnxruntime thread (session.run, cv2 and the PNG write release the GIL): a
+# mask is its image's alone, so the bytes are the ones one thread writes (station 2026-11-01:
+# a loop bridge's few extra frames, ~2.4 s each, one after another with the card idle). The
+# sessions are kept for the process's life, per model file.
+SKY_THREADS = 8
+_SESSIONS: Dict[tuple, "queue.SimpleQueue"] = {}
+_SESSIONS_LOCK = threading.Lock()
 
 
 def _sha256_cached(path: str) -> str:
@@ -115,6 +126,54 @@ def _prune_stale(cache_root: str, keep_dir: str, log) -> None:
             f"model / code / naming deleted (never reusable)")
 
 
+def _session_pool(model_path: str, session_factory):
+    """The process's sessions of one model and factory (each used by one thread at a time)."""
+    key = (os.path.abspath(model_path), session_factory)
+    with _SESSIONS_LOCK:
+        return _SESSIONS.setdefault(key, queue.SimpleQueue())
+
+
+def _segment_all(todo, model_path: str, segment, session_factory) -> None:
+    """``segment(image, session, mask path)`` for every (image, mask path) of ``todo``, on up to
+    SKY_THREADS threads, each holding one session for its whole share (the first error raised,
+    as the loop would)."""
+    if not todo:
+        return
+    pool = _session_pool(model_path, session_factory)
+
+    def take():
+        try:
+            return pool.get_nowait()
+        except queue.Empty:
+            return session_factory(model_path)
+    n = max(1, min(int(SKY_THREADS), len(todo)))
+    if n == 1:
+        sess = take()
+        try:
+            for p, mp in todo:
+                segment(p, sess, mp)
+        finally:
+            pool.put(sess)
+        return
+    from concurrent.futures import ThreadPoolExecutor
+    local = threading.local()
+    held, held_lock = [], threading.Lock()
+
+    def one(item):
+        sess = getattr(local, "session", None)
+        if sess is None:
+            sess = local.session = take()
+            with held_lock:
+                held.append(sess)
+        segment(item[0], sess, item[1])
+    try:
+        with ThreadPoolExecutor(max_workers=n) as ex:
+            list(ex.map(one, todo))
+    finally:
+        for sess in held:
+            pool.put(sess)
+
+
 def apply_sky_masks(conf: np.ndarray, image_paths: Sequence[str], cache_root: str, *,
                     model_path: str, segment: Callable[[str, object, str], object],
                     session_factory: Callable[[str], object] = cpu_session,
@@ -138,17 +197,17 @@ def apply_sky_masks(conf: np.ndarray, image_paths: Sequence[str], cache_root: st
     cdir = mask_cache_dir(cache_root, model_sha, code_sha)
     os.makedirs(cdir, exist_ok=True)
     _prune_stale(cache_root, cdir, log)
-    session = None
-    n_new = n_reused = 0
-    for i, p in enumerate(paths[:S]):
-        mp = mask_path(cdir, p)
-        if os.path.exists(mp):
-            n_reused += 1
-        else:
-            if session is None:
-                session = session_factory(model_path)
-            segment(p, session, mp)
-            n_new += 1
+    mps = [mask_path(cdir, p) for p in paths[:S]]
+    todo, seen = [], set()
+    for p, mp in zip(paths[:S], mps):
+        if mp not in seen and not os.path.exists(mp):
+            seen.add(mp)
+            todo.append((p, mp))
+    _segment_all(todo, model_path, segment, session_factory)
+    n_new = len(todo)
+    n_reused = S - n_new
+    for i, mp in enumerate(mps):
+        p = paths[i]
         sky = read_mask(mp)
         if sky is None:
             raise RuntimeError(f"[STAC sky] {mp} unreadable — the sky mask of "
