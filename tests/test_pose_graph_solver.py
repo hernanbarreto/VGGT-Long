@@ -253,7 +253,7 @@ def test_plane_node_is_solved_jointly_with_the_poses():
         d_l = float(d_true - n_true @ t)
         pg.add_plane_edge(k, node, n_l, d_l, 0.1, 0.01, huber=True, tag="wall")
     rep = pg.solve(log=lambda m: None)
-    assert rep["stop"] in ("rel_tol", "step_below_tol"), rep["stop"]
+    assert rep["stop"] in ("converged", "stationary"), rep["stop"]
     n_s, d_s = pg.plane_of(node)
     assert abs(float(n_s @ n_true)) > np.cos(np.radians(0.05)), n_s
     assert abs(d_s - d_true) < 0.01, d_s
@@ -263,3 +263,69 @@ def test_plane_node_is_solved_jointly_with_the_poses():
                for k in range(n)]
     assert max(dist_err) < 0.02, max(dist_err)
     assert max(yaw_err) < 0.1, max(yaw_err)
+
+
+# ── the vectorised assembly and update (2026-11-01) against the loops they replaced ─────────
+
+def _mixed_graph(seed=0, device="cpu"):
+    """Every edge kind at once: odometry, Huber loops (nodes shared by several loops), two edges
+    between the same pair, a plane datum, an axis prior and a plane node seen by every third
+    frame — the blocks that receive many contributions are exactly where an order matters."""
+    rng = np.random.default_rng(seed)
+    T_gt = _ring(n=24)
+    T_init = _drifted(T_gt)
+    n = len(T_gt)
+    pg = PoseGraph(T_init, graph_cfg(), device=device)
+    for k in range(n - 1):
+        pg.add_relative(k, k + 1, lie.se3_inv(T_init[k]) @ T_init[k + 1], 0.5, 0.05)
+    for i, j in ((0, n - 1), (3, 15), (3, 20), (15, 20), (7, 1), (5, 6)):
+        Z = lie.se3_inv(T_gt[i]) @ T_gt[j] @ lie.se3_exp(rng.normal(0, 0.01, 6))
+        pg.add_relative(i, j, Z, 0.5, 0.02, huber=True, tag="loop")
+    up = np.array([0.0, 1.0, 0.0])
+    R, t = T_gt[4][:3, :3], T_gt[4][:3, 3]
+    n_l = R.T @ up
+    pg.add_plane_datum(4, n_l, float(n_l @ (R.T @ (-t))), up, 0.0, 0.2, 0.01)
+    pg.add_axis_vertical(9, up, up, 2.0)
+    n_true, d_true = np.array([1.0, 0.0, 0.0]), 8.0
+    node = pg.add_plane_node(n_true, n_true * (d_true + 0.2))
+    for k in range(0, n, 3):
+        R, t = T_gt[k][:3, :3], T_gt[k][:3, 3]
+        pg.add_plane_edge(k, node, R.T @ n_true, float(d_true - n_true @ t), 0.1, 0.01, huber=True,
+                          tag="wall")
+    return pg
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_assemble_is_the_edge_by_edge_loop_bit_for_bit(seed):
+    pg = _mixed_graph(seed)
+    groups = pg._groups()
+    for T in (pg.T, PoseGraph._apply_delta_reference(
+            pg.T, torch.as_tensor(np.random.default_rng(seed).normal(0, 0.01, 6 * pg.n)))):
+        res = pg._residuals(T, groups, with_jac=True)
+        H, g, blocks = pg._assemble(groups, res)
+        H0, g0, blocks0 = pg._assemble_reference(groups, res)
+        assert torch.equal(H, H0) and torch.equal(g, g0)
+        assert len(blocks) == len(blocks0)
+        for b, b0 in zip(blocks, blocks0):
+            assert np.array_equal(b[0], b0[0]) and np.array_equal(b[1], b0[1])
+            assert all(torch.equal(x, y) for x, y in zip(b[2:], b0[2:]))
+
+
+def test_apply_delta_is_the_node_by_node_loop():
+    rng = np.random.default_rng(3)
+    T = torch.as_tensor(np.stack([lie.se3_exp(rng.normal(0, 0.5, 6)) for _ in range(50)]))
+    for scale in (1e-12, 1e-6, 1e-2, 0.5):
+        d = torch.as_tensor(rng.normal(0, scale, 6 * 50))
+        assert torch.equal(PoseGraph._apply_delta(T, d), PoseGraph._apply_delta_reference(T, d))
+
+
+def test_the_solve_is_the_reference_solve(monkeypatch):
+    pg = _mixed_graph(4)
+    rep = pg.solve(log=lambda m: None)
+    ref = _mixed_graph(4)
+    monkeypatch.setattr(PoseGraph, "_assemble", PoseGraph._assemble_reference)
+    monkeypatch.setattr(PoseGraph, "_apply_delta", staticmethod(PoseGraph._apply_delta_reference))
+    rep0 = ref.solve(log=lambda m: None)
+    assert np.array_equal(pg.poses, ref.poses)
+    assert rep["history"] == rep0["history"] and rep["stop"] == rep0["stop"]
+    assert rep["iterations"] == rep0["iterations"] and rep["accepted_steps"] == rep0["accepted_steps"]

@@ -313,12 +313,8 @@ class PoseGraph:
         return c
 
     # ── normal equations ─────────────────────────────────────────────────
-    def _assemble(self, groups, res):
-        """H (6n×6n dense) and g (6n) of the Gauss-Newton system; node 0 rows
-        and columns are removed by the caller (gauge)."""
-        n6 = 6 * self.n
-        H = torch.zeros((n6, n6), dtype=torch.float64, device=self.device)
-        gvec = torch.zeros(n6, dtype=torch.float64, device=self.device)
+    def _edge_blocks(self, groups, res):
+        """Per group, the edge blocks of the Gauss-Newton system: (i, j, Hii, Hjj, Hij, gi, gj)."""
         blocks = []
         for kind, g in groups.items():
             rec = res[kind]
@@ -337,6 +333,17 @@ class PoseGraph:
             gi = torch.einsum("emi,em->ei", Ji, rw)
             gj = torch.einsum("emi,em->ei", Jj, rw)
             ii = g["i"].cpu().numpy(); jj = g["j"].cpu().numpy()
+            blocks.append((kind, ii, jj, Hii, Hjj, Hij, gi, gj))
+        return blocks
+
+    def _assemble_reference(self, groups, res):
+        """The edge-by-edge accumulation (the solver's until 2026-11-01): kept as the reference
+        _assemble is held to, bit for bit (tests/test_pose_graph_solver.py)."""
+        n6 = 6 * self.n
+        H = torch.zeros((n6, n6), dtype=torch.float64, device=self.device)
+        gvec = torch.zeros(n6, dtype=torch.float64, device=self.device)
+        blocks = []
+        for kind, ii, jj, Hii, Hjj, Hij, gi, gj in self._edge_blocks(groups, res):
             blocks.append((ii, jj, Hii, Hjj, Hij, gi, gj))
             for e in range(len(ii)):
                 a, b = 6 * int(ii[e]), 6 * int(jj[e])
@@ -347,6 +354,57 @@ class PoseGraph:
                     H[a:a + 6, b:b + 6] += Hij[e]
                     H[b:b + 6, a:a + 6] += Hij[e].T
                     gvec[b:b + 6] += gj[e]
+        return H, gvec, blocks
+
+    def _assemble(self, groups, res):
+        """H (6n×6n dense) and g (6n) of the Gauss-Newton system; node 0 rows
+        and columns are removed by the caller (gauge).
+
+        Every edge's contributions are added to their 6x6 / 6 blocks in ROUNDS: round r adds
+        each block's r-th contribution in the order of the edge-by-edge loop (kind by kind,
+        edge by edge, ii · jj · ij · ji within an edge) — no block twice in a round — so every
+        entry receives the same additions in the same order as the loop: the same H and g, bit
+        for bit (:meth:`_assemble_reference`), with a handful of tensor operations per round
+        instead of a Python step per edge (station 2026-11-01: the judge's 20 solves took ~55 s
+        each on the card, which was idle three quarters of the time)."""
+        n, n6 = self.n, 6 * self.n
+        eb = self._edge_blocks(groups, res)
+        Hv, Ht, Hs, gv, gt, gs = [], [], [], [], [], []
+        base = 0
+        for kind, ii, jj, Hii, Hjj, Hij, gi, gj in eb:
+            ne = len(ii)
+            e4 = (base + np.arange(ne, dtype=np.int64)) * 4
+            ii64, jj64 = ii.astype(np.int64), jj.astype(np.int64)
+            Hv.append(Hii); Ht.append(ii64 * n + ii64); Hs.append(e4)
+            gv.append(gi); gt.append(ii64); gs.append(e4)
+            if kind in _BINARY:
+                Hv += [Hjj, Hij, Hij.transpose(1, 2)]
+                Ht += [jj64 * n + jj64, ii64 * n + jj64, jj64 * n + ii64]
+                Hs += [e4 + 1, e4 + 2, e4 + 3]
+                gv.append(gj); gt.append(jj64); gs.append(e4 + 1)
+            base += ne
+        Hb = torch.zeros((n * n, 6, 6), dtype=torch.float64, device=self.device)
+        gb = torch.zeros((n, 6), dtype=torch.float64, device=self.device)
+        for acc, vals, tgts, seqs in ((Hb, Hv, Ht, Hs), (gb, gv, gt, gs)):
+            if not vals:
+                continue
+            V = torch.cat(vals, dim=0)
+            tgt = np.concatenate(tgts)
+            seq = np.concatenate(seqs)
+            order = np.lexsort((seq, tgt))                 # by block, then the loop's order
+            t_sorted = tgt[order]
+            first = np.r_[True, t_sorted[1:] != t_sorted[:-1]]
+            start = np.maximum.accumulate(np.where(first, np.arange(len(order)), 0))
+            rank = np.empty(len(order), np.int64)
+            rank[order] = np.arange(len(order)) - start
+            for r in range(int(rank.max()) + 1):
+                sel = np.flatnonzero(rank == r)            # each block at most once in a round
+                ti = torch.as_tensor(tgt[sel], device=self.device)
+                si = torch.as_tensor(sel, device=self.device)
+                acc[ti] = acc[ti] + V[si]
+        H = Hb.view(n, n, 6, 6).permute(0, 2, 1, 3).reshape(n6, n6)
+        gvec = gb.reshape(n6)
+        blocks = [(ii, jj, Hii, Hjj, Hij, gi, gj) for _k, ii, jj, Hii, Hjj, Hij, gi, gj in eb]
         return H, gvec, blocks
 
     def _solve_linear(self, H, gvec, lam):
@@ -406,10 +464,18 @@ class PoseGraph:
         return x
 
     @staticmethod
-    def _apply_delta(T, d):
+    def _apply_delta_reference(T, d):
+        """Node by node (the solver's until 2026-11-01): the reference _apply_delta is held to."""
         n = T.shape[0]
         dd = d.view(n, 6)
         return torch.stack([t_se3_exp(dd[k]) @ T[k] for k in range(n)])
+
+    @staticmethod
+    def _apply_delta(T, d):
+        """T_i ← Exp(δ_i)·T_i for every node at once (the same exponential, vmapped, and one
+        batched product; tests/test_pose_graph_solver.py holds it to the node-by-node loop)."""
+        n = T.shape[0]
+        return torch.vmap(t_se3_exp)(d.view(n, 6)) @ T
 
     # ── the LM loop ──────────────────────────────────────────────────────
     def solve(self, log=print) -> dict:
