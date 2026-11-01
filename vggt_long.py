@@ -1683,9 +1683,9 @@ class VGGT_Long:
         if sol is None:
             # per-frame owned view: points+conf+pose+K of each frame's canonical copy
             cache = {}
-            for k, (start, end) in enumerate(self.chunk_indices):
-                data = np.load(os.path.join(self.result_aligned_dir, f"chunk_{k}.npy"),
-                               allow_pickle=True).item()
+            for k, data in self._stac_iter_chunks(self.result_aligned_dir,
+                                                  range(len(self.chunk_indices))):
+                start, end = self.chunk_indices[k]
                 if data.get('_stac_depth_graph_applied'):
                     raise RuntimeError(
                         f"[depth-graph] chunk {k} already depth-corrected but "
@@ -2119,15 +2119,16 @@ class VGGT_Long:
         self._stac_max_write_depth = self._stac_write_depth_cap()
         self._stac_far_drop = self._stac_far_contradictions()
         self._stac_prepare_backfill()
+        todo = []
         for k in range(len(self.chunk_indices)):
             if (os.path.exists(os.path.join(self.pcd_dir, f"{k}_pcd.ply"))
                     and os.path.exists(os.path.join(self.pcd_dir, f"{k}_origins.npz"))):
                 print(f"[outputs] chunk {k}: PLY + origins already written — skipped")
                 continue
-            path = os.path.join(self.result_aligned_dir, f"chunk_{k}.npy")
-            if not os.path.exists(path):
+            if not os.path.exists(os.path.join(self.result_aligned_dir, f"chunk_{k}.npy")):
                 continue
-            data = np.load(path, allow_pickle=True).item()
+            todo.append(k)
+        for k, data in self._stac_iter_chunks(self.result_aligned_dir, todo):
             self._stac_write_chunk_outputs(data, k)
             del data
             # NOTE (2026-09-04): do NOT delete the aligned npy here — the
@@ -2180,6 +2181,27 @@ class VGGT_Long:
     def _stac_drop_chunk_cache(self):
         if getattr(self, '_stac_chunk_cache', None):
             self._stac_chunk_cache.clear()
+
+    @staticmethod
+    def _stac_iter_chunks(directory, ks):
+        """(k, chunk dict) of every chunk ``k`` in ``ks`` from ``directory``, in order, the next
+        one read in a background thread while the caller works on the current one — the dicts
+        np.load gives, at most two held (station 2026-11-01: every per-chunk pass read its 2 GB
+        pickles one after another over the network file system, the card idle)."""
+        from concurrent.futures import ThreadPoolExecutor
+        ks = list(ks)
+        if not ks:
+            return
+
+        def load(k):
+            return np.load(os.path.join(directory, f"chunk_{k}.npy"), allow_pickle=True).item()
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(load, ks[0])
+            for i, k in enumerate(ks):
+                data = fut.result()
+                fut = ex.submit(load, ks[i + 1]) if i + 1 < len(ks) else None
+                yield k, data
+                del data
 
     def _stac_seam_chain(self, tag):
         """Exact rigid seams over the CURRENT unaligned chunks → sequential
@@ -2946,9 +2968,8 @@ class VGGT_Long:
                 print(f"[uncertainty] uncertainty.json unreadable ({_e}) — re-measuring")
         per_frame = {}
         prev_tail = None
-        for k, (start, end) in enumerate(self.chunk_indices):
-            data = np.load(os.path.join(self.result_aligned_dir, f"chunk_{k}.npy"),
-                           allow_pickle=True).item()
+        for k, data in self._stac_iter_chunks(self.result_aligned_dir, range(len(self.chunk_indices))):
+            start, end = self.chunk_indices[k]
             wp = np.asarray(data['world_points']); wp = wp[0] if wp.ndim == 5 else wp
             cf = np.asarray(data['world_points_conf']).reshape(wp.shape[:3])
             if prev_tail is not None and prev_tail[0] == k - 1:
