@@ -1714,7 +1714,11 @@ class VGGT_Long:
             from loop_utils.metric_lock import depth_graph_verdict
             _zref = float(_inspect.signature(depth_graph_verdict).parameters["zref"].default)
             meas, held, held_err, before_all = [], [], [], []
+            from loop_utils.metric_lock import depth_pair_source
             for f in sorted(cache):
+                # the source half of every pair of f — its stable sample — once for its eight
+                # partners (the same array each pair computed)
+                src_f = depth_pair_source(cache[f][0], cache[f][1], seed=f)
                 for d in fit_offsets + holdout_offsets:
                     g = f + d
                     if g not in cache:
@@ -1722,7 +1726,7 @@ class VGGT_Long:
                     zs = depth_pair_samples(cache[f][0], cache[f][1],
                                             cache[g][0], cache[g][1],
                                             cache[g][2], cache[g][3],
-                                            seed=f)   # stable pixel keys of keyframe f
+                                            seed=f, src=src_f)   # stable pixel keys of keyframe f
                     if zs is None:
                         continue
                     rel = pair_depth_relation(zs[0], zs[1])
@@ -1809,6 +1813,13 @@ class VGGT_Long:
         n_moved_total = 0
         for k, (start, end) in enumerate(self.chunk_indices):
             path = os.path.join(self.result_aligned_dir, f"chunk_{k}.npy")
+            if all(abs(a[g] - 1.0) < 1e-9 and abs(b[g]) < 1e-12 for g in range(start, end)):
+                # identity on every frame of the chunk: nothing to move, the file is not read
+                # nor rewritten (station 2026-11-01: an identity solution rewrote 15 GB of
+                # chunks, 43 s with the card idle); the flag guards re-correcting a corrected
+                # chunk, and this one was not corrected
+                print(f"[depth-graph] chunk {k}: 0/{end - start} frames re-depthed")
+                continue
             data = np.load(path, allow_pickle=True).item()
             if data.get('_stac_depth_graph_applied'):
                 print(f"[depth-graph] chunk {k}: already applied — skipped")

@@ -948,17 +948,12 @@ def elastic_corrections(chunk_indices, k, seam_fits, suspect=None, trust=None):
     return corr
 
 
-def depth_pair_samples(wp_src, conf_src, wp_dst, conf_dst, w2c_dst, K_dst,
-                       max_samples=8000, seed=0):
-    """EXACT-surface depth samples between two frames: project src's valid points
-    into dst's camera, read dst's OWN depth at the hit pixel. Returns (z_src, z_dst)
-    — the depth src's geometry implies in dst's frame vs the depth dst itself
-    predicts for that surface — or None when starved. Purely geometric: the same
-    association the seam work uses, generalized to any nearby frame pair.
-    Past ``max_samples`` the source pixels are chosen by a stable per-pixel key
-    in the namespace ``seed`` (the source frame's key — plan point 11)."""
+def depth_pair_source(wp_src, conf_src, max_samples=8000, seed=0):
+    """The source half of :func:`depth_pair_samples`: src's valid points (float64), past
+    ``max_samples`` chosen by a stable per-pixel key in the namespace ``seed`` (the source
+    frame's key — plan point 11); None when starved. It depends on the source frame alone, so
+    a caller pairing one frame with several computes it once."""
     from loop_utils.stable_sample import pixel_keys, stable_pick
-    H, W = wp_dst.shape[:2]
     p = np.asarray(wp_src, np.float64).reshape(-1, 3)
     c = np.asarray(conf_src, np.float32).reshape(-1)
     idx = np.flatnonzero(c > 1e-5)
@@ -968,7 +963,26 @@ def depth_pair_samples(wp_src, conf_src, wp_dst, conf_dst, w2c_dst, K_dst,
         # stable per-pixel choice (plan point 11): ``seed`` is the frame key of the
         # source frame (the fork passes its global keyframe index)
         idx = idx[stable_pick(pixel_keys(int(seed), idx), max_samples)]
-    p = p[idx]
+    return p[idx]
+
+
+def depth_pair_samples(wp_src, conf_src, wp_dst, conf_dst, w2c_dst, K_dst,
+                       max_samples=8000, seed=0, src=None):
+    """EXACT-surface depth samples between two frames: project src's valid points
+    into dst's camera, read dst's OWN depth at the hit pixel. Returns (z_src, z_dst)
+    — the depth src's geometry implies in dst's frame vs the depth dst itself
+    predicts for that surface — or None when starved. Purely geometric: the same
+    association the seam work uses, generalized to any nearby frame pair.
+    Past ``max_samples`` the source pixels are chosen by a stable per-pixel key
+    in the namespace ``seed`` (the source frame's key — plan point 11). ``src``: the
+    :func:`depth_pair_source` of (wp_src, conf_src, max_samples, seed) when the caller
+    already has it (the same array — the same samples)."""
+    H, W = wp_dst.shape[:2]
+    if src is None:
+        src = depth_pair_source(wp_src, conf_src, max_samples, seed)
+    if src is None:
+        return None
+    p = src
     w2c = np.asarray(w2c_dst, np.float64)
     X = p @ w2c[:3, :3].T + w2c[:3, 3]
     z = X[:, 2]

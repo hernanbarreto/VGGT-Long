@@ -106,6 +106,25 @@ def stable_pick(keys, k, salt=0) -> np.ndarray:
         return np.arange(n)
     if k <= 0:
         return np.zeros(0, dtype=np.int64)
+    # the k smallest by (hash, position) — exactly a stable argsort's first k — without sorting
+    # all n (station 2026-11-01: the depth graph's 3,062 picks of 8,000 among ~590,000 pixels
+    # sorted 27 s of every 31): the k-th smallest hash v, every element below it, then the
+    # earliest elements equal to it until k (_stable_pick_reference is the sort)
+    v = np.partition(h, k - 1)[k - 1]
+    below = np.flatnonzero(h < v)
+    eq = np.flatnonzero(h == v)[: k - len(below)]
+    return np.sort(np.concatenate([below, eq]))
+
+
+def _stable_pick_reference(keys, k, salt=0) -> np.ndarray:
+    """stable_pick by a full stable sort (its definition; the tests hold stable_pick to it)."""
+    h = _salted(keys, salt)
+    n = len(h)
+    k = int(k)
+    if k >= n:
+        return np.arange(n)
+    if k <= 0:
+        return np.zeros(0, dtype=np.int64)
     order = np.argsort(h, kind="stable")
     return np.sort(order[:k])
 
