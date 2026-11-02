@@ -3808,12 +3808,22 @@ class VGGT_Long:
             self._stac_metric_lock()
 
         print("Aligning all the chunks...")
-        for chunk_idx in range(len(self.chunk_indices)-1):
+        # STAC: every chunk read ONCE, the next one in a background thread while a seam is fit
+        # (the seam reads both chunks and never writes them; station 2026-11-01: 14 loads of
+        # 2 GB for 7 seams, one after another, the card idle)
+        _seam_prev = None
+        for _k_next, _d_next in self._stac_iter_chunks(
+                self.result_unaligned_dir,
+                range(len(self.chunk_indices)) if len(self.chunk_indices) > 1 else []):
+            if _seam_prev is None:
+                _seam_prev = (_k_next, _d_next)
+                continue
+            chunk_idx, chunk_data1 = _seam_prev
+            chunk_data2 = _d_next
+            _seam_prev = (_k_next, _d_next)
 
             print(f"Aligning {chunk_idx} and {chunk_idx+1} (Total {len(self.chunk_indices)-1})")
-            chunk_data1 = np.load(os.path.join(self.result_unaligned_dir, f"chunk_{chunk_idx}.npy"), allow_pickle=True).item()
-            chunk_data2 = np.load(os.path.join(self.result_unaligned_dir, f"chunk_{chunk_idx+1}.npy"), allow_pickle=True).item()
-            
+
             # STAC: the frames THIS seam shares — `overlap` on the uniform layout, the
             # seam's own count on an explicit (co-visibility planned) one
             ov, point_map1, point_map2, conf1, conf2 = self._stac_seam_copies(
@@ -3889,6 +3899,8 @@ class VGGT_Long:
                 s = 1.0
 
             self.sim3_list.append((s, R, t))
+            del chunk_data1, chunk_data2
+        _seam_prev = None
 
 
         if self.loop_enable and _stac_loops:
