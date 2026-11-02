@@ -3238,11 +3238,12 @@ class VGGT_Long:
                 if f + d < N:
                     wanted.add(f); wanted.add(f + d)
         cache = {}
-        for k, (start, end) in enumerate(self.chunk_indices):
-            need = [g for g in range(start, end) if g in wanted and owner[g] == k]
-            if not need:
-                continue
-            data = self._stac_load_chunk_aligned(k)
+        needs = {k: [g for g in range(start, end) if g in wanted and owner[g] == k]
+                 for k, (start, end) in enumerate(self.chunk_indices)}
+        for k, data in self._stac_iter_chunks(self.result_aligned_dir,
+                                              [k for k in needs if needs[k]]):
+            start, end = self.chunk_indices[k]
+            need = needs[k]
             wp = np.asarray(data['world_points']); wp = wp[0] if wp.ndim == 5 else wp
             cf = np.asarray(data['world_points_conf']).reshape(wp.shape[:3])
             ext = np.asarray(data['extrinsic']); K = np.asarray(data['intrinsic'])
