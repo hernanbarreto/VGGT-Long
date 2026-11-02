@@ -4088,6 +4088,7 @@ class VGGT_Long:
         if _elastic:
             print("[STAC] per-chunk PLY/origins deferred until after the elastic/depth stages")
 
+        _apply = []
         for chunk_idx in range(len(self.chunk_indices) - 1):
             # STAC patch (resume): skip this chunk's apply if its aligned .npy + pcd .ply
             # already exist (from a prior run). chunk_0 is written inside the idx==0 branch.
@@ -4102,12 +4103,16 @@ class VGGT_Long:
             if _done:
                 print(f'[STAC resume] chunk {chunk_idx + 1} aligned+pcd exist — apply skipped')
                 continue
+            _apply.append(chunk_idx)
+        # STAC: the unaligned chunks to apply read one ahead (the next one while the current one
+        # is transformed and written; station 2026-11-01: ~70 s of one-after-another 2 GB reads
+        # and writes with the card idle) — what each iteration reads is what np.load read
+        for _k1, chunk_data in self._stac_iter_chunks(self.result_unaligned_dir,
+                                                      [ci + 1 for ci in _apply]):
+            chunk_idx = _k1 - 1
             print(f'Applying {chunk_idx + 1} -> {chunk_idx} (Total {len(self.chunk_indices) - 1})')
             s, R, t = self.sim3_list[chunk_idx]
 
-
-            chunk_data = np.load(os.path.join(self.result_unaligned_dir, f"chunk_{chunk_idx + 1}.npy"),
-                                     allow_pickle=True).item()
 
             chunk_data['world_points'] = apply_sim3_direct(chunk_data['world_points'], s, R, t)
             # STAC: the per-chunk Sim3 scales world_points by s, but the raw per-camera `depth`
