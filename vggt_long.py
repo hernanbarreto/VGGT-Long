@@ -2435,7 +2435,7 @@ class VGGT_Long:
         tried in order through the spatial gate (its occlusion test with each frame's own depth)
         and the first it does not reject gets a bridge — unless an existing closure's windows
         already cover it. Returns (items in loop_results' format, {(i, j): candidate})."""
-        from loop_utils.revisits import propose, quick_visibility
+        from loop_utils.revisits import covered, propose, quick_visibility
         sp = lcfg['spatial']
         c = gate_mod._cfg(sp)
         n = len(self.img_list)
@@ -2460,7 +2460,7 @@ class VGGT_Long:
         props = propose(F, owner, walk_cum, float(c["min_walk_m"]), float(c["min_visible_frac"]))
         half = int(self.config['Model']['loop_chunk_size'] / 2)
         _ov = lambda r, q: max(r[0], q[0]) < min(r[1], q[1])     # noqa: E731
-        existing = [(tuple(it[1]), tuple(it[3])) for it in loop_results]
+        existing = [(int(it[0]), tuple(it[1]), int(it[2]), tuple(it[3])) for it in loop_results]
         items, cands, report = [], {}, []
         for (a, b), lst in props.items():
             rec = {"chunks": [a, b], "tried": [], "kept": None}
@@ -2471,9 +2471,8 @@ class VGGT_Long:
                 t = {"i": int(i), "j": int(j), "visibility": float(score)}
                 if _ov(ra, rb):
                     t["skipped"] = "its two windows share keyframes"
-                elif any((_ov(ra, qa) and _ov(rb, qb)) or (_ov(ra, qb) and _ov(rb, qa))
-                         for qa, qb in existing):
-                    t["skipped"] = "an existing closure's windows already cover it"
+                elif covered(ki, ra, kj, rb, existing):
+                    t["skipped"] = "a closure of the same two chunks already covers these windows"
                 else:
                     gate = gate_mod.gate_frame_pair(int(i), int(j), view, sp)
                     t["gate"] = gate.get("verdict")
@@ -2482,7 +2481,7 @@ class VGGT_Long:
                         cands[(int(i), int(j))] = {"i": int(i), "j": int(j), "sim": None,
                                                    "source": "geometry",
                                                    "visibility": float(score)}
-                        existing.append((ra, rb))
+                        existing.append((ki, ra, kj, rb))
                         rec["kept"] = [int(i), int(j)]
                 rec["tried"].append(t)
                 if rec["kept"] is not None or t.get("skipped", "").startswith("an existing"):
@@ -3918,15 +3917,6 @@ class VGGT_Long:
               f"({sum(1 for e in loops if str(e.get('source', '')) == 'geometry')} by geometry)"
               + (f" ({len(skipped)} without a place, skipped)" if skipped else "")
               + f", {len(priors)} DA3 scale prior(s)")
-        # a closure the chain cannot be wrong by (SALAD's false matches, metres off) never
-        # testifies nor enters: the chain's own uncertainty decides (consistent_with_chain)
-        loops_all = loops
-        loops, inconsistent = CG.consistent_with_chain(n, seams, loops_all, priors, conf)
-        for e in inconsistent:
-            print(f"[chunk-graph] closure {e.get('bridge')} (chunks {e['a']}<->{e['b']}, σ "
-                  f"{e['sigma_m']*100:.1f} cm) is {e['chain_error_m']*100:.1f} cm off the chain — "
-                  f"Mahalanobis² {e['chain_mahalanobis2']:.1f} > χ²₇ {e['chi2_bar']:.1f} with the "
-                  f"chain's own uncertainty: left out")
         judge = CG.judge_leave_one_out(n, seams, loops, priors, error_factor=fac,
                                        confidence=conf)
         used = loops if judge.get("improves") else []
@@ -3958,7 +3948,6 @@ class VGGT_Long:
         doc = {"version": 1, "mode": "sim3", "applied": applied,
                "confidence": conf, "improvement_error_factor": fac,
                "seams": [_js(e) for e in seams], "closures": [_js(e) for e in loops],
-               "closures_inconsistent": [_js(e) for e in inconsistent],
                "closures_skipped": skipped, "priors": {str(k): v for k, v in priors.items()},
                "judge": judge, "solve": {k_: v_ for k_, v_ in sol.items() if k_ != "poses"},
                "poses": _rec(poses), "chain": _rec(chain), "per_chunk": per_chunk,

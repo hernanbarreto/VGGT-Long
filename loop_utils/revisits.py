@@ -75,3 +75,22 @@ def propose(F: np.ndarray, owner: Sequence[int], walk_cum: np.ndarray, min_walk_
     for k in out:
         out[k] = sorted(out[k], key=lambda x: (-x[0], x[1], x[2]))[:int(per_pair)]
     return dict(sorted(out.items()))
+
+
+def _overlap(r, q) -> bool:
+    return max(int(r[0]), int(q[0])) < min(int(r[1]), int(q[1]))
+
+
+def covered(ka: int, ra, kb: int, rb, existing) -> bool:
+    """Whether a closure already joins the SAME two chunks over these two windows: ``existing``
+    holds (chunk a, window a, chunk b, window b) of the closures planned so far. A closure of
+    other chunks never covers it (pccr 2026-11-04: a SALAD pair 110↔130 inside one pass 'covered'
+    the revisit 91↔125 of chunks 3 and 5 by one keyframe of window overlap)."""
+    for qa, wa, qb, wb in existing:
+        if {int(qa), int(qb)} != {int(ka), int(kb)}:
+            continue
+        if int(qa) == int(ka) and _overlap(ra, wa) and _overlap(rb, wb):
+            return True
+        if int(qa) == int(kb) and _overlap(ra, wb) and _overlap(rb, wa):
+            return True
+    return False
