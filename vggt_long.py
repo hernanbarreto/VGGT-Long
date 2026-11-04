@@ -2846,7 +2846,11 @@ class VGGT_Long:
             # plan point 17: the scale this bridge still disagrees with the closed chunks
             # (measured by the Sim3 pass, net of the close) enters its σ in quadrature —
             # the rigid measurement here has s_ab = 1 by construction
-            _sres = (None if sim3 else
+            # in the chunk Sim(3) graph the scale is the GRAPH's variable: the bridge's scale
+            # disagreement is what the graph corrects, never added to its σ (0 here — None
+            # would make verify_loop read log s_ab of the measurement and add it, which on
+            # pccr 2026-11-04 turned the start↔end closure's 7.9 cm held-out into σ 28 cm)
+            _sres = (0.0 if sim3 else
                      (getattr(self, '_stac_bridge_scale_resid', {}) or {}).get(li))
             v = verify_loop(meas, lcfg, semantic=sem, spatial=meta.get("gate"),
                             reference_m=reference_m, scale_disagreement_log=_sres)
