@@ -3855,9 +3855,9 @@ class VGGT_Long:
         shared frames, σ = their median residual), the verified SALAD closures (Sim(3), σ = the
         held-out residual, no scale term) and DA3 per chunk as a weak scale prior (σ =
         sigma_anchor/√anchors, toward the chunk's DA3 scale over the scale the lock applied).
-        The closures enter only when the leave-one-out judge says they improve
-        (chunk_graph.judge_leave_one_out, Model.graph's confidence and error factor); otherwise
-        the graph is solved with the seams and the priors alone. The solution, relative to
+        Every verified closure enters, as in a SLAM (USER 2026-11-04), weighed by its σ under the
+        Cauchy loss; the leave-one-out judge (chunk_graph.judge_leave_one_out, Model.graph's
+        confidence and error factor) is measured and recorded, it does not decide. The solution, relative to
         chunk 0, replaces self.sim3_list (the global metre is scale_align's, after Omega).
         Everything lands in chunk_graph.json."""
         import json as _json
@@ -3917,14 +3917,18 @@ class VGGT_Long:
               f"({sum(1 for e in loops if str(e.get('source', '')) == 'geometry')} by geometry)"
               + (f" ({len(skipped)} without a place, skipped)" if skipped else "")
               + f", {len(priors)} DA3 scale prior(s)")
+        # USER 2026-11-04 ("sí" — apply them as a SLAM does): every verified closure enters the
+        # graph, the Cauchy loss weighs down the ones metres off. The leave-one-out judge is still
+        # MEASURED and recorded, never deciding here — the local errors of revisits (each its own
+        # offset) cannot predict one another, and on pccr it refused even with three true ones
         judge = CG.judge_leave_one_out(n, seams, loops, priors, error_factor=fac,
                                        confidence=conf)
-        used = loops if judge.get("improves") else []
+        used = loops
         chain = CG.chain_poses(n, seams)
         sol = CG.solve(n, seams, used, priors)
         if sol["converged"]:
             poses, applied = sol["poses"], ("seams + closures + DA3 priors" if used
-                                            else "seams + DA3 priors (closures not applied)")
+                                            else "seams + DA3 priors (no closure)")
         else:
             poses, applied = chain, "the seams' chain (the final solve did not converge)"
         self.sim3_list = CG.sequential(poses)
