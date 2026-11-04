@@ -2560,8 +2560,17 @@ class VGGT_Long:
             pred = self.process_single_chunk(item[1], range_2=item[3], is_loop=True,
                                              extra_1=ex1, extra_2=ex2)
             layout = bridge_layout(item, self.chunk_indices, len(ex1), len(ex2))
-            meta = {"candidate": cand, "gate": gate, "layout": layout}
-            self.loop_predict_list.append((item, pred, meta))
+            # the bridge stays in the file process_single_chunk wrote and is read back by
+            # _stac_bridge_pred where it is needed (bufferStop 2026-11-04: 151 bridges held in
+            # memory took the Omega process to 104 GB, the pod to its 117 GB limit)
+            bfile = os.path.join(self.result_loop_dir, f"loop_{item[1][0]}_{item[1][1]}_"
+                                                       f"{item[3][0]}_{item[3][1]}.npy")
+            if not os.path.isfile(bfile):
+                raise RuntimeError(f"[loop-bridge] {bfile} was not written — the bridge cannot be "
+                                   f"read back")
+            del pred
+            meta = {"candidate": cand, "gate": gate, "layout": layout, "file": bfile}
+            self.loop_predict_list.append((item, None, meta))
             print(f"[loop-bridge] {cand['source']} {cand['i']}<->{cand['j']}: chunks "
                   f"{item[0]}<->{item[2]}, windows {item[1]}+{item[3]}, "
                   f"{len(ex1)}+{len(ex2)} extra frame(s)")
@@ -2615,6 +2624,23 @@ class VGGT_Long:
             record_run_products(self.output_dir, anchors=[
                 f"frame_{real_frame_number(m)}.npz" for m in missing])
 
+    def _stac_bridge_pred(self, pred, meta):
+        """A bridge's prediction for its readers: ``pred`` when it is held in memory, else
+        (what the run stores since 2026-11-04) read from ``meta["file"]`` with the scales the
+        lock and the scale close gave it re-applied in the same order and under the same
+        conditions — the same arrays as the in-memory path, one bridge in memory at a time."""
+        if pred is not None:
+            return pred
+        from loop_utils.metric_lock import apply_scale
+        p = np.load(meta["file"], allow_pickle=True).item()
+        lock = meta.get("lock")
+        if lock is not None:
+            apply_scale(p, lock["s"])
+            f = lock.get("delta_parents")
+            if f is not None and abs(float(f) - 1.0) > 1e-12:
+                apply_scale(p, f)
+        return p
+
     def _stac_lock_bridges(self):
         """Metric-lock every bridge: own DA3 anchors when present, else the
         scale graph's value for its parent chunks (never 'the median') — and
@@ -2625,7 +2651,8 @@ class VGGT_Long:
         near_frac = float(ml.get('near_frac', 0.25))
         scales = getattr(self, '_stac_scales_applied', {}) or {}
         for li, (item, pred, meta) in enumerate(self.loop_predict_list):
-            if pred.get('_stac_bridge_locked'):
+            if (pred.get('_stac_bridge_locked') if pred is not None
+                    else meta.get("lock") is not None):
                 continue
             ka, (a0, a1), kb, (b0, b1) = item[0], item[1], item[2], item[3]
             lay = meta["layout"]
@@ -2637,7 +2664,8 @@ class VGGT_Long:
             nums = [n if n is not None else -1 for n in nums]
             s, n, ratios = (None, 0, [])
             if anchor_dir:
-                s, n, ratios = chunk_scale(pred, nums, anchor_dir, near_frac=near_frac)
+                s, n, ratios = chunk_scale(self._stac_bridge_pred(pred, meta), nums, anchor_dir,
+                                           near_frac=near_frac)
             if s is None:
                 sa, sb = scales.get(ka), scales.get(kb)
                 if sa is None or sb is None:
@@ -2648,8 +2676,9 @@ class VGGT_Long:
                 src = "scale_graph_parents"
             else:
                 src = "own_anchors"
-            apply_scale(pred, s)
-            pred['_stac_bridge_locked'] = True
+            if pred is not None:
+                apply_scale(pred, s)
+                pred['_stac_bridge_locked'] = True
             meta["lock"] = {"s": float(s), "n_anchors": int(n), "source": src,
                             "ratios": [float(r) for r in ratios]}
             print(f"[loop-bridge] {ka}<->{kb}: metric lock s={s:.4f} ({src}, {n} anchor(s))")
@@ -2688,8 +2717,8 @@ class VGGT_Long:
                     cache[k] = np.load(os.path.join(self.result_unaligned_dir, f"chunk_{k}.npy"),
                                        allow_pickle=True).item()
                 at += 1
-            out[li] = measure_bridge(pred, meta["layout"], cache[pairs[li][0]],
-                                     cache[pairs[li][1]], lcfg, rigid=rigid)
+            out[li] = measure_bridge(self._stac_bridge_pred(pred, meta), meta["layout"],
+                                     cache[pairs[li][0]], cache[pairs[li][1]], lcfg, rigid=rigid)
         cache.clear()
         self._stac_drop_chunk_cache()
         return out
@@ -2824,8 +2853,8 @@ class VGGT_Long:
             if meta.get("lock", {}).get("source") == "scale_graph_parents":
                 ka, kb = int(item[0]), int(item[2])
                 f = float(np.sqrt(delta[ka] * delta[kb]))
-                if abs(f - 1.0) > 1e-12:
-                    apply_scale(pred, f)
+                if pred is not None and abs(f - 1.0) > 1e-12:
+                    apply_scale(pred, f)          # on disk: _stac_bridge_pred applies it
                 meta["lock"]["delta_parents"] = f
         self._stac_scales_applied = {k: float(s_v1.get(k, 1.0) * delta[k]) for k in range(n_chunks)}
         self._stac_scale_delta = delta
@@ -2944,7 +2973,7 @@ class VGGT_Long:
                             reference_m=reference_m, scale_disagreement_log=_sres)
             if not meas.get("ok"):
                 # starved exact fit → the VENDOR coarse fit, recorded as low confidence
-                coarse = self._stac_vendor_bridge_fit(item, pred, meta)
+                coarse = self._stac_vendor_bridge_fit(item, self._stac_bridge_pred(pred, meta), meta)
                 if coarse is not None:
                     s_ab, R_ab, t_ab = coarse
                     v = {"status": "accepted", "sigma_m": starved_sig, "fallback": "vendor_point_map_fit",
@@ -2976,7 +3005,7 @@ class VGGT_Long:
                 # exact-fit residual, σ_rot from config. Intra-chunk bridges
                 # give edges too (no scale row, but a pose constraint).
                 lay = meta["layout"]
-                ext_b = np.asarray(pred['extrinsic'])
+                ext_b = np.asarray(self._stac_bridge_pred(pred, meta)['extrinsic'])
                 if ext_b.ndim == 4:
                     ext_b = ext_b[0]
                 # the edge joins the CANDIDATE frames the spatial gate judged (both
@@ -4390,8 +4419,8 @@ class VGGT_Long:
             plt.close()
 
         # STAC (USER 2026-10-05, the /workspace quota at 92 % on pccr 2408): the bridge
-        # files are consumed — every bridge is in memory (loop_predict_list) and the
-        # loop stage is through — and the aligned chunk copy is about to be written. The
+        # files are consumed — every reader of the bridges (each read from its file since
+        # 2026-11-04) is through — and the aligned chunk copy is about to be written. The
         # files only served a resume of the bridges; ~0.4 GB each, 79 on pccr 2408 (34 GB)
         # sitting there while the aligned copy doubles the chunks. loop_closures.txt
         # stays: a resume past this point re-measures the bridges.

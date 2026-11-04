@@ -210,3 +210,57 @@ def test_scale_close_is_identity_without_loop_rows(tmp_path, synth):
         assert np.array_equal(d["world_points"], before[k]), f"chunk {k} geometry moved with no loop row"
     # s_ref (no loops) is recorded and equals s_v2 here
     assert all(abs(sg["s_ref_no_loops"][k] - sg["s_v2_with_loops"][k]) < 1e-12 for k in sg["s_ref_no_loops"])
+
+
+def test_a_bridge_read_back_from_its_file_gives_the_same_measurements(tmp_path, synth):
+    """bufferStop 2026-11-04: 151 bridges held in memory took the Omega process to 104 GB. A bridge
+    now stays in the file process_single_chunk wrote and is read back where it is needed, with the
+    lock's scale (and the close's δ) re-applied in the same order — every measurement, the closed
+    scales and the verified edges are the in-memory path's, bit for bit."""
+    sess, chunks, ci, _ = synth
+    from loop_utils.loop_bridges import bridge_layout
+    from loop_utils.sim3utils import process_loop_list
+    out = {}
+    for mode in ("memory", "file"):
+        r, save_dir = _make_runner(tmp_path / mode, sess, chunks, ci)
+        i, j = 140, 8
+        r.loop_list = [(i, j)]
+        r.loop_cands = [{"i": i, "j": j, "sim": 0.9, "source": "salad"}]
+        results = process_loop_list(ci, r.loop_list, half_window=10)
+        paired = [tuple(res) + ((i, j),) for res in results]
+        r._stac_metric_lock()
+        planned = r._stac_plan_bridges(paired)
+        for item, cand, gate in planned:
+            pred = make_bridge(sess, item, s_L=1.25, yaw_L_deg=8.0, t_L=(0.7, 0.1, -0.3))
+            meta = {"candidate": cand, "gate": gate, "layout": bridge_layout(item, ci)}
+            if mode == "file":
+                f = save_dir / "_tmp_results_loop" / f"loop_{item[1][0]}_{item[1][1]}_{item[3][0]}_{item[3][1]}.npy"
+                np.save(f, pred)
+                meta["file"] = str(f)
+                pred = None
+            r.loop_predict_list.append((item, pred, meta))
+        r._stac_ensure_bridge_anchors()
+        r._stac_lock_bridges()
+        m3 = r._stac_measure_loops(rigid=False)
+        r._stac_scale_close(m3)
+        mr = r._stac_measure_loops(rigid=True)
+        r._stac_verify_loops(mr)
+        out[mode] = {"m3": m3, "mr": mr, "scales": dict(r._stac_scales_applied),
+                     "held": [p is not None for _, p, _ in r.loop_predict_list],
+                     "lock": [m["lock"] for _, _, m in r.loop_predict_list],
+                     "edges": json.loads((save_dir / "loop_edges.json").read_text())["edges"]}
+    a, b = out["memory"], out["file"]
+    assert all(a["held"]) and not any(b["held"])        # the file mode keeps no bridge in memory
+    assert a["lock"] == b["lock"] and a["scales"] == b["scales"]
+    for k in ("m3", "mr"):
+        for x, y in zip(a[k], b[k]):
+            assert set(x) == set(y)
+            for key in x:
+                xv, yv = x[key], y[key]
+                if isinstance(xv, (np.ndarray, list, tuple)):
+                    assert np.array_equal(np.asarray(xv, dtype=object), np.asarray(yv, dtype=object)), key
+                else:
+                    assert xv == yv or (xv != xv and yv != yv), key
+    strip = lambda es: [{k: v for k, v in e.items() if k != "candidate"} for e in es]   # noqa: E731
+    assert json.dumps(strip(a["edges"]), sort_keys=True, default=str) == \
+        json.dumps(strip(b["edges"]), sort_keys=True, default=str)
