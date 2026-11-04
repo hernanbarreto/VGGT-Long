@@ -2802,7 +2802,7 @@ class VGGT_Long:
             with open(_ml_path, "w") as f:
                 _json.dump(_rep, f, indent=1)
 
-    def _stac_verify_loops(self, meas_rigid):
+    def _stac_verify_loops(self, meas_rigid, sim3=False):
         """§4.2 steps 1–4 on the SE(3) measurements; builds the pose-edge list
         (every edge carries σ) and the loop report. loop_enable_opt then depends
         on at least one edge with σ ≤ max_edge_sigma_m — the exact-seam skip is
@@ -2846,7 +2846,8 @@ class VGGT_Long:
             # plan point 17: the scale this bridge still disagrees with the closed chunks
             # (measured by the Sim3 pass, net of the close) enters its σ in quadrature —
             # the rigid measurement here has s_ab = 1 by construction
-            _sres = (getattr(self, '_stac_bridge_scale_resid', {}) or {}).get(li)
+            _sres = (None if sim3 else
+                     (getattr(self, '_stac_bridge_scale_resid', {}) or {}).get(li))
             v = verify_loop(meas, lcfg, semantic=sem, spatial=meta.get("gate"),
                             reference_m=reference_m, scale_disagreement_log=_sres)
             if not meas.get("ok"):
@@ -2876,7 +2877,7 @@ class VGGT_Long:
                     "sides": meas.get("sides"), "verdict": v, "status": v["status"],
                     "stage": "verification", "intra_chunk": ka == kb}
             edges.append(edge)
-            if v["status"] == "accepted" and gcfg is not None:
+            if v["status"] == "accepted" and gcfg is not None and not sim3:
                 # KEYFRAME edge for the SE(3) graph (§4.3): the relative pose
                 # between the two window centres as ONE Omega pass measured it
                 # (the bridge's own metric-locked extrinsics); σ_t = the verified
@@ -2914,6 +2915,9 @@ class VGGT_Long:
             if v["status"] == "accepted" and ka != kb:
                 self._stac_loop_edges.append({"a": ka, "b": kb, "R_ab": np.asarray(meas["R_ab"]),
                                               "t_ab": np.asarray(meas["t_ab"]),
+                                              "s_ab": float(meas.get("s_ab", 1.0)),
+                                              "centroid_b": meas.get("centroid_b"),
+                                              "range_m": meas.get("range_m"),
                                               "sigma_m": float(v["sigma_m"]),
                                               "status": v["status"], "bridge": li})
                 if float(v["sigma_m"]) <= max_sig:
@@ -2959,9 +2963,14 @@ class VGGT_Long:
         # weighs it by its own σ. Saying "loop optimizer OFF" without that
         # second half read as "nothing closes" (USER 2026-09-16, pccr).
         n_edges = len(self._stac_loop_edges_kf)
-        print(f"[loop-verify] {n_good} edge(s) with σ ≤ {max_sig} m → vendor Sim3 optimizer "
-              f"{'ON' if self.loop_enable_opt else 'OFF'}; {n_edges} edge(s) go to the "
-              f"keyframe pose graph weighted by σ; loop_edges.json")
+        if sim3:
+            print(f"[loop-verify] {len(self._stac_loop_edges)} chunk-to-chunk edge(s) go to the "
+                  f"chunk Sim(3) graph weighted by σ (the vendor optimizer and the keyframe "
+                  f"SE(3) graph do not run); loop_edges.json")
+        else:
+            print(f"[loop-verify] {n_good} edge(s) with σ ≤ {max_sig} m → vendor Sim3 optimizer "
+                  f"{'ON' if self.loop_enable_opt else 'OFF'}; {n_edges} edge(s) go to the "
+                  f"keyframe pose graph weighted by σ; loop_edges.json")
 
     # ══════════════════════════════════════════════════════════════════════
     # STAC F2 — KEYFRAME SE(3) POSE GRAPH, INTRINSIC UNCERTAINTY, AUTHORITY
@@ -3687,6 +3696,164 @@ class VGGT_Long:
         finally:
             self._stac_drop_chunk_cache()
 
+    def _stac_chunk_graph_mode(self):
+        """'sim3' when Model.chunk_graph.mode says so (USER 2026-11-04: the chunks are pieces of
+        ONE Sim(3) graph — seams, SALAD closures and DA3 as a weak scale prior; loop_utils/
+        chunk_graph.py), else None: the metric-lock scale ladder + SE(3) seams + the keyframe
+        SE(3) graph, as before."""
+        mode = (self.config['Model'].get('chunk_graph') or {}).get('mode')
+        if mode not in (None, "sim3"):
+            raise ValueError(f"Model.chunk_graph.mode must be 'sim3' or absent, got {mode!r}")
+        return mode
+
+    def _stac_record_seam_edge(self, chunk_idx, ov, chunk_data1, point_map1, conf1, conf2, mask,
+                               sim3):
+        """Seam k→k+1 as an edge of the chunk Sim(3) graph (loop_utils.chunk_graph): chunk k+1's
+        coordinates onto chunk k's by the seam's fit; read at the median of the overlap's points
+        in chunk k (where the two copies are compared), with their lever arm (the median distance
+        of each overlap frame's points to its own camera) and σ = the fit's median residual (the
+        session's measured overlap agreement). A starved seam (the vendor point-map fit) records
+        σ None; the graph gives it the largest exact seam residual, declared."""
+        pm = np.asarray(point_map1, np.float64)
+        pm = pm[0] if pm.ndim == 5 else pm
+        shp = pm.shape[:3]
+        ok = (np.asarray(conf1).reshape(shp) > 1e-5) & (np.asarray(conf2).reshape(shp) > 1e-5)
+        if mask is not None:
+            ok &= np.asarray(mask).reshape(shp).astype(bool)
+        ext = np.asarray(chunk_data1['extrinsic'], np.float64)
+        ext = ext[0] if ext.ndim == 4 else ext
+        cams = ext[-ov:, :3, 3]
+        dists, pts = [], []
+        for f in range(shp[0]):
+            q = pm[f][ok[f]]
+            if len(q) == 0:
+                continue
+            dists.append(float(np.median(np.linalg.norm(q - cams[f], axis=1))))
+            pts.append(q[::max(1, len(q) // 20000)])
+        res = (getattr(self, '_stac_seam_residuals', {}) or {}).get(chunk_idx)
+        if not hasattr(self, '_stac_seam_edges'):
+            self._stac_seam_edges = {}
+        s_, R_, t_ = sim3
+        self._stac_seam_edges[chunk_idx] = {
+            "a": int(chunk_idx) + 1, "b": int(chunk_idx), "s": float(s_),
+            "R": np.asarray(R_, np.float64), "t": np.asarray(t_, np.float64).reshape(3),
+            "centroid": (np.median(np.concatenate(pts), axis=0).tolist() if pts else None),
+            "lever_m": (float(np.median(dists)) if dists else None),
+            "sigma_m": (float(res) if res is not None else None), "exact": res is not None}
+
+    def _stac_chunk_graph(self):
+        """USER 2026-11-04 ("ok, Sim3 … lo tenés que implementar correctamente"): the chunks are
+        pieces of ONE Sim(3) graph (loop_utils/chunk_graph.py) — the seams (exact Sim(3) of the
+        shared frames, σ = their median residual), the verified SALAD closures (Sim(3), σ = the
+        held-out residual, no scale term) and DA3 per chunk as a weak scale prior (σ =
+        sigma_anchor/√anchors, toward the chunk's DA3 scale over the scale the lock applied).
+        The closures enter only when the leave-one-out judge says they improve
+        (chunk_graph.judge_leave_one_out, Model.graph's confidence and error factor); otherwise
+        the graph is solved with the seams and the priors alone. The solution, relative to
+        chunk 0, replaces self.sim3_list (the global metre is scale_align's, after Omega).
+        Everything lands in chunk_graph.json."""
+        import json as _json
+        from loop_utils import chunk_graph as CG
+        from loop_utils.loop_bridges import cfg_req
+        n = len(self.chunk_indices)
+        seam_by = getattr(self, '_stac_seam_edges', {}) or {}
+        missing = [k for k in range(n - 1) if k not in seam_by]
+        if missing:
+            raise RuntimeError(f"[chunk-graph] seam(s) {missing} were never fitted — the graph "
+                               f"needs every seam")
+        exact = [float(e["sigma_m"]) for e in seam_by.values()
+                 if e["sigma_m"] is not None and e["sigma_m"] > 0]
+        levers = [float(e["lever_m"]) for e in seam_by.values() if e.get("lever_m")]
+        seams = []
+        for k in range(n - 1):
+            e = dict(seam_by[k])
+            if e["sigma_m"] is None or not e["sigma_m"] > 0:
+                if not exact:
+                    raise RuntimeError("[chunk-graph] no exact seam measured its residual")
+                e["sigma_m"], e["sigma_source"] = max(exact), "starved seam: the largest exact residual"
+            else:
+                e["sigma_source"] = "exact seam median residual"
+            if not e.get("lever_m"):
+                if not levers:
+                    raise RuntimeError("[chunk-graph] no seam measured its lever arm")
+                e["lever_m"], e["lever_source"] = float(np.median(levers)), "the seams' median"
+            if e.get("centroid") is None:
+                raise RuntimeError(f"[chunk-graph] seam {k}->{k + 1} has no valid overlap point")
+            seams.append(e)
+        loops, skipped = [], []
+        for e in getattr(self, '_stac_loop_edges', []) or []:
+            if e.get("centroid_b") is None or not e.get("range_m"):
+                skipped.append({"bridge": e.get("bridge"), "why": "no centroid / lever arm"})
+                continue
+            loops.append({"a": int(e["a"]), "b": int(e["b"]), "s": float(e.get("s_ab", 1.0)),
+                          "R": np.asarray(e["R_ab"], np.float64),
+                          "t": np.asarray(e["t_ab"], np.float64).reshape(3),
+                          "centroid": list(e["centroid_b"]), "lever_m": float(e["range_m"]),
+                          "sigma_m": float(e["sigma_m"]), "bridge": e.get("bridge")})
+        inputs = getattr(self, '_stac_scale_inputs', None) or {}
+        s_v1 = getattr(self, '_stac_scales_applied', None) or {}
+        sig_a = float(inputs.get("sigma_anchor", 0.08))
+        priors = {}
+        for k, s_d in (inputs.get("s_da3") or {}).items():
+            k = int(k)
+            if s_d and s_v1.get(k):
+                nk = max(float((inputs.get("n_anchors") or {}).get(k, 1)), 1.0)
+                priors[k] = {"log_s": float(np.log(float(s_d) / float(s_v1[k]))),
+                             "sigma": sig_a / float(np.sqrt(nk)), "anchors": int(nk)}
+        gcfg = self._stac_graph_cfg() or {}
+        conf = float(cfg_req(gcfg, "heldout_confidence", "graph"))
+        fac = float(cfg_req(gcfg, "improvement_error_factor", "graph"))
+        print(f"[chunk-graph] {n} chunk(s): {len(seams)} seam(s) (σ {min(e['sigma_m'] for e in seams)*100:.1f}–"
+              f"{max(e['sigma_m'] for e in seams)*100:.1f} cm), {len(loops)} closure(s)"
+              + (f" ({len(skipped)} without a place, skipped)" if skipped else "")
+              + f", {len(priors)} DA3 scale prior(s)")
+        judge = CG.judge_leave_one_out(n, seams, loops, priors, error_factor=fac,
+                                       confidence=conf)
+        used = loops if judge.get("improves") else []
+        chain = CG.chain_poses(n, seams)
+        sol = CG.solve(n, seams, used, priors)
+        if sol["converged"]:
+            poses, applied = sol["poses"], ("seams + closures + DA3 priors" if used
+                                            else "seams + DA3 priors (closures not applied)")
+        else:
+            poses, applied = chain, "the seams' chain (the final solve did not converge)"
+        self.sim3_list = CG.sequential(poses)
+
+        def _rec(P):
+            return [{"s": float(p[0]), "R": np.asarray(p[1]).tolist(), "t": np.asarray(p[2]).tolist()}
+                    for p in P]
+        per_chunk = [{"chunk": k, "scale_vs_chain": float(poses[k][0] / chain[k][0]),
+                      "moved_m": float(np.linalg.norm(np.asarray(poses[k][2]) - np.asarray(chain[k][2])))}
+                     for k in range(n)]
+        loop_err = [{"bridge": e.get("bridge"), "chunks": [e["a"], e["b"]],
+                     "sigma_m": e["sigma_m"],
+                     "chain_m": CG.edge_error_m(chain[e["a"]], chain[e["b"]], e),
+                     "final_m": CG.edge_error_m(poses[e["a"]], poses[e["b"]], e)} for e in loops]
+        seam_err = [{"seam": [e["b"], e["a"]], "sigma_m": e["sigma_m"],
+                     "final_m": CG.edge_error_m(poses[e["a"]], poses[e["b"]], e)} for e in seams]
+
+        def _js(e):
+            return {k_: (np.asarray(v_).tolist() if isinstance(v_, np.ndarray) else v_)
+                    for k_, v_ in e.items()}
+        doc = {"version": 1, "mode": "sim3", "applied": applied,
+               "confidence": conf, "improvement_error_factor": fac,
+               "seams": [_js(e) for e in seams], "closures": [_js(e) for e in loops],
+               "closures_skipped": skipped, "priors": {str(k): v for k, v in priors.items()},
+               "judge": judge, "solve": {k_: v_ for k_, v_ in sol.items() if k_ != "poses"},
+               "poses": _rec(poses), "chain": _rec(chain), "per_chunk": per_chunk,
+               "closure_errors": loop_err, "seam_errors": seam_err}
+        if self._stac_stamp_digest() is not None:
+            doc["_stac_fork_stamp"] = self._stac_stamp_digest()
+        path = os.path.join(self.output_dir, "chunk_graph.json")
+        with open(path + ".tmp", "w") as f:
+            _json.dump(doc, f, indent=1, default=float)
+        os.replace(path + ".tmp", path)
+        sc = [c["scale_vs_chain"] for c in per_chunk]
+        print(f"[chunk-graph] APPLIED {applied}: chunk scale vs the seams' chain "
+              f"{min(sc):.4f}–{max(sc):.4f}, chunks moved ≤ {max(c['moved_m'] for c in per_chunk)*100:.1f} cm"
+              + ("".join(f"; closure {c['bridge']} {c['chain_m']*100:.1f} → {c['final_m']*100:.1f} cm"
+                         for c in loop_err)) + " → chunk_graph.json")
+
     def _stac_layout_text(self):
         """One line for the log: chunk count, lengths and seam overlaps."""
         from loop_utils.metric_lock import seam_overlap
@@ -3843,7 +4010,12 @@ class VGGT_Long:
                 self._stac_ensure_bridge_anchors()
                 self._stac_lock_bridges()
                 meas_sim3 = self._stac_measure_loops(rigid=False)
-                self._stac_scale_close(meas_sim3)
+                if self._stac_chunk_graph_mode() == "sim3":
+                    # the chunk Sim(3) graph closes scale AND pose with these measurements
+                    # (_stac_chunk_graph); the scale ladder keeps the lock it solved
+                    self._stac_meas_sim3 = meas_sim3
+                else:
+                    self._stac_scale_close(meas_sim3)
         else:
             self._stac_metric_lock()
 
@@ -3891,17 +4063,31 @@ class VGGT_Long:
                 _ok = (_c1 > 1e-5) & (_c2 > 1e-5)
                 if mask is not None:
                     _ok &= np.asarray(mask).reshape(-1).astype(bool)
-                _fit = robust_rigid(_p2[_ok], _p1[_ok],
-                                    keys=self._stac_seam_keys(chunk_idx, point_map1, _ok))
+                _keys = self._stac_seam_keys(chunk_idx, point_map1, _ok)
+                _fit = None
+                if self._stac_chunk_graph_mode() == "sim3":
+                    # USER 2026-11-04: the seam keeps the scale the two copies of the shared
+                    # frames measure — one more degree of freedom on the same exact pixels
+                    from loop_utils.loop_bridges import robust_sim3
+                    _f3 = robust_sim3(_p2[_ok], _p1[_ok], keys=_keys)
+                    if _f3 is not None and 0.6 <= float(_f3[0]) <= 1.6:
+                        _fit = (_f3[1], _f3[2], _f3[3], _f3[4], float(_f3[0]))
+                    elif _f3 is not None:
+                        print(f"[exact-seam] {chunk_idx}->{chunk_idx+1}: Sim3 scale "
+                              f"{float(_f3[0]):.4f} outside [0.6, 1.6] — the rigid fit instead")
+                if _fit is None:
+                    _fr = robust_rigid(_p2[_ok], _p1[_ok], keys=_keys)
+                    _fit = None if _fr is None else (_fr[0], _fr[1], _fr[2], _fr[3], 1.0)
                 if _fit is not None:
-                    R, t, _res, _n = _fit[0], _fit[1], _fit[2], _fit[3]
-                    s = 1.0
+                    R, t, _res, _n, s = _fit
                     self._stac_exact_seams = getattr(self, '_stac_exact_seams', 0) + 1
                     if not hasattr(self, '_stac_seam_residuals'):
                         self._stac_seam_residuals = {}
                     self._stac_seam_residuals[chunk_idx] = float(_res)   # σ of the seam odometry (§4.3)
-                    print(f"[exact-seam] {chunk_idx}->{chunk_idx+1}: rigid fit on "
-                          f"{_n:,} exact correspondences, median residual {_res*100:.1f} cm")
+                    print(f"[exact-seam] {chunk_idx}->{chunk_idx+1}: "
+                          f"{'Sim3' if s != 1.0 else 'rigid'} fit on {_n:,} exact "
+                          f"correspondences, scale {float(s):.4f}, median residual "
+                          f"{_res*100:.1f} cm")
                 else:
                     print(f"[exact-seam] {chunk_idx}->{chunk_idx+1}: starved — "
                           f"falling back to the point-map fit")
@@ -3939,11 +4125,21 @@ class VGGT_Long:
                 s = 1.0
 
             self.sim3_list.append((s, R, t))
+            if self._stac_chunk_graph_mode() == "sim3":
+                self._stac_record_seam_edge(chunk_idx, ov, chunk_data1, point_map1, conf1,
+                                            conf2, mask, (s, R, t))
             del chunk_data1, chunk_data2
         _seam_prev = None
 
 
-        if self.loop_enable and _stac_loops:
+        if self.loop_enable and _stac_loops and self._stac_chunk_graph_mode() == "sim3":
+            # USER 2026-11-04: the closures are verified on their Sim(3) measurement and enter
+            # the chunk Sim(3) graph (no SE(3) re-measurement: the scale is the graph's)
+            _m3 = getattr(self, '_stac_meas_sim3', None)
+            if _m3 is None:
+                _m3 = self._stac_measure_loops(rigid=False)
+            self._stac_verify_loops(_m3, sim3=True)
+        elif self.loop_enable and _stac_loops:
             # ── STAC F1 ── the scale is closed: exact SE(3) edges + verification
             # (§4.2) on the re-scaled chunks; every edge carries its measured σ.
             meas_rigid = self._stac_measure_loops(rigid=True)
@@ -4039,7 +4235,11 @@ class VGGT_Long:
         # the keyframe SE(3) graph (_stac_pose_graph, after the chunks are aligned);
         # the vendor optimizer stays for the other backends.
         _stac_kf_graph = bool(_stac_loops and self._stac_graph_cfg() is not None)
-        if self.loop_enable_opt and not _stac_kf_graph:
+        _stac_sim3_graph = bool(_stac_loops and self._stac_chunk_graph_mode() == "sim3"
+                                and len(self.chunk_indices) > 1)
+        if _stac_sim3_graph:
+            self._stac_chunk_graph()               # replaces self.sim3_list
+        if self.loop_enable_opt and not _stac_kf_graph and not _stac_sim3_graph:
             input_abs_poses = self.loop_optimizer.sequential_to_absolute_poses(self.sim3_list)
             self.sim3_list = self.loop_optimizer.optimize(self.sim3_list, self.loop_sim3_list)
             optimized_abs_poses = self.loop_optimizer.sequential_to_absolute_poses(self.sim3_list)
@@ -4214,7 +4414,11 @@ class VGGT_Long:
             # corrections flow into _stac_elastic_corr like the intra-chunk stage.
             self._stac_uncertainty()
             self._stac_ensemble_apply()
-            self._stac_pose_graph()
+            if _stac_sim3_graph:
+                print("[pose-graph] not run: the closures were applied by the chunk Sim(3) "
+                      "graph (chunk_graph.json)")
+            else:
+                self._stac_pose_graph()
         self._stac_elastic_seams()
         self._stac_intra_chunk()
         self._stac_depth_graph()

@@ -302,6 +302,10 @@ def measure_bridge(bridge, layout: dict, chunk_a, chunk_b, loops_cfg: dict,
         rng_m = _side_range_m(q, chunk, cl)
         if rng_m is not None:
             rec["range_m"] = float(rng_m)
+        if len(q):
+            # where this side's correspondences sit (chunk coordinates): the chunk Sim(3) graph
+            # reads an edge's disagreement THERE (loop_utils.chunk_graph), never at the origin
+            rec["centroid"] = np.median(np.asarray(q, np.float64).reshape(-1, 3), axis=0).tolist()
         fit = None
         if len(p) >= min_pts:
             if rigid:
@@ -340,6 +344,7 @@ def measure_bridge(bridge, layout: dict, chunk_a, chunk_b, loops_cfg: dict,
                     "range_m": (float(min(ranges)) if ranges else None),
                     "residual_m": float(max(out["sides"]["a"]["residual_m"],
                                             out["sides"]["b"]["residual_m"])),
+                    "centroid_b": out["sides"]["b"].get("centroid"),
                     "n_corr": int(min(out["sides"]["a"]["n_corr"],
                                       out["sides"]["b"]["n_corr"]))})
         if sh_a is not None and sh_b is not None:

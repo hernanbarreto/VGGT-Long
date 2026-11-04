@@ -263,5 +263,6 @@ def test_no_loop_edge_means_identity(tmp_path, synth_drift):
 
 def test_vendor_optimizer_bypassed_in_stac_path():
     src = (_FORK / "vggt_long.py").read_text()
-    assert "if self.loop_enable_opt and not _stac_kf_graph:" in src
+    # (2026-11-04: the chunk Sim(3) graph bypasses it too)
+    assert "if self.loop_enable_opt and not _stac_kf_graph and not _stac_sim3_graph:" in src
     assert "self._stac_pose_graph()" in src
