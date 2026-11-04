@@ -141,6 +141,13 @@ class VGGT_Long:
             validate_chunk_ranges(self.chunk_ranges_cfg)
             self.chunk_size = self.config['Model'].get('chunk_size')
             self.overlap = self.config['Model'].get('overlap')
+        # STAC (USER 2026-11-04): CONTEXT views per chunk — Model.chunk_context, one list of
+        # frame files per Model.chunk_ranges entry (the server's turn frames between the
+        # chunk's keyframes, intake/turn_frames.py). Inferred with the chunk, dropped before
+        # it is saved (loop_utils.context_views); resolved against the layout in
+        # _stac_build_layout. None = no context view (every run before the turn frames).
+        self.chunk_context_cfg = self.config['Model'].get('chunk_context')
+        self.chunk_context = None
         self.seed = 42
         # STAC (plan point 12): CUDA only, ONE autocast dtype (base_model.AMP_DTYPE) — a
         # CPU or fp16 fallback would be another reconstruction, so a card without them FAILS
@@ -480,6 +487,12 @@ class VGGT_Long:
             filename = f"chunk_{chunk_idx}.npy"
         save_path = os.path.join(save_dir, filename)
         expected_frames = len(chunk_image_paths)
+        # STAC (USER 2026-11-04): a chain chunk's CONTEXT views (the turn frames between its
+        # keyframes) enter its inference only; the file keeps the keyframes' slots
+        _ctx = (list(self.chunk_context[chunk_idx])
+                if (not is_loop and range_2 is None and self.chunk_context is not None
+                    and chunk_idx is not None) else [])
+        _ctx_names = [os.path.basename(p) for p in _ctx]
 
         # STAC patch (resume): if this chunk's .npy already exists (prior run), load it
         # and SKIP the expensive inference. Restore the camera state EXACTLY as the
@@ -506,6 +519,14 @@ class VGGT_Long:
                         f"{save_path} has {_n_on_disk} frames, this run's chunk {chunk_idx} "
                         f"has {expected_frames} — the outputs on disk are of ANOTHER chunk "
                         f"plan; re-run with replace, or let the map worker wipe them")
+                if not is_loop and list(predictions.get('_stac_context') or []) != _ctx_names:
+                    # the same keyframes inferred with OTHER context views are another chunk
+                    raise _StacPlanMismatch(
+                        f"{save_path} was inferred with context views "
+                        f"{list(predictions.get('_stac_context') or [])[:4]}…, this run's chunk "
+                        f"{chunk_idx} with {_ctx_names[:4]}… — the outputs on disk are of "
+                        f"ANOTHER chunk plan; re-run with replace, or let the map worker wipe "
+                        f"them")
                 if not is_loop and predictions.get('_stac_range') is not None:
                     # an EXPLICIT-layout chunk carries its [start, end): same length is
                     # not the same chunk when the plan places chunks freely
@@ -528,10 +549,20 @@ class VGGT_Long:
             except Exception as _e:
                 print(f'[STAC resume] {filename} unreadable ({_e}) — re-inferring')
 
-        predictions = self.model.infer_chunk(chunk_image_paths)
+        if _ctx:
+            from loop_utils.context_views import keep_keyframe_slots, merge_views
+            _views, _keep = merge_views(chunk_image_paths, _ctx)
+        else:
+            _views, _keep = chunk_image_paths, None
+        predictions = self.model.infer_chunk(_views)
         for key in predictions.keys():
             if isinstance(predictions[key], torch.Tensor):
                 predictions[key] = predictions[key].cpu().numpy().squeeze(0)
+        if _keep is not None:
+            keep_keyframe_slots(predictions, _keep, len(_views))
+            print(f"[STAC context] chunk {chunk_idx}: {len(_views)} views inferred "
+                  f"({len(chunk_image_paths)} keyframes + {len(_ctx)} context), "
+                  f"{len(chunk_image_paths)} kept")
         if is_loop:
             predictions['_stac_extra'] = {"n_extra_1": len(extra_1), "n_extra_2": len(extra_2),
                                           "extra_1": [os.path.basename(p) for p in extra_1],
@@ -565,6 +596,8 @@ class VGGT_Long:
             _stac_images_to_u8(predictions)
             if self._stac_layout_stamp() is not None:
                 predictions['_stac_range'] = [int(range_1[0]), int(range_1[1])]
+            if _ctx_names:
+                predictions['_stac_context'] = list(_ctx_names)
         if self._stac_stamp_digest() is not None:
             predictions['_stac_fork_stamp'] = self._stac_stamp_digest()   # plan point 9
 
@@ -3680,6 +3713,13 @@ class VGGT_Long:
         else:
             self.chunk_indices = uniform_chunk_ranges(len(self.img_list), self.chunk_size,
                                                       self.overlap)
+        from loop_utils.context_views import check_chunk_context
+        self.chunk_context = check_chunk_context(self.chunk_context_cfg, self.chunk_indices,
+                                                 self.img_list, self.img_dir)
+        _n_ctx = [len(c) for c in self.chunk_context]
+        if any(_n_ctx):
+            print(f"[STAC context] {sum(_n_ctx)} context view(s) (turn frames) inferred with "
+                  f"the chunks and dropped before saving: per chunk {_n_ctx}")
         return len(self.chunk_indices)
 
     def _stac_seam_copies(self, k, d1, d2):
