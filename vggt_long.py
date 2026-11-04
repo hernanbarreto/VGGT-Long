@@ -559,6 +559,10 @@ class VGGT_Long:
             if isinstance(predictions[key], torch.Tensor):
                 predictions[key] = predictions[key].cpu().numpy().squeeze(0)
         if _keep is not None:
+            # the context views stay as F6 WITNESSES (USER 2026-11-04): their depth, confidence
+            # and pose relative to the keyframe before them, stamped with this run
+            self._stac_save_context_views(chunk_idx, predictions, _views, _keep,
+                                          list(range(range_1[0], range_1[1])))
             keep_keyframe_slots(predictions, _keep, len(_views))
             print(f"[STAC context] chunk {chunk_idx}: {len(_views)} views inferred "
                   f"({len(chunk_image_paths)} keyframes + {len(_ctx)} context), "
@@ -2383,6 +2387,13 @@ class VGGT_Long:
             seq, seam_rep = self._stac_seam_chain("provisional")
             self._stac_provisional_seams = seam_rep
             view = self._StacChainView(self, seq)
+            if self._stac_chunk_graph_mode() == "sim3":
+                # USER 2026-11-04: revisits SALAD does not retrieve, proposed by the geometry
+                # of the provisional chain (loop_utils/revisits.py)
+                geo_items, geo_cands = self._stac_geometric_revisits(view, gate_mod, lcfg,
+                                                                     loop_results)
+                loop_results = list(loop_results) + geo_items
+                by_pair.update(geo_cands)
         else:
             print("[loop-gate] Model.loops.stac_server_dir not configured — spatial "
                   "gate OFF (declared in loop_edges.json); every candidate gets a bridge")
@@ -2415,6 +2426,78 @@ class VGGT_Long:
         self._stac_loops_rejected = rejected
         self._stac_drop_chunk_cache()
         return planned
+
+    def _stac_geometric_revisits(self, view, gate_mod, lcfg, loop_results):
+        """REVISIT closures by GEOMETRY (USER 2026-11-04, loop_utils/revisits.py): keyframe pairs
+        of chunks that share no frame, walked at least min_walk_m apart, that see each other's
+        surfaces in the provisional chain (the spatial gate's visible_fraction, widened by the
+        drift budget, both ways ≥ its min_visible_frac). Per pair of chunks the best three are
+        tried in order through the spatial gate (its occlusion test with each frame's own depth)
+        and the first it does not reject gets a bridge — unless an existing closure's windows
+        already cover it. Returns (items in loop_results' format, {(i, j): candidate})."""
+        from loop_utils.revisits import propose, quick_visibility
+        sp = lcfg['spatial']
+        c = gate_mod._cfg(sp)
+        n = len(self.img_list)
+        owner = np.asarray(view._owner)
+        cent = view.centres()
+        ok = np.isfinite(cent).all(1)
+        steps = np.zeros(n)
+        idx = np.flatnonzero(ok)
+        if len(idx) > 1:
+            steps[idx[1:]] = np.linalg.norm(np.diff(cent[idx], axis=0), axis=1)
+        walk_cum = np.cumsum(steps)
+        n_quick = max(50, int(c["frustum_points"]) // 6)
+        pts = [view.points(g, n_quick) if ok[g] else np.zeros((0, 3)) for g in range(n)]
+        eye = np.eye(4)
+        poses = np.stack([view.pose(g) if view.pose(g) is not None else eye for g in range(n)])
+        Ks = np.stack([view.K(g) if view.K(g) is not None else np.eye(3) for g in range(n)])
+
+        def _budget(L):
+            b = gate_mod.drift_budget(L, sp)
+            return float(b["delta_m"]), float(b["theta_deg"])
+        F = quick_visibility(pts, poses, Ks, view.hw, c, walk_cum, _budget)
+        props = propose(F, owner, walk_cum, float(c["min_walk_m"]), float(c["min_visible_frac"]))
+        half = int(self.config['Model']['loop_chunk_size'] / 2)
+        _ov = lambda r, q: max(r[0], q[0]) < min(r[1], q[1])     # noqa: E731
+        existing = [(tuple(it[1]), tuple(it[3])) for it in loop_results]
+        items, cands, report = [], {}, []
+        for (a, b), lst in props.items():
+            rec = {"chunks": [a, b], "tried": [], "kept": None}
+            for score, i, j in lst:
+                ki, kj = int(owner[i]), int(owner[j])
+                ra = tuple(get_frame_range(self.chunk_indices[ki], i, half))
+                rb = tuple(get_frame_range(self.chunk_indices[kj], j, half))
+                t = {"i": int(i), "j": int(j), "visibility": float(score)}
+                if _ov(ra, rb):
+                    t["skipped"] = "its two windows share keyframes"
+                elif any((_ov(ra, qa) and _ov(rb, qb)) or (_ov(ra, qb) and _ov(rb, qa))
+                         for qa, qb in existing):
+                    t["skipped"] = "an existing closure's windows already cover it"
+                else:
+                    gate = gate_mod.gate_frame_pair(int(i), int(j), view, sp)
+                    t["gate"] = gate.get("verdict")
+                    if gate.get("verdict") != "reject":
+                        items.append((ki, list(ra), kj, list(rb), (int(i), int(j))))
+                        cands[(int(i), int(j))] = {"i": int(i), "j": int(j), "sim": None,
+                                                   "source": "geometry",
+                                                   "visibility": float(score)}
+                        existing.append((ra, rb))
+                        rec["kept"] = [int(i), int(j)]
+                rec["tried"].append(t)
+                if rec["kept"] is not None or t.get("skipped", "").startswith("an existing"):
+                    break
+            report.append(rec)
+        self._stac_geometric_report = {"pairs_of_chunks": report,
+                                       "min_visible_frac": float(c["min_visible_frac"]),
+                                       "min_walk_m": float(c["min_walk_m"])}
+        self._stac_drop_chunk_cache()
+        print(f"[loops] geometry: {len(items)} revisit closure(s) proposed over "
+              f"{len(props)} pair(s) of chunks that see each other "
+              + ", ".join(f"{r['chunks'][0]}<->{r['chunks'][1]}"
+                          + (f" kf {r['kept'][0]}<->{r['kept'][1]}" if r["kept"] else " —")
+                          for r in report))
+        return items, cands
 
     def _stac_extra_frames(self, range_kf, n_extra, exclude):
         """§4.9: up to n_extra NON-keyframe frames spread over the real-frame
@@ -2923,6 +3006,7 @@ class VGGT_Long:
                                               "centroid_b": meas.get("centroid_b"),
                                               "range_m": meas.get("range_m"),
                                               "sigma_m": float(v["sigma_m"]),
+                                              "source": str(cand.get("source", "salad")),
                                               "status": v["status"], "bridge": li})
                 if float(v["sigma_m"]) <= max_sig:
                     self.loop_sim3_list.append((ka, kb, (1.0, np.asarray(meas["R_ab"]),
@@ -2961,7 +3045,8 @@ class VGGT_Long:
                                 "max_edge_sigma_m": max_sig,
                                 "n_edges_usable": n_good,
                                 "loop_enable_opt": self.loop_enable_opt,
-                                "provisional_seams": getattr(self, '_stac_provisional_seams', None)})
+                                "provisional_seams": getattr(self, '_stac_provisional_seams', None),
+                                "geometric_revisits": getattr(self, '_stac_geometric_report', None)})
         # The vendor's per-chunk Sim3 optimizer is the only thing σ ≤ max_sig
         # gates; the §4.3 keyframe pose graph takes EVERY accepted edge and
         # weighs it by its own σ. Saying "loop optimizer OFF" without that
@@ -3700,6 +3785,26 @@ class VGGT_Long:
         finally:
             self._stac_drop_chunk_cache()
 
+    def _stac_save_context_views(self, chunk_idx, predictions, views, keep, keyframe_global):
+        """<output>/context_views/c<chunk>_<frame>.npz for every context view of this chunk's
+        pass (loop_utils.context_views.context_records), the chunk's older files removed first;
+        each carries this run's fork stamp so F6 never reads another run's."""
+        from loop_utils.context_views import CONTEXT_DIR, context_records
+        d = os.path.join(self.output_dir, CONTEXT_DIR)
+        os.makedirs(d, exist_ok=True)
+        for fn in os.listdir(d):
+            if fn.startswith(f"c{int(chunk_idx):03d}_"):
+                os.remove(os.path.join(d, fn))
+        stamp = self._stac_stamp_digest() or ""
+        recs = context_records(predictions, views, keep, keyframe_global)
+        for r in recs:
+            path = os.path.join(d, f"c{int(chunk_idx):03d}_{r['frame']:06d}.npz")
+            np.savez(path + ".tmp.npz", chunk=int(chunk_idx), fork_stamp=stamp,
+                     **{k: v for k, v in r.items()})
+            os.replace(path + ".tmp.npz", path)
+        print(f"[STAC context] chunk {chunk_idx}: {len(recs)} context view(s) kept as F6 "
+              f"witnesses → {CONTEXT_DIR}/")
+
     def _stac_chunk_graph_mode(self):
         """'sim3' when Model.chunk_graph.mode says so (USER 2026-11-04: the chunks are pieces of
         ONE Sim(3) graph — seams, SALAD closures and DA3 as a weak scale prior; loop_utils/
@@ -3790,6 +3895,7 @@ class VGGT_Long:
                 skipped.append({"bridge": e.get("bridge"), "why": "no centroid / lever arm"})
                 continue
             loops.append({"a": int(e["a"]), "b": int(e["b"]), "s": float(e.get("s_ab", 1.0)),
+                          "source": str(e.get("source", "salad")),
                           "R": np.asarray(e["R_ab"], np.float64),
                           "t": np.asarray(e["t_ab"], np.float64).reshape(3),
                           "centroid": list(e["centroid_b"]), "lever_m": float(e["range_m"]),
@@ -3808,9 +3914,19 @@ class VGGT_Long:
         conf = float(cfg_req(gcfg, "heldout_confidence", "graph"))
         fac = float(cfg_req(gcfg, "improvement_error_factor", "graph"))
         print(f"[chunk-graph] {n} chunk(s): {len(seams)} seam(s) (σ {min(e['sigma_m'] for e in seams)*100:.1f}–"
-              f"{max(e['sigma_m'] for e in seams)*100:.1f} cm), {len(loops)} closure(s)"
+              f"{max(e['sigma_m'] for e in seams)*100:.1f} cm), {len(loops)} closure(s) "
+              f"({sum(1 for e in loops if str(e.get('source', '')) == 'geometry')} by geometry)"
               + (f" ({len(skipped)} without a place, skipped)" if skipped else "")
               + f", {len(priors)} DA3 scale prior(s)")
+        # a closure the chain cannot be wrong by (SALAD's false matches, metres off) never
+        # testifies nor enters: the chain's own uncertainty decides (consistent_with_chain)
+        loops_all = loops
+        loops, inconsistent = CG.consistent_with_chain(n, seams, loops_all, priors, conf)
+        for e in inconsistent:
+            print(f"[chunk-graph] closure {e.get('bridge')} (chunks {e['a']}<->{e['b']}, σ "
+                  f"{e['sigma_m']*100:.1f} cm) is {e['chain_error_m']*100:.1f} cm off the chain — "
+                  f"Mahalanobis² {e['chain_mahalanobis2']:.1f} > χ²₇ {e['chi2_bar']:.1f} with the "
+                  f"chain's own uncertainty: left out")
         judge = CG.judge_leave_one_out(n, seams, loops, priors, error_factor=fac,
                                        confidence=conf)
         used = loops if judge.get("improves") else []
@@ -3842,6 +3958,7 @@ class VGGT_Long:
         doc = {"version": 1, "mode": "sim3", "applied": applied,
                "confidence": conf, "improvement_error_factor": fac,
                "seams": [_js(e) for e in seams], "closures": [_js(e) for e in loops],
+               "closures_inconsistent": [_js(e) for e in inconsistent],
                "closures_skipped": skipped, "priors": {str(k): v for k, v in priors.items()},
                "judge": judge, "solve": {k_: v_ for k_, v_ in sol.items() if k_ != "poses"},
                "poses": _rec(poses), "chain": _rec(chain), "per_chunk": per_chunk,

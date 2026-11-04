@@ -159,6 +159,62 @@ def solve(n: int, seams: Sequence[dict], loops: Sequence[dict], priors: Dict[int
             "nfev": int(res.nfev), "status": int(res.status), "residuals": per_edge}
 
 
+def _residual_fn(n: int, edges: Sequence[dict], priors: Dict[int, dict]):
+    pk = sorted(int(k) for k in priors if 0 < int(k) < n)
+
+    def fun(x):
+        P = _unpack(x, n)
+        r = [edge_residual(P[int(e["a"])], P[int(e["b"])], e) for e in edges]
+        for k in pk:
+            pr = priors[k]
+            r.append(np.array([(np.log(P[k][0]) - float(pr["log_s"])) / float(pr["sigma"])]))
+        return np.concatenate(r) if r else np.zeros(1)
+    return fun
+
+
+def _num_jac(f, x: np.ndarray, h: float = 1e-6) -> np.ndarray:
+    f0 = f(x)
+    J = np.zeros((len(f0), len(x)))
+    for k in range(len(x)):
+        xp = x.copy()
+        xp[k] += h
+        J[:, k] = (f(xp) - f0) / h
+    return J
+
+
+def consistent_with_chain(n: int, seams: Sequence[dict], loops: Sequence[dict],
+                          priors: Dict[int, dict], confidence: float) -> Tuple[List[dict], List[dict]]:
+    """The closures that agree with the chain WITHIN WHAT THE CHAIN CAN BE WRONG BY (USER
+    2026-11-04: SALAD's false matches on pccr sat 1.7–6.3 m off a chain whose real start↔end drift
+    was 17.5 cm): the graph without closures (seams + priors) is solved, its pose covariance is
+    the inverse of JᵀJ of its whitened residuals, and each closure's whitened residual r — its own
+    σ being the identity — is read against I + J_e·Σ·J_eᵀ (the chain's uncertainty carried into
+    the closure); a closure whose Mahalanobis distance r·(I + J_e Σ J_eᵀ)⁻¹·r exceeds the
+    chi-square quantile (7 dof) at ``confidence`` disagrees with any chain the seams and priors
+    allow and never enters the graph (returned with its distance). Returns (kept, rejected)."""
+    from scipy.stats import chi2
+    if not loops:
+        return [], []
+    base = solve(n, seams, [], priors)
+    x = _pack(base["poses"])
+    J = _num_jac(_residual_fn(n, list(seams), priors), x)
+    Sigma = np.linalg.pinv(J.T @ J)
+    bar = float(chi2.ppf(float(confidence), 7))
+    kept, rejected = [], []
+    for e in loops:
+        def fe(xx, e=e):
+            P = _unpack(xx, n)
+            return edge_residual(P[int(e["a"])], P[int(e["b"])], e)
+        r = fe(x)
+        Je = _num_jac(fe, x)
+        C = np.eye(7) + Je @ Sigma @ Je.T
+        m2 = float(r @ np.linalg.solve(C, r))
+        rec = dict(e, chain_mahalanobis2=m2, chi2_bar=bar,
+                   chain_error_m=edge_error_m(base["poses"][int(e["a"])], base["poses"][int(e["b"])], e))
+        (kept if m2 <= bar else rejected).append(rec)
+    return kept, rejected
+
+
 def edge_error_m(Ca: Sim3, Cb: Sim3, edge: dict) -> float:
     """The displacement (m) an edge's centroid suffers between what the edge measured and the
     poses — the judges' unit."""

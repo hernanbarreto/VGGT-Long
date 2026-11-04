@@ -96,3 +96,40 @@ def keep_keyframe_slots(predictions: Dict, keep: Sequence[int], n_views: int) ->
                                     f"axis, the inference had {n_views} views")
         predictions[key] = v[idx]
     return predictions
+
+
+CONTEXT_DIR = "context_views"
+
+
+def context_records(predictions: Dict, views: Sequence[str], keep: Sequence[int],
+                    keyframe_global: Sequence[int]) -> List[Dict]:
+    """The context views of one inference as F6 WITNESSES (USER 2026-11-04, "hacé 1 y 2"): for
+    every slot that is not a keyframe, its Omega depth and confidence (the chunk's own units),
+    its intrinsics, and its pose RELATIVE to the keyframe just before it in the pass (its anchor:
+    inv(c2w_anchor) · c2w_view, chunk units) with the anchor's median valid depth — F6 carries the
+    anchor's scale, bend and refined pose onto the view through them (precision/depth_on_f5.py).
+    ``keyframe_global``: each keyframe slot's global keyframe index, in ``keep``'s order."""
+    keep = [int(k) for k in keep]
+    kslot = {k: g for k, g in zip(keep, keyframe_global)}
+    depth = np.asarray(predictions["depth"])
+    conf = np.asarray(predictions["world_points_conf"]).reshape(depth.shape[:3])
+    ext = np.asarray(predictions["extrinsic"], np.float64)
+    K = np.asarray(predictions["intrinsic"], np.float64)
+    out = []
+    for q in range(len(views)):
+        if q in kslot:
+            continue
+        before = [k for k in keep if k < q]
+        if not before:
+            raise ContextViewsError(f"context view {views[q]} has no keyframe before it in its pass")
+        a = before[-1]
+        da, ca = depth[a], conf[a]
+        ok = np.isfinite(da) & (da > 0) & (ca > 1e-5)
+        if not ok.any():
+            continue
+        out.append({"frame": frame_number(views[q]), "frame_file": os.path.basename(views[q]),
+                    "anchor_frame": frame_number(views[a]), "anchor_index": int(kslot[a]),
+                    "depth": depth[q].astype(np.float32), "conf": conf[q].astype(np.float32),
+                    "K": K[q], "rel_pose": np.linalg.inv(ext[a]) @ ext[q],
+                    "anchor_depth_median": float(np.median(da[ok]))})
+    return out
