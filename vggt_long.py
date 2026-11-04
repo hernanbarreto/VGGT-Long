@@ -148,6 +148,13 @@ class VGGT_Long:
         # _stac_build_layout. None = no context view (every run before the turn frames).
         self.chunk_context_cfg = self.config['Model'].get('chunk_context')
         self.chunk_context = None
+        # STAC (USER 2026-11-04, "que los chunks no se modifiquen por los frames extra en los
+        # tramos rectos, que solo entren para afirmar o no en el F6"): WITNESS views per chunk —
+        # Model.chunk_witnesses, one list of frame files per Model.chunk_ranges entry (the
+        # server's interval frames, intake/turn_frames.py). Never inferred WITH the chunk: a pass
+        # of their own after it (_stac_witness_pass), whose outputs only F6 reads.
+        self.chunk_witnesses_cfg = self.config['Model'].get('chunk_witnesses')
+        self.chunk_witnesses = None
         self.seed = 42
         # STAC (plan point 12): CUDA only, ONE autocast dtype (base_model.AMP_DTYPE) — a
         # CPU or fp16 fallback would be another reconstruction, so a card without them FAILS
@@ -3839,6 +3846,55 @@ class VGGT_Long:
         print(f"[STAC context] chunk {chunk_idx}: {len(recs)} context view(s) kept as F6 "
               f"witnesses → {CONTEXT_DIR}/")
 
+    def _stac_witness_pass(self, chunk_idx):
+        """USER 2026-11-04 ("que los chunks no se modifiquen por los frames extra en los tramos
+        rectos, que solo entren para afirmar o no en el F6"): the chunk's WITNESS frames
+        (Model.chunk_witnesses) are inferred in a pass of their OWN with the chunk's keyframes,
+        after the chunk — the chunk file is the main pass's and nothing of this pass reaches it.
+        Of this pass only the witnesses are kept, as the context views are (the sky mask on the
+        whole pass first; their depth, confidence and pose relative to the keyframe before them):
+        <output>/context_views/w<chunk>_<frame>.npz, stamped with this run, read by F6 alone.
+        Skipped when every witness file of this chunk carries this run's stamp."""
+        wit = list(((self.chunk_witnesses or [])[chunk_idx:chunk_idx + 1] or [[]])[0] or [])
+        if not wit:
+            return
+        from loop_utils.context_views import CONTEXT_DIR, context_records, frame_number, merge_views
+        s, e = (int(x) for x in self.chunk_indices[chunk_idx])
+        kf_paths = list(self.img_list[s:e])
+        d = os.path.join(self.output_dir, CONTEXT_DIR)
+        stamp = self._stac_stamp_digest() or ""
+        prefix = f"w{int(chunk_idx):03d}_"
+        want = {f"{prefix}{frame_number(p):06d}.npz" for p in wit}
+        if os.path.isdir(d) and want <= set(os.listdir(d)):
+            same = True
+            for fn in sorted(want):
+                with np.load(os.path.join(d, fn)) as z:
+                    same = same and str(z["fork_stamp"]) == stamp
+            if same:
+                print(f"[STAC witness] chunk {chunk_idx}: {len(want)} witness view(s) of this run "
+                      f"on disk — pass skipped")
+                return
+        views, keep = merge_views(kf_paths, wit)
+        predictions = self.model.infer_chunk(views)
+        for key in predictions.keys():
+            if isinstance(predictions[key], torch.Tensor):
+                predictions[key] = predictions[key].cpu().numpy().squeeze(0)
+        self._stac_mask_sky(predictions, views)
+        os.makedirs(d, exist_ok=True)
+        for fn in os.listdir(d):
+            if fn.startswith(prefix):
+                os.remove(os.path.join(d, fn))
+        recs = context_records(predictions, views, keep, list(range(s, e)))
+        for r in recs:
+            path = os.path.join(d, f"{prefix}{r['frame']:06d}.npz")
+            np.savez(path + ".tmp.npz", chunk=int(chunk_idx), fork_stamp=stamp,
+                     **{k: v for k, v in r.items()})
+            os.replace(path + ".tmp.npz", path)
+        print(f"[STAC witness] chunk {chunk_idx}: {len(views)} views inferred ({len(kf_paths)} "
+              f"keyframes + {len(wit)} witnesses) in a pass of their own, {len(recs)} witness "
+              f"view(s) kept for F6 → {CONTEXT_DIR}/ (the chunk untouched)")
+        del predictions
+
     def _stac_chunk_graph_mode(self):
         """'sim3' when Model.chunk_graph.mode says so (USER 2026-11-04: the chunks are pieces of
         ONE Sim(3) graph — seams, SALAD closures and DA3 as a weak scale prior; loop_utils/
@@ -4029,13 +4085,24 @@ class VGGT_Long:
         else:
             self.chunk_indices = uniform_chunk_ranges(len(self.img_list), self.chunk_size,
                                                       self.overlap)
-        from loop_utils.context_views import check_chunk_context
+        from loop_utils.context_views import check_chunk_context, ContextViewsError
         self.chunk_context = check_chunk_context(self.chunk_context_cfg, self.chunk_indices,
                                                  self.img_list, self.img_dir)
         _n_ctx = [len(c) for c in self.chunk_context]
         if any(_n_ctx):
             print(f"[STAC context] {sum(_n_ctx)} context view(s) (turn frames) inferred with "
                   f"the chunks and dropped before saving: per chunk {_n_ctx}")
+        self.chunk_witnesses = check_chunk_context(self.chunk_witnesses_cfg, self.chunk_indices,
+                                                   self.img_list, self.img_dir)
+        for k, (c, w) in enumerate(zip(self.chunk_context, self.chunk_witnesses)):
+            both = sorted(set(c) & set(w))
+            if both:
+                raise ContextViewsError(f"chunk {k}: {[os.path.basename(x) for x in both[:4]]} "
+                                        f"are both context views and witnesses")
+        _n_wit = [len(w) for w in self.chunk_witnesses]
+        if any(_n_wit):
+            print(f"[STAC witness] {sum(_n_wit)} witness view(s) inferred in a pass of their own "
+                  f"after each chunk, for F6 only: per chunk {_n_wit}")
         return len(self.chunk_indices)
 
     def _stac_seam_copies(self, k, d1, d2):
@@ -4066,6 +4133,8 @@ class VGGT_Long:
         for chunk_idx in range(len(self.chunk_indices)):
             print(f'[Progress]: {chunk_idx}/{len(self.chunk_indices)-1}')
             self.process_single_chunk(self.chunk_indices[chunk_idx], chunk_idx=chunk_idx)
+            torch.cuda.empty_cache()
+            self._stac_witness_pass(chunk_idx)
             torch.cuda.empty_cache()
 
         _stac_loops = (self._stac_loops_cfg() is not None

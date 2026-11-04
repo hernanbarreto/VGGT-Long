@@ -106,9 +106,10 @@ def run_stamp(*, img_list: Sequence[str], img_dir: str, config: dict,
         fq = os.path.join(img_dir, "frame_quality.json")
         if os.path.isfile(fq):
             inputs["frames/frame_quality.json"] = fq
-    # the chunks' CONTEXT views (USER 2026-11-04, loop_utils.context_views): their bytes are an
-    # input of the chunk they are inferred with
-    for fn in sorted({str(f) for c in (model.get("chunk_context") or []) for f in (c or [])}):
+    # the chunks' CONTEXT views and WITNESS views (USER 2026-11-04, loop_utils.context_views):
+    # their bytes are an input of the passes they are inferred in
+    for fn in sorted({str(f) for key in ("chunk_context", "chunk_witnesses")
+                      for c in (model.get(key) or []) for f in (c or [])}):
         inputs[f"frames/{fn}"] = os.path.join(img_dir, fn)
     wcfg = config.get("Weights") or {}
     name = wcfg.get("model")
