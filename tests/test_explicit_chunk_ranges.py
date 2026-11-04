@@ -55,6 +55,7 @@ def _runner(tmp_path, sess, chunk_ranges=None, chunk_size=None, overlap=None, ex
     model.update(extra or {})
     r.config = {"Model": model}
     r.chunk_ranges_cfg = model.get("chunk_ranges")
+    r.chunk_context_cfg, r.chunk_context = model.get("chunk_context"), None   # __init__ (2026-11-04)
     r.chunk_size, r.overlap = model.get("chunk_size"), model.get("overlap")
     r.chunk_indices = None
     r.sky_mask = False
