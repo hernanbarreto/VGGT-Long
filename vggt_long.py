@@ -559,6 +559,10 @@ class VGGT_Long:
             if isinstance(predictions[key], torch.Tensor):
                 predictions[key] = predictions[key].cpu().numpy().squeeze(0)
         if _keep is not None:
+            # a context view is a view of the pass like the keyframes: the SAME sky mask, on the
+            # whole pass before anything is kept (its confidence, its anchor's median depth — the
+            # pixels F6 reads, sky excluded as in the keyframes' records; USER 2026-11-04)
+            self._stac_mask_sky(predictions, _views)
             # the context views stay as F6 WITNESSES (USER 2026-11-04): their depth, confidence
             # and pose relative to the keyframe before them, stamped with this run
             self._stac_save_context_views(chunk_idx, predictions, _views, _keep,
@@ -583,8 +587,10 @@ class VGGT_Long:
 
         # STAC: drop sky points (zero their confidence) before saving, so the cloud
         # builder's confidence filter removes them. Sky detection is MapAnything-side
-        # (skyseg.onnx) — DA3 priors are NOT relied on for this.
-        self._stac_mask_sky(predictions, chunk_image_paths)
+        # (skyseg.onnx) — DA3 priors are NOT relied on for this. A pass with context views was
+        # masked whole above, before its context views were kept.
+        if _keep is None:
+            self._stac_mask_sky(predictions, chunk_image_paths)
 
         if is_loop:
             # STAC (USER 2026-10-05, zaragoza): a bridge's images are read by nothing — the
