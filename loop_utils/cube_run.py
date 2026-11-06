@@ -228,7 +228,9 @@ class CubeRun:
                                            f"them")
                 print(f"{LOG} cube {k}: on disk — inference skipped")
                 return
-            except CubePlanMismatch:
+            except RuntimeError:
+                # a cube of another plan or another fork stamp (_StacPlanMismatch, CubePlanMismatch) is a broken
+                # invariant — the run stops (plan point 9), it is never silently re-inferred
                 raise
             except Exception as e:  # noqa: BLE001
                 print(f"{LOG} cube {k}: {sp} unreadable ({e}) — re-inferring")
