@@ -28,7 +28,11 @@ alignment always had it (every chunk is placed in chunk 0's frame). Its DA3 prio
 a variable's (recorded, not used): a free chunk-0 scale would move the whole session's metre away
 from DA3's, which scale_align then has to bring back and its verifier (|s − 1| ≤
 scale.verify_max_dev) refuses beyond 10 %. Solved by scipy's trust-region least squares with a Cauchy loss on the
-whitened residuals, float64, deterministic."""
+whitened residuals, float64, deterministic. ``robust_seams=False`` (the CUBES, USER 2026-11-07): the seams enter
+SQUARED — they are exact fits of the same pixels in two passes, never an outlier to drop — and only the loops keep the
+Cauchy loss; with every residual under one Cauchy, pccr's chain of 11 cubes broke two seams by 16 % (18 and 24 cm at
+their surfaces) to follow DA3's per-cube priors, concentrating the disagreement where it cost the least instead of
+spreading it."""
 
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -128,19 +132,31 @@ def chain_poses(n: int, seams: Sequence[dict]) -> List[Sim3]:
     return poses
 
 
+def _cauchy_whitened(r: np.ndarray) -> np.ndarray:
+    """The residual whose square is scipy's Cauchy loss of ``r`` (f_scale 1): sign(r)·√ln(1 + r²) per component — a
+    Cauchy block inside a linear-loss solve."""
+    return np.sign(r) * np.sqrt(np.log1p(r * r))
+
+
 def solve(n: int, seams: Sequence[dict], loops: Sequence[dict], priors: Dict[int, dict],
-          x0: Optional[Sequence[Sim3]] = None, max_nfev: int = 2000) -> dict:
+          x0: Optional[Sequence[Sim3]] = None, max_nfev: int = 2000, robust_seams: bool = True) -> dict:
     """The chunk poses (relative to chunk 0) that best agree with ``seams``, ``loops`` and the
-    scale ``priors`` ({k: {"log_s": target log scale, "sigma": σ log}}). Returns {"poses",
-    "converged", "cost", "nfev", "residuals": per edge whitened norm}."""
+    scale ``priors`` ({k: {"log_s": target log scale, "sigma": σ log}}). ``robust_seams`` True: every
+    residual under one Cauchy loss (the chunk layouts); False: the seams and the priors squared, the
+    loops alone under Cauchy (the cubes — see the module doc). Returns {"poses", "converged", "cost",
+    "nfev", "residuals": per edge whitened norm}."""
     from scipy.optimize import least_squares
     edges = list(seams) + list(loops)
+    n_seams = len(list(seams))
     start = chain_poses(n, seams) if x0 is None else list(x0)
     pk = sorted(int(k) for k in priors if 0 < int(k) < n)        # chunk 0 is the gauge
 
     def fun(x):
         P = _unpack(x, n)
-        r = [edge_residual(P[int(e["a"])], P[int(e["b"])], e) for e in edges]
+        r = []
+        for i, e in enumerate(edges):
+            ri = edge_residual(P[int(e["a"])], P[int(e["b"])], e)
+            r.append(ri if (robust_seams or i < n_seams) else _cauchy_whitened(ri))
         for k in pk:
             pr = priors[k]
             r.append(np.array([(np.log(P[k][0]) - float(pr["log_s"])) / float(pr["sigma"])]))
@@ -149,7 +165,7 @@ def solve(n: int, seams: Sequence[dict], loops: Sequence[dict], priors: Dict[int
     if n == 1:
         P = [identity()]
         return {"poses": P, "converged": True, "cost": 0.0, "nfev": 0, "residuals": []}
-    res = least_squares(fun, _pack(start), method="trf", loss="cauchy", f_scale=1.0,
+    res = least_squares(fun, _pack(start), method="trf", loss=("cauchy" if robust_seams else "linear"), f_scale=1.0,
                         x_scale="jac", max_nfev=int(max_nfev), xtol=1e-12, ftol=1e-12,
                         gtol=1e-12)
     P = _unpack(res.x, n)
@@ -166,6 +182,13 @@ def edge_error_m(Ca: Sim3, Cb: Sim3, edge: dict) -> float:
     E = compose(compose(inverse(Cb), Ca), inverse(M))
     c = np.asarray(edge["centroid"], np.float64)
     return float(np.linalg.norm(apply(E, c[None])[0] - c))
+
+
+def edge_surface_error_m(Ca: Sim3, Cb: Sim3, edge: dict) -> float:
+    """What an edge's two pieces disagree by AT ITS SURFACES (m): the centroid's displacement with the rotation and the
+    log-scale read at the edge's lever arm — the unwhitened norm of edge_residual. The centroid alone (edge_error_m) is
+    blind to scale: pccr's two broken seams read 0.0 cm there and 18 / 24 cm here (USER 2026-11-07)."""
+    return float(np.linalg.norm(edge_residual(Ca, Cb, edge)) * float(edge["sigma_m"]))
 
 
 def judge_leave_one_out(n: int, seams: Sequence[dict], loops: Sequence[dict],

@@ -457,17 +457,28 @@ class CubeRun:
         x0 = [tree[k] for k in range(K)]
         inputs = getattr(self, 'scale_inputs', None) or {}
         sig_a = float(inputs.get("sigma_anchor", 0.08))
+        # THE DA3 PRIOR'S σ, MEASURED (USER 2026-11-07, pccr): how far two neighbouring cubes' DA3 locks disagree is what
+        # every seam measures (its scale, two passes over the same pixels after each pass's own lock); its robust spread
+        # over the session's seams, / √2 for one lock, is each lock's error. σ_anchor/√anchors (each cube's anchors
+        # taken as independent) claimed 1.1–1.5 % where pccr's seams measured 0.876–1.167 between neighbours: the
+        # prior outweighed the seams and the solve broke two of them by 16 %. The prior is never tighter than either.
+        ls = np.log([float(e["s"]) for e in edges]) if edges else np.zeros(0)
+        sig_lock = float(1.4826 * np.median(np.abs(ls)) / np.sqrt(2.0)) if len(ls) else 0.0
         priors = {}
         for k, s_d in (inputs.get("s_da3") or {}).items():
             s_v = (self.scales_applied or {}).get(int(k))
             if s_d and s_v:
                 nk = max(float((inputs.get("n_anchors") or {}).get(k, 1)), 1.0)
                 priors[int(k)] = {"log_s": float(np.log(float(s_d) / float(s_v))),
-                                  "sigma": sig_a / float(np.sqrt(nk)), "anchors": int(nk)}
+                                  "sigma": max(sig_a / float(np.sqrt(nk)), sig_lock), "anchors": int(nk),
+                                  "sigma_anchors": sig_a / float(np.sqrt(nk)), "sigma_seams": sig_lock}
         print(f"{LOG} graph: {K} cube(s), {len(edges)} seam(s) (σ {min(e['sigma_m'] for e in edges) * 100:.1f}–"
-              f"{max(e['sigma_m'] for e in edges) * 100:.1f} cm), {len(priors)} DA3 scale prior(s)" if edges else
+              f"{max(e['sigma_m'] for e in edges) * 100:.1f} cm, squared — an exact fit of the same pixels is never "
+              f"dropped), {len(priors)} DA3 scale prior(s) at σ {sig_lock * 100:.1f} % (the seams' own spread of the "
+              f"locks; the anchors alone claimed {min((v['sigma_anchors'] for v in priors.values()), default=0) * 100:.1f}–"
+              f"{max((v['sigma_anchors'] for v in priors.values()), default=0) * 100:.1f} %)" if edges else
               f"{LOG} graph: one cube")
-        sol = CG.solve(K, edges, [], priors, x0=x0)
+        sol = CG.solve(K, edges, [], priors, x0=x0, robust_seams=False)
         if sol["converged"]:
             poses, applied = sol["poses"], "seams + DA3 priors"
         else:
@@ -484,7 +495,8 @@ class CubeRun:
                      for k in range(K)]
         seam_err = [{"seam": [e["b"], e["a"]], "sigma_m": e["sigma_m"],
                      "tree_m": CG.edge_error_m(x0[e["a"]], x0[e["b"]], e),
-                     "final_m": CG.edge_error_m(poses[e["a"]], poses[e["b"]], e)} for e in edges]
+                     "final_m": CG.edge_error_m(poses[e["a"]], poses[e["b"]], e),
+                     "final_surface_m": CG.edge_surface_error_m(poses[e["a"]], poses[e["b"]], e)} for e in edges]
         doc = {"version": 1, "mode": "sim3", "layout": "cubes", "layout_sha256": self.digest, "applied": applied,
                "seams": [_js(e) for e in edges], "closures": [], "priors": {str(k): v for k, v in priors.items()},
                "solve": {k_: v_ for k_, v_ in sol.items() if k_ != "poses"}, "poses": _rec(poses), "tree": _rec(x0),
@@ -495,11 +507,12 @@ class CubeRun:
         with open(path + ".tmp", "w") as f:
             json.dump(doc, f, indent=1, default=float)
         os.replace(path + ".tmp", path)
-        fe = [s_["final_m"] for s_ in seam_err]
+        fe = [s_["final_surface_m"] for s_ in seam_err]
         print(f"{LOG} graph APPLIED ({applied}): cube scale vs the tree {min(c['scale_vs_tree'] for c in per_chunk):.4f}"
               f"–{max(c['scale_vs_tree'] for c in per_chunk):.4f}, moved ≤ "
               f"{max(c['moved_m'] for c in per_chunk) * 100:.1f} cm"
-              + (f"; seams after the solve {np.median(fe) * 100:.1f} cm median, {max(fe) * 100:.1f} max" if fe else "")
+              + (f"; seams after the solve, at their surfaces (scale and rotation read at the lever arm) "
+                 f"{np.median(fe) * 100:.1f} cm median, {max(fe) * 100:.1f} max" if fe else "")
               + " → chunk_graph.json")
 
     def load_graph(self) -> bool:
