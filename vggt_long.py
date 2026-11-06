@@ -133,7 +133,21 @@ class VGGT_Long:
         # loads; its end against the frame list once the list exists
         # (process_long_sequence).
         self.chunk_ranges_cfg = self.config['Model'].get('chunk_ranges')
-        if self.chunk_ranges_cfg is None:
+        # STAC (USER 2026-11-06, "hay que recortar la escena como hace genrecon, que toma cubos"): a CUBE layout —
+        # Model.chunk_sets, the server's cube plan (frame-index sets, two cubes sharing a block of the scene) with
+        # Model.chunk_owner (each frame's owner cube) — runs loop_utils.cube_run instead of the chain
+        self.chunk_sets_cfg = self.config['Model'].get('chunk_sets')
+        if self.chunk_sets_cfg is not None:
+            if self.chunk_ranges_cfg is not None:
+                raise ValueError("Model.chunk_sets and Model.chunk_ranges are two layouts — give one")
+            if self.config['Model'].get('chunk_owner') is None:
+                raise ValueError("Model.chunk_sets needs Model.chunk_owner (each frame's owner cube)")
+            if self.config['Model'].get('loop_enable'):
+                raise ValueError("Model.chunk_sets runs without the chain's loop bridges (loop_enable must be false)")
+        if self.chunk_sets_cfg is not None:
+            self.chunk_size = self.config['Model'].get('chunk_size')
+            self.overlap = self.config['Model'].get('overlap')
+        elif self.chunk_ranges_cfg is None:
             self.chunk_size = self.config['Model']['chunk_size']
             self.overlap = self.config['Model']['overlap']
         else:
@@ -4760,7 +4774,33 @@ class VGGT_Long:
             k, p2_matrix = extract_p2_k_matrix(calib_path)
             self.model.k = k
 
+        if getattr(self, 'chunk_sets_cfg', None) is not None:
+            self._stac_build_cube_layout()
+            from loop_utils.cube_run import process_cubes
+            process_cubes(self, images_to_u8=_stac_images_to_u8, images_u8=_stac_images_u8,
+                          save_ply=save_confident_pointcloud_batch, apply_sim3_direct=apply_sim3_direct)
+            return
         self.process_long_sequence()
+
+    def _stac_build_cube_layout(self):
+        """The cube layout of this run (loop_utils.cube_run): the sets and owners checked against the frame list, the
+        context and witness views resolved per cube."""
+        from loop_utils.cube_run import check_cube_extras, validate_chunk_sets
+        self._stac_cube_sets, self._stac_cube_owner = validate_chunk_sets(
+            self.chunk_sets_cfg, len(self.img_list), self.config['Model']['chunk_owner'])
+        self.chunk_indices = None
+        self.chunk_context = check_cube_extras(self.chunk_context_cfg, self._stac_cube_sets, self.img_list,
+                                               self.img_dir, "chunk_context")
+        self.chunk_witnesses = check_cube_extras(self.chunk_witnesses_cfg, self._stac_cube_sets, self.img_list,
+                                                 self.img_dir, "chunk_witnesses")
+        for k, (c, w) in enumerate(zip(self.chunk_context, self.chunk_witnesses)):
+            both = sorted(set(c) & set(w))
+            if both:
+                raise ValueError(f"cube {k}: {[os.path.basename(x) for x in both[:4]]} are both context views and "
+                                 f"witnesses")
+        print(f"[STAC layout] {len(self._stac_cube_sets)} cube(s) over {len(self.img_list)} frames: keyframes "
+              f"{[len(F) for F in self._stac_cube_sets]}, context {[len(c) for c in self.chunk_context]}, witnesses "
+              f"{[len(w) for w in self.chunk_witnesses]}")
 
     def save_camera_poses(self):
         '''
