@@ -10,7 +10,8 @@ Sim(3) graph — every chunk one piece with its own rotation, translation and sc
   graph and that disagreement is exactly what it corrects);
 * DA3 per chunk as a WEAK scale prior: log s_k toward the chunk's own DA3 estimate, σ =
   sigma_anchor / √anchors (metric_lock.solve_scale_graph's weight) — so a walk without loops does
-  not chain its scale freely.
+  not chain its scale freely. On CUBES (loop_utils/cube_run.py, USER 2026-11-07) no prior enters: the seams
+  alone place the cubes, and the scale along the walk is F2's continuous gauge.
 
 The VGGT-SLAM structure (short pieces tied in a graph, loops applied), with Sim(3) instead of its
 SL(4): SL(4) also shears and stretches each piece (on station each keyframe ended with its own

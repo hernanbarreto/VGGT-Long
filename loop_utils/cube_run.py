@@ -457,11 +457,14 @@ class CubeRun:
         x0 = [tree[k] for k in range(K)]
         inputs = getattr(self, 'scale_inputs', None) or {}
         sig_a = float(inputs.get("sigma_anchor", 0.08))
-        # THE DA3 PRIOR'S σ, MEASURED (USER 2026-11-07, pccr): how far two neighbouring cubes' DA3 locks disagree is what
-        # every seam measures (its scale, two passes over the same pixels after each pass's own lock); its robust spread
-        # over the session's seams, / √2 for one lock, is each lock's error. σ_anchor/√anchors (each cube's anchors
-        # taken as independent) claimed 1.1–1.5 % where pccr's seams measured 0.876–1.167 between neighbours: the
-        # prior outweighed the seams and the solve broke two of them by 16 %. The prior is never tighter than either.
+        # THE DA3 PER-CUBE SCALES ARE RECORDED, NOT USED (USER 2026-11-07, pccr: "corregí, detené pccr y volvé a
+        # correr"). Every seam is an exact fit of the same pixels in two passes: the cubes must coincide there. A DA3
+        # prior per cube fought the seams wherever the locks disagree (pccr: neighbours 0.876–1.167 apart) — at
+        # σ_anchor/√anchors (1.1–1.5 %) the solve broke two seams by 16 %; at the locks' measured spread (8.8 %) it
+        # still bent three by 6–10 cm, and the 10-view support floor then emptied the keyframes at those transitions
+        # (#19–25, #55–65, #187–199: 0–2 k points each against a median of 27 k). The metre is scale_align's (every
+        # anchor of the session); the scale ALONG the walk is F2's continuous gauge — a smooth curve of the walked
+        # distance, so it cannot put a step at a transition. The locks' spread is still measured and recorded.
         ls = np.log([float(e["s"]) for e in edges]) if edges else np.zeros(0)
         sig_lock = float(1.4826 * np.median(np.abs(ls)) / np.sqrt(2.0)) if len(ls) else 0.0
         priors = {}
@@ -474,13 +477,12 @@ class CubeRun:
                                   "sigma_anchors": sig_a / float(np.sqrt(nk)), "sigma_seams": sig_lock}
         print(f"{LOG} graph: {K} cube(s), {len(edges)} seam(s) (σ {min(e['sigma_m'] for e in edges) * 100:.1f}–"
               f"{max(e['sigma_m'] for e in edges) * 100:.1f} cm, squared — an exact fit of the same pixels is never "
-              f"dropped), {len(priors)} DA3 scale prior(s) at σ {sig_lock * 100:.1f} % (the seams' own spread of the "
-              f"locks; the anchors alone claimed {min((v['sigma_anchors'] for v in priors.values()), default=0) * 100:.1f}–"
-              f"{max((v['sigma_anchors'] for v in priors.values()), default=0) * 100:.1f} %)" if edges else
-              f"{LOG} graph: one cube")
-        sol = CG.solve(K, edges, [], priors, x0=x0, robust_seams=False)
+              f"dropped); the {len(priors)} DA3 per-cube scales recorded, not used (the locks disagree by "
+              f"{sig_lock * 100:.1f} % between neighbours; the metre is scale_align's, the scale along the walk F2's)"
+              if edges else f"{LOG} graph: one cube")
+        sol = CG.solve(K, edges, [], {}, x0=x0, robust_seams=False)
         if sol["converged"]:
-            poses, applied = sol["poses"], "seams + DA3 priors"
+            poses, applied = sol["poses"], "seams"
         else:
             poses, applied = x0, "the seams' spanning tree (the solve did not converge)"
         self.poses = poses
@@ -499,6 +501,7 @@ class CubeRun:
                      "final_surface_m": CG.edge_surface_error_m(poses[e["a"]], poses[e["b"]], e)} for e in edges]
         doc = {"version": 1, "mode": "sim3", "layout": "cubes", "layout_sha256": self.digest, "applied": applied,
                "seams": [_js(e) for e in edges], "closures": [], "priors": {str(k): v for k, v in priors.items()},
+               "priors_used": False, "locks_spread_log": sig_lock,
                "solve": {k_: v_ for k_, v_ in sol.items() if k_ != "poses"}, "poses": _rec(poses), "tree": _rec(x0),
                "per_chunk": per_chunk, "seam_errors": seam_err}
         if self.vl._stac_stamp_digest() is not None:
