@@ -31,7 +31,26 @@ import numpy as np
 import torch
 
 LOG = "[cubes]"
-SCALE_RANGE = (0.6, 1.6)            # the chain's seam rule: a Sim(3) scale outside it is degenerate → the rigid fit
+SCALE_RANGE = (0.6, 1.6)            # (kept for the chain mode only; the cubes measure their own bound — scale_bound)
+Z95 = 1.959963984540054             # the two-sided 95 % normal quantile (the project's 95 % interval)
+FACTOR = 1.1                        # USER: "1.1 en todos los casos" (metric_lock's improvement_error_factor)
+
+
+def scale_bound(scales) -> dict:
+    """The session's OWN bound on a relative scale (USER 2026-11-08: "de dónde salieron 0.6 y 1.6 … que sea genérico y
+    correcto"): over the seams' Sim(3) log-scales, the median and the robust spread σ = 1.4826·MAD; a scale is
+    degenerate when |log s − median| exceeds FACTOR × Z95 × σ — the session's 95 % interval widened by the project's
+    factor, no fixed number. Fewer than 3 scales (no spread to measure): no bound, declared."""
+    ls = np.log(np.asarray([float(x) for x in scales if float(x) > 0], np.float64))
+    if len(ls) < 3:
+        return {"median": 0.0, "sigma": None, "bound": None, "n": int(len(ls))}
+    med = float(np.median(ls))
+    sig = float(1.4826 * np.median(np.abs(ls - med)))
+    return {"median": med, "sigma": sig, "bound": float(FACTOR * Z95 * sig), "n": int(len(ls))}
+
+
+def scale_ok(s: float, sb: dict) -> bool:
+    return sb["bound"] is None or abs(float(np.log(float(s))) - sb["median"]) <= sb["bound"]
 
 
 class CubeLayoutError(ValueError):
@@ -209,7 +228,8 @@ class CubeRun:
         # THE REVISITS AS SLAM CLOSURES (USER 2026-11-08): global keyframe-index pairs (i, j) the server's F4 rule
         # found co-visible — each bridged by a joint Omega pass, then a Cauchy-robust loop edge of the cube graph
         self.revisits = [(int(i), int(j)) for i, j in (self.cfg.get('cube_revisits') or [])]
-        self.bridge_half = 4                 # keyframes each side of a revisit end in its bridge window
+        # each side of a bridge: F4's own loop window (precision.tracks.loop_half_window), handed by the server
+        self.bridge_half = int(self.cfg.get('cube_bridge_half', 0))
 
     # 1b. the revisit bridges (model loaded) ──────────────────────────────────────────────────
     def _bridge_path(self, a, b, i, j):
@@ -228,7 +248,7 @@ class CubeRun:
             h = self.bridge_half
             wa = [g for g in sorted(self.local[a]) if abs(g - i) <= h]
             wb = [g for g in sorted(self.local[b]) if abs(g - j) <= h]
-            if len(wa) >= 3 and len(wb) >= 3:
+            if wa and wb:                       # a starved fit is refused by robust_sim3 itself
                 out.append((a, b, i, j, wa, wb))
         return out
 
@@ -312,9 +332,9 @@ class CubeRun:
             sa, Ra, ta, ra, na = fits["a"]
             sb, Rb, tb, rb, nb = fits["b"]
             s = float(sa) / float(sb)
-            if not (SCALE_RANGE[0] <= s <= SCALE_RANGE[1]):
-                print(f"{LOG} ⚠ closure {a}<->{b} (revisit {i}<->{j}): relative scale {s:.4f} outside "
-                      f"{list(SCALE_RANGE)} — not an edge (declared)")
+            if not scale_ok(s, getattr(self, "scale_bound", {"bound": None, "median": 0.0})):
+                print(f"{LOG} ⚠ closure {a}<->{b} (revisit {i}<->{j}): relative scale {s:.4f} outside the session's "
+                      f"bound — not an edge (declared)")
                 continue
             R = np.asarray(Ra, np.float64) @ np.asarray(Rb, np.float64).T
             t = np.asarray(ta, np.float64).reshape(3) - s * (R @ np.asarray(tb, np.float64).reshape(3))
@@ -488,7 +508,7 @@ class CubeRun:
                     cache.pop(next(iter(cache)))
                 cache[k] = np.load(_path(self.un, k), allow_pickle=True).item()
             return cache[k]
-        edges = []
+        edges, cand = [], []
         for (a, b), sh in sorted(self.pairs.items()):
             da, db = load(a), load(b)
             la = np.asarray([self.local[a][int(g)] for g in sh])
@@ -502,22 +522,14 @@ class CubeRun:
             keys = pixel_keys(sh[flat // px], flat % px)
             P_a = pa.reshape(-1, 3)[flat].astype(np.float64)
             P_b = pb.reshape(-1, 3)[flat].astype(np.float64)
-            fit, kind = None, None
             f3 = robust_sim3(P_b, P_a, keys=keys)
-            if f3 is not None and SCALE_RANGE[0] <= float(f3[0]) <= SCALE_RANGE[1]:
-                fit, kind = (float(f3[0]), f3[1], f3[2], float(f3[3]), int(f3[4])), "Sim3"
-            else:
-                if f3 is not None:
-                    print(f"{LOG} seam {a}<->{b}: Sim3 scale {float(f3[0]):.4f} outside {list(SCALE_RANGE)} — the "
-                          f"rigid fit instead")
-                fr = robust_rigid(P_b, P_a, keys=keys)
-                if fr is not None:
-                    fit, kind = (1.0, fr[0], fr[1], float(fr[2]), int(fr[3])), "rigid"
-            if fit is None:
+            fr = robust_rigid(P_b, P_a, keys=keys)
+            fits_sim3 = (float(f3[0]), f3[1], f3[2], float(f3[3]), int(f3[4])) if f3 is not None else None
+            fits_rigid = (1.0, fr[0], fr[1], float(fr[2]), int(fr[3])) if fr is not None else None
+            if fits_sim3 is None and fits_rigid is None:
                 print(f"{LOG} ⚠ seam {a}<->{b}: starved ({len(sh)} shared frame(s), {len(flat):,} pixels) — not an "
                       f"edge (declared)")
                 continue
-            s, R, t, res, n_used = fit
             cams = _ext(da)[la][:, :3, 3]
             dists, pts = [], []
             for f in range(shp[0]):
@@ -529,15 +541,38 @@ class CubeRun:
             if not pts:
                 print(f"{LOG} ⚠ seam {a}<->{b}: no valid shared point — not an edge (declared)")
                 continue
-            edges.append({"a": int(b), "b": int(a), "s": float(s), "R": np.asarray(R, np.float64),
-                          "t": np.asarray(t, np.float64).reshape(3),
-                          "centroid": np.median(np.concatenate(pts), axis=0).tolist(),
-                          "lever_m": float(np.median(dists)), "sigma_m": float(res), "exact": True,
-                          "fit": kind, "shared_frames": int(len(sh)), "correspondences": int(n_used)})
-            print(f"{LOG} seam {a}<->{b}: {kind} on {n_used:,} exact correspondences of {len(sh)} shared frame(s), "
-                  f"scale {s:.4f}, median residual {res * 100:.1f} cm")
+            cand.append({"a": int(b), "b": int(a), "_sim3": fits_sim3, "_rigid": fits_rigid,
+                         "centroid": np.median(np.concatenate(pts), axis=0).tolist(),
+                         "lever_m": float(np.median(dists)), "exact": True, "shared_frames": int(len(sh))})
             del pa, pb, P_a, P_b
         cache.clear()
+        # the decision on the session's OWN bound (scale_bound): measured over these seams' Sim(3) scales
+        sb = scale_bound([c["_sim3"][0] for c in cand if c["_sim3"] is not None])
+        self.scale_bound = sb
+        print(f"{LOG} seam scale bound: " + (f"|log s − {sb['median']:+.4f}| ≤ {sb['bound']:.4f} (1.1 × the 95 % "
+                                              f"interval of the session's σ {sb['sigma']:.4f}, {sb['n']} seams)"
+                                              if sb["bound"] is not None else
+                                              f"none — {sb['n']} seam scale(s), no spread to measure (declared)"))
+        for c in cand:
+            a_, b_ = c["b"], c["a"]
+            if c["_sim3"] is not None and scale_ok(c["_sim3"][0], sb):
+                fit, kind = c["_sim3"], "Sim3"
+            elif c["_rigid"] is not None:
+                fit, kind = c["_rigid"], "rigid"
+                if c["_sim3"] is not None:
+                    print(f"{LOG} seam {a_}<->{b_}: Sim3 scale {c['_sim3'][0]:.4f} outside the session's bound — "
+                          f"the rigid fit instead")
+            else:
+                print(f"{LOG} ⚠ seam {a_}<->{b_}: Sim3 scale outside the bound and no rigid fit — not an edge "
+                      f"(declared)")
+                continue
+            s_, R_, t_, res_, n_used = fit
+            edges.append({"a": c["a"], "b": c["b"], "s": float(s_), "R": np.asarray(R_, np.float64),
+                          "t": np.asarray(t_, np.float64).reshape(3), "centroid": c["centroid"],
+                          "lever_m": c["lever_m"], "sigma_m": float(res_), "exact": True, "fit": kind,
+                          "shared_frames": c["shared_frames"], "correspondences": int(n_used)})
+            print(f"{LOG} seam {a_}<->{b_}: {kind} on {n_used:,} exact correspondences of {c['shared_frames']} "
+                  f"shared frame(s), scale {s_:.4f}, median residual {res_ * 100:.1f} cm")
         if any(not (e["sigma_m"] > 0) for e in edges):
             pos = [e["sigma_m"] for e in edges if e["sigma_m"] > 0]
             for e in edges:

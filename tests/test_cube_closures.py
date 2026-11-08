@@ -75,3 +75,15 @@ def test_neighbours_sharing_frames_get_no_closure(tmp_path):
     run.pairs = CR.overlap_pairs(sets)
     run.revisits, run.bridge_half, run.un = [(5, 25)], 4, str(tmp_path)
     assert run._bridge_items() == [], "a seam already ties cubes that share frames"
+
+
+def test_the_scale_bound_is_the_sessions_own():
+    """USER 2026-11-08 ("de dónde salieron 0.6 y 1.6 … que sea genérico y correcto"): the bound comes from the
+    session's seam scales — a tight session gets a tight bound, a loose one a wide bound; fewer than 3 scales: none."""
+    tight = CR.scale_bound([1.00, 1.01, 0.99, 1.02, 0.98])
+    loose = CR.scale_bound([0.90, 1.15, 0.95, 1.10, 1.05])
+    assert 0 < tight["bound"] < loose["bound"]
+    assert CR.scale_ok(1.03, loose) and not CR.scale_ok(1.30, tight)
+    assert CR.scale_bound([1.1, 0.9])["bound"] is None and CR.scale_ok(5.0, CR.scale_bound([1.1, 0.9]))
+    pccr = [1.1267, 1.0631, 1.0415]                      # three of pccr 2026-11-08's seams
+    assert all(CR.scale_ok(s, CR.scale_bound(pccr)) for s in pccr)
