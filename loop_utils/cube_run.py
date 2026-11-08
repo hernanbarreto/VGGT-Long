@@ -206,6 +206,117 @@ class CubeRun:
         self.digest = layout_digest(self.sets, self.owner)
         self.un, self.al = vl.result_unaligned_dir, vl.result_aligned_dir
         self.poses = None
+        # THE REVISITS AS SLAM CLOSURES (USER 2026-11-08): global keyframe-index pairs (i, j) the server's F4 rule
+        # found co-visible — each bridged by a joint Omega pass, then a Cauchy-robust loop edge of the cube graph
+        self.revisits = [(int(i), int(j)) for i, j in (self.cfg.get('cube_revisits') or [])]
+        self.bridge_half = 4                 # keyframes each side of a revisit end in its bridge window
+
+    # 1b. the revisit bridges (model loaded) ──────────────────────────────────────────────────
+    def _bridge_path(self, a, b, i, j):
+        return os.path.join(self.un, f"bridge_{a}_{b}_{i}_{j}.npy")
+
+    def _bridge_items(self):
+        """(cube a, cube b, i, j, window a, window b) per revisit whose ends lie in two cubes that share no frame
+        (a seam already ties cubes that do)."""
+        out = []
+        for i, j in self.revisits:
+            if not (0 <= i < self.n and 0 <= j < self.n):
+                continue
+            a, b = int(self.owner[i]), int(self.owner[j])
+            if a == b or (min(a, b), max(a, b)) in self.pairs:
+                continue
+            h = self.bridge_half
+            wa = [g for g in sorted(self.local[a]) if abs(g - i) <= h]
+            wb = [g for g in sorted(self.local[b]) if abs(g - j) <= h]
+            if len(wa) >= 3 and len(wb) >= 3:
+                out.append((a, b, i, j, wa, wb))
+        return out
+
+    def bridges(self):
+        """One joint Omega pass per revisit (both windows together), written to disk — read back by the graph."""
+        vl = self.vl
+        items = self._bridge_items()
+        print(f"{LOG} revisit bridges: {len(items)} of {len(self.revisits)} revisit(s) join two cubes that share "
+              f"no frame")
+        for a, b, i, j, wa, wb in items:
+            p = self._bridge_path(a, b, i, j)
+            if os.path.exists(p):
+                try:
+                    old = np.load(p, allow_pickle=True).item()
+                    if list(old.get('_stac_frames') or []) == wa + wb:
+                        vl._stac_check_fork_stamp(old, p)
+                        continue
+                except RuntimeError:
+                    raise
+                except Exception:  # noqa: BLE001 — unreadable: re-infer
+                    pass
+            views = [vl.img_list[int(g)] for g in wa + wb]
+            pred = vl.model.infer_chunk(views)
+            for key in pred.keys():
+                if isinstance(pred[key], torch.Tensor):
+                    pred[key] = pred[key].cpu().numpy().squeeze(0)
+            pred['depth'] = np.squeeze(pred['depth'])
+            vl._stac_mask_sky(pred, views)
+            pred['_stac_frames'] = wa + wb
+            pred['_stac_split'] = len(wa)
+            if vl._stac_stamp_digest() is not None:
+                pred['_stac_fork_stamp'] = vl._stac_stamp_digest()
+            np.save(p, pred)
+            del pred
+            torch.cuda.empty_cache()
+            print(f"{LOG} bridge {a}<->{b} (revisit {i}<->{j}): {len(wa)}+{len(wb)} keyframes")
+
+    def closures(self) -> List[dict]:
+        """The loop edges of the graph: per bridge, its fit onto cube a and onto cube b on EXACT pixel
+        correspondences (the same frames in both passes), composed into cube b → cube a — the seam convention
+        ({"a": b, "b": a}: the transform maps edge["a"]'s coordinates onto edge["b"]'s)."""
+        from loop_utils.loop_bridges import robust_sim3
+        from loop_utils.stable_sample import pixel_keys
+        out = []
+        for a, b, i, j, wa, wb in self._bridge_items():
+            p = self._bridge_path(a, b, i, j)
+            if not os.path.exists(p):
+                continue
+            br = np.load(p, allow_pickle=True).item()
+            fits, side_pts = {}, {}
+            for side, k, win, off in (("a", a, wa, 0), ("b", b, wb, len(wa))):
+                dk = np.load(_path(self.un, k), allow_pickle=True).item()
+                lb = np.arange(off, off + len(win))
+                lk = np.asarray([self.local[k][int(g)] for g in win])
+                pb, pk = _wp(br)[lb], _wp(dk)[lk]
+                shp = pb.shape[:3]
+                ok = (_conf(br, _wp(br).shape[:3])[lb] > 1e-5) & (_conf(dk, _wp(dk).shape[:3])[lk] > 1e-5)
+                flat = np.flatnonzero(ok.reshape(-1))
+                px = int(shp[1]) * int(shp[2])
+                keys = pixel_keys(np.asarray(win)[flat // px], flat % px)
+                f3 = robust_sim3(pb.reshape(-1, 3)[flat].astype(np.float64),
+                                 pk.reshape(-1, 3)[flat].astype(np.float64), keys=keys)
+                if f3 is None or not (SCALE_RANGE[0] <= float(f3[0]) <= SCALE_RANGE[1]):
+                    fits = None
+                    break
+                fits[side] = f3
+                if side == "a":
+                    cams = _ext(dk)[lk][:, :3, 3]
+                    q = pk.reshape(-1, 3)[flat].astype(np.float64)
+                    side_pts = {"centroid": np.median(q[::max(1, len(q) // 20000)], axis=0).tolist(),
+                                "lever_m": float(np.median(np.linalg.norm(
+                                    q[::max(1, len(q) // 20000)][:, None, :] - cams[None], axis=2).min(1)))}
+                del dk
+            if not fits:
+                print(f"{LOG} ⚠ closure {a}<->{b} (revisit {i}<->{j}): a side starved or degenerate — not an edge "
+                      f"(declared)")
+                continue
+            sa, Ra, ta, ra, na = fits["a"]
+            sb, Rb, tb, rb, nb = fits["b"]
+            s = float(sa) / float(sb)
+            R = np.asarray(Ra, np.float64) @ np.asarray(Rb, np.float64).T
+            t = np.asarray(ta, np.float64).reshape(3) - s * (R @ np.asarray(tb, np.float64).reshape(3))
+            sig = float(np.hypot(float(ra), float(rb)))
+            out.append({"a": int(b), "b": int(a), "s": s, "R": R, "t": t, "centroid": side_pts["centroid"],
+                        "lever_m": max(side_pts["lever_m"], 1e-3), "sigma_m": max(sig, 1e-3), "exact": False,
+                        "fit": "bridge", "revisit": [int(i), int(j)], "correspondences": int(min(na, nb))})
+            print(f"{LOG} closure {a}<->{b} (revisit {i}<->{j}): scale {s:.4f}, residual {sig * 100:.1f} cm")
+        return out
 
     # 1. inference ─────────────────────────────────────────────────────────────────────────────
     def infer(self, k):
@@ -480,7 +591,11 @@ class CubeRun:
               f"dropped); the {len(priors)} DA3 per-cube scales recorded, not used (the locks disagree by "
               f"{sig_lock * 100:.1f} % between neighbours; the metre is scale_align's, the scale along the walk F2's)"
               if edges else f"{LOG} graph: one cube")
-        sol = CG.solve(K, edges, [], {}, x0=x0, robust_seams=False)
+        # the revisits as SLAM closures (USER 2026-11-08): loop edges under Cauchy — a wrong one is down-weighted,
+        # never trusted like a seam; the spanning tree above is the seams' alone
+        loops = self.closures() if self.revisits else []
+        sol = CG.solve(K, edges, loops, {}, x0=x0, robust_seams=False)
+        print(f"{LOG} graph: {len(loops)} revisit closure(s) in the solve")
         if sol["converged"]:
             poses, applied = sol["poses"], "seams"
         else:
@@ -500,7 +615,7 @@ class CubeRun:
                      "final_m": CG.edge_error_m(poses[e["a"]], poses[e["b"]], e),
                      "final_surface_m": CG.edge_surface_error_m(poses[e["a"]], poses[e["b"]], e)} for e in edges]
         doc = {"version": 1, "mode": "sim3", "layout": "cubes", "layout_sha256": self.digest, "applied": applied,
-               "seams": [_js(e) for e in edges], "closures": [], "priors": {str(k): v for k, v in priors.items()},
+               "seams": [_js(e) for e in edges], "closures": [_js(e) for e in loops], "priors": {str(k): v for k, v in priors.items()},
                "priors_used": False, "locks_spread_log": sig_lock,
                "solve": {k_: v_ for k_, v_ in sol.items() if k_ != "poses"}, "poses": _rec(poses), "tree": _rec(x0),
                "per_chunk": per_chunk, "seam_errors": seam_err}
@@ -861,6 +976,8 @@ def process_cubes(vl, *, images_to_u8, images_u8, save_ply, apply_sim3_direct):
         torch.cuda.empty_cache()
         run.witness_pass(k)
         torch.cuda.empty_cache()
+    if run.revisits and run.K > 1:
+        run.bridges()          # the revisit bridges need the model: before it is released
     del vl.model
     torch.cuda.empty_cache()
     if run.load_graph():
