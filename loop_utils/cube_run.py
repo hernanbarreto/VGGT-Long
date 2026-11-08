@@ -291,7 +291,10 @@ class CubeRun:
                 keys = pixel_keys(np.asarray(win)[flat // px], flat % px)
                 f3 = robust_sim3(pb.reshape(-1, 3)[flat].astype(np.float64),
                                  pk.reshape(-1, 3)[flat].astype(np.float64), keys=keys)
-                if f3 is None or not (SCALE_RANGE[0] <= float(f3[0]) <= SCALE_RANGE[1]):
+                # each side's scale is the bridge's raw Omega scale against a cube already in the metric lock's
+                # scale (~5–7× on pccr 2026-11-08: all 49 closures were refused here) — only the COMPOSED relative
+                # scale between the two cubes is held to SCALE_RANGE, below
+                if f3 is None or not (float(f3[0]) > 0):
                     fits = None
                     break
                 fits[side] = f3
@@ -309,6 +312,10 @@ class CubeRun:
             sa, Ra, ta, ra, na = fits["a"]
             sb, Rb, tb, rb, nb = fits["b"]
             s = float(sa) / float(sb)
+            if not (SCALE_RANGE[0] <= s <= SCALE_RANGE[1]):
+                print(f"{LOG} ⚠ closure {a}<->{b} (revisit {i}<->{j}): relative scale {s:.4f} outside "
+                      f"{list(SCALE_RANGE)} — not an edge (declared)")
+                continue
             R = np.asarray(Ra, np.float64) @ np.asarray(Rb, np.float64).T
             t = np.asarray(ta, np.float64).reshape(3) - s * (R @ np.asarray(tb, np.float64).reshape(3))
             sig = float(np.hypot(float(ra), float(rb)))

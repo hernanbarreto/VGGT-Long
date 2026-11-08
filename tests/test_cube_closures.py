@@ -27,11 +27,17 @@ def _maps(world, frames, H=12, W=16):
     return np.stack(out)
 
 
-def test_the_closure_maps_cube_b_onto_cube_a(tmp_path):
+import pytest
+
+
+@pytest.mark.parametrize("metric", [1.0, 6.0])
+def test_the_closure_maps_cube_b_onto_cube_a(tmp_path, metric):
+    """``metric``: the cubes carry the metric lock's scale (~5–7× the bridge's raw Omega scale on pccr
+    2026-11-08 — every closure was refused when each side's scale was held to SCALE_RANGE)."""
     rng = np.random.default_rng(0)
     world = rng.uniform([-3, -1, 2], [3, 2, 8], size=(5000, 3))
-    Ta = _sim3(1.0, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0])          # cube a's frame = world
-    Tb = _sim3(1.15, [0.05, -0.2, 0.1], [0.4, -0.3, 1.2])       # cube b's frame: world → b
+    Ta = _sim3(metric, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0])               # cube a's frame
+    Tb = _sim3(metric * 1.15, [0.05, -0.2, 0.1], [0.4, -0.3, 1.2])    # cube b's frame: world → b
     Tbr = _sim3(0.9, [0.1, 0.05, -0.02], [-0.2, 0.1, 0.3])      # the bridge's own frame
     sets = [np.arange(0, 20), np.arange(40, 60)]
     i, j = 10, 50
