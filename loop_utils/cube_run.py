@@ -230,6 +230,10 @@ class CubeRun:
         self.revisits = [(int(i), int(j)) for i, j in (self.cfg.get('cube_revisits') or [])]
         # each side of a bridge: F4's own loop window (precision.tracks.loop_half_window), handed by the server
         self.bridge_half = int(self.cfg.get('cube_bridge_half', 0))
+        # THE RANGE (USER 2026-11-09: "puntos a más de 10 m no deben aportar, a menos de 10 m de la cámara sí"): the
+        # seams' and closures' fits hear only points within this many metres of their camera — F6's own range
+        # (precision.cloud.fusion_witness_max_m, handed by the server); 0 = every point (declared)
+        self.range_m = float(self.cfg.get('cube_range_m', 0.0))
 
     # 1b. the revisit bridges (model loaded) ──────────────────────────────────────────────────
     def _bridge_path(self, a, b, i, j):
@@ -306,6 +310,11 @@ class CubeRun:
                 pb, pk = _wp(br)[lb], _wp(dk)[lk]
                 shp = pb.shape[:3]
                 ok = (_conf(br, _wp(br).shape[:3])[lb] > 1e-5) & (_conf(dk, _wp(dk).shape[:3])[lk] > 1e-5)
+                rng_m = float(getattr(self, "range_m", 0.0))
+                if rng_m > 0:
+                    # the range on the cube's side (metric; the bridge is in Omega's raw units)
+                    ck = _ext(dk)[lk][:, :3, 3]
+                    ok &= np.linalg.norm(pk - ck[:, None, None, :], axis=-1) <= rng_m
                 flat = np.flatnonzero(ok.reshape(-1))
                 px = int(shp[1]) * int(shp[2])
                 keys = pixel_keys(np.asarray(win)[flat // px], flat % px)
@@ -517,6 +526,15 @@ class CubeRun:
             shp = pa.shape[:3]
             ca, cb = _conf(da, _wp(da).shape[:3])[la], _conf(db, _wp(db).shape[:3])[lb]
             ok = (ca > 1e-5) & (cb > 1e-5)
+            rng_m = float(getattr(self, "range_m", 0.0))
+            n_far = 0
+            if rng_m > 0:
+                # the range in BOTH cubes: a pixel whose point lies beyond it from its camera in either copy is no
+                # correspondence (USER 2026-11-09: "a más de 10 m no debe aportar")
+                near = ((np.linalg.norm(pa - _ext(da)[la][:, :3, 3][:, None, None, :], axis=-1) <= rng_m)
+                        & (np.linalg.norm(pb - _ext(db)[lb][:, :3, 3][:, None, None, :], axis=-1) <= rng_m))
+                n_far = int((ok & ~near).sum())
+                ok &= near
             flat = np.flatnonzero(ok.reshape(-1))
             px = int(shp[1]) * int(shp[2])
             keys = pixel_keys(sh[flat // px], flat % px)
@@ -541,6 +559,8 @@ class CubeRun:
             if not pts:
                 print(f"{LOG} ⚠ seam {a}<->{b}: no valid shared point — not an edge (declared)")
                 continue
+            if n_far:
+                print(f"{LOG} seam {a}<->{b}: {n_far:,} shared pixel(s) beyond {rng_m:g} m of their camera left out")
             cand.append({"a": int(b), "b": int(a), "_sim3": fits_sim3, "_rigid": fits_rigid,
                          "centroid": np.median(np.concatenate(pts), axis=0).tolist(),
                          "lever_m": float(np.median(dists)), "exact": True, "shared_frames": int(len(sh))})

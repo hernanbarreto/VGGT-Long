@@ -87,3 +87,34 @@ def test_the_scale_bound_is_the_sessions_own():
     assert CR.scale_bound([1.1, 0.9])["bound"] is None and CR.scale_ok(5.0, CR.scale_bound([1.1, 0.9]))
     pccr = [1.1267, 1.0631, 1.0415]                      # three of pccr 2026-11-08's seams
     assert all(CR.scale_ok(s, CR.scale_bound(pccr)) for s in pccr)
+
+
+@pytest.mark.parametrize("range_m", [0.0, 10.0])
+def test_the_seam_hears_only_points_within_the_range(tmp_path, range_m):
+    """USER 2026-11-09 ("puntos a más de 10 m no deben aportar, a menos de 10 m de la cámara sí"): two cubes agree on
+    everything near their cameras and disagree only far away (the far copy pushed 0.8 m along the ray) — with the
+    10 m range the seam is the exact identity of the near surface; with every point it bends towards the far
+    disagreement."""
+    rng = np.random.default_rng(3)
+    near = rng.uniform([-3, -1, 2], [3, 2, 7], size=(4000, 3))
+    far = rng.uniform([-6, -2, 14], [6, 3, 20], size=(4000, 3))
+    world = np.concatenate([near, far])
+    sets = [np.arange(0, 20), np.arange(10, 30)]
+    run = CR.CubeRun.__new__(CR.CubeRun)
+    run.n, run.K, run.sets = 30, 2, sets
+    run.owner = np.array([0] * 15 + [1] * 15)
+    run.local = [{int(g): k for k, g in enumerate(F)} for F in sets]
+    run.pairs = CR.overlap_pairs(sets)
+    run.un, run.range_m = str(tmp_path), range_m
+    for k, F in enumerate(sets):
+        wp = _maps(world, F, H=24, W=32)
+        if k == 1:
+            far_px = wp[..., 2] > 10.0
+            wp[far_px] = wp[far_px] + np.array([0.0, 0.0, 0.8])
+        np.save(CR._path(run.un, k), {"world_points": wp, "world_points_conf": np.ones(wp.shape[:3]),
+                                      "extrinsic": np.tile(np.eye(4), (len(F), 1, 1))})
+    (e,) = run.seams()
+    if range_m:
+        assert abs(e["s"] - 1.0) < 1e-6 and np.allclose(e["t"], 0.0, atol=1e-6) and e["sigma_m"] < 1e-3, e
+    else:
+        assert e["sigma_m"] > 0.01 or abs(e["s"] - 1.0) > 1e-3, "without the range the far copy bends the seam"
