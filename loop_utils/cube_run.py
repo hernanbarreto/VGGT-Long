@@ -461,7 +461,8 @@ class CubeRun:
         rep = vl._stac_with_stamp({"layout": "cubes", "layout_sha256": self.digest, "chunks": {}})
         for k, data in vl._stac_iter_chunks(self.un, range(self.K)):
             nums = [real_frame_number(vl.img_list[int(g)]) for g in self.sets[k]]
-            locs, ratios = chunk_anchor_ratios(data, nums, ml['anchor_dir'], near_frac=float(ml.get('near_frac', 0.25)))
+            locs, ratios = chunk_anchor_ratios(data, nums, ml['anchor_dir'], near_frac=float(ml.get('near_frac', 0.25)),
+                                               range_m=float(getattr(self, "range_m", 0.0)))
             lock = data.get('_stac_cube_lock')
             if lock is not None:                      # a resumed cube: its ratios before the lock
                 ratios = [float(r) * float(lock) for r in ratios]
@@ -838,7 +839,13 @@ class CubeRun:
                     g = int(g)
                     if int(self.owner[g]) == k:
                         c2w = self.pose_of(k, ext[i])
-                        cache[g] = (wp[i].astype(np.float32), cf[i].astype(np.float32), np.linalg.inv(c2w), Kin[i])
+                        cfi = cf[i].astype(np.float32)
+                        rng_m = float(getattr(self, "range_m", 0.0))
+                        if rng_m > 0:
+                            # THE RANGE: a point farther than it from its own camera is no depth sample
+                            cfi = np.where(np.linalg.norm(wp[i] - c2w[:3, 3], axis=-1) <= rng_m, cfi, 0.0).astype(
+                                np.float32)
+                        cache[g] = (wp[i].astype(np.float32), cfi, np.linalg.inv(c2w), Kin[i])
                 del data
             fit_offsets, holdout_offsets = (1, 2, 3, 5, 8, 12), (4, 10)
             zref = float(inspect.signature(depth_graph_verdict).parameters["zref"].default)

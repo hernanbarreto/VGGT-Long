@@ -35,7 +35,7 @@ def real_frame_number(image_path):
     return int(m.group(1)) if m else -1
 
 
-def anchor_ratio(omega_depth, da3_depth, conf=None, near_frac=0.25, min_px=50):
+def anchor_ratio(omega_depth, da3_depth, conf=None, near_frac=0.25, min_px=50, K=None, range_m=0.0):
     """median(da3/omega) over pixels valid in BOTH maps, restricted to the near band
     (omega depth <= its `near_frac` quantile). Returns None when starved."""
     om = np.asarray(omega_depth, np.float32).squeeze()
@@ -49,6 +49,13 @@ def anchor_ratio(omega_depth, da3_depth, conf=None, near_frac=0.25, min_px=50):
         cf = np.asarray(conf, np.float32).squeeze()
         if cf.shape == om.shape:
             m &= cf > 1e-5          # sky is masked by zeroing conf — exclude it
+    if range_m and range_m > 0 and K is not None:
+        # THE RANGE (the server's reconstruction.view_range_m, USER 2026-11-09): DA3's pixels farther than it from
+        # the camera (its metric depth along the ray of Omega's grid) never vote the metre
+        K = np.asarray(K, np.float64).reshape(3, 3)
+        ys, xs = np.mgrid[0:om.shape[0], 0:om.shape[1]]
+        ray = np.sqrt(((xs - K[0, 2]) / K[0, 0]) ** 2 + ((ys - K[1, 2]) / K[1, 1]) ** 2 + 1.0)
+        m &= da * ray <= float(range_m)
     if m.sum() < min_px:
         return None
     near = om <= np.quantile(om[m], near_frac)
@@ -58,7 +65,7 @@ def anchor_ratio(omega_depth, da3_depth, conf=None, near_frac=0.25, min_px=50):
     return float(np.median(da[mm] / om[mm]))
 
 
-def chunk_anchor_ratios(chunk_data, frame_numbers, anchor_dir, near_frac=0.25):
+def chunk_anchor_ratios(chunk_data, frame_numbers, anchor_dir, near_frac=0.25, range_m=0.0):
     """Per-anchor (local_index, ratio) pairs for one chunk — the positioned form
     of the anchor evidence, so a scale that DRIFTS along the chunk is visible
     instead of being collapsed into one median.
@@ -81,7 +88,15 @@ def chunk_anchor_ratios(chunk_data, frame_numbers, anchor_dir, near_frac=0.25):
         if conf3 is not None:
             c = np.asarray(conf3)
             conf = c[local] if local < c.shape[0] else None
-        r = anchor_ratio(depth[local], z["depth"], conf=conf, near_frac=near_frac)
+        Kl = None
+        if range_m and range_m > 0:
+            kin = chunk_data.get("intrinsic")
+            if kin is None:
+                raise RuntimeError("the chunk carries no intrinsic — the range cannot be measured on its anchors")
+            kin = np.asarray(kin, np.float64)
+            kin = kin[0] if kin.ndim == 4 else kin
+            Kl = kin[local]
+        r = anchor_ratio(depth[local], z["depth"], conf=conf, near_frac=near_frac, K=Kl, range_m=range_m)
         if r is not None and np.isfinite(r) and r > 0:
             locals_.append(int(local))
             ratios.append(r)
