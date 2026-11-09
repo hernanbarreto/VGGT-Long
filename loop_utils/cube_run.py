@@ -555,16 +555,20 @@ class CubeRun:
                                               f"none — {sb['n']} seam scale(s), no spread to measure (declared)"))
         for c in cand:
             a_, b_ = c["b"], c["a"]
-            if c["_sim3"] is not None and scale_ok(c["_sim3"][0], sb):
+            # SEAMS ARE ALWAYS FREE SCALE (USER 2026-11-09: "ajustalo libre" — zaragoza's tight measured bound, σ
+            # 0.7 %, sent three seams to the rigid fit at 7.9–14.8 cm): the Sim(3) of the same pixels in two passes
+            # is the seam; the rigid fit only when no Sim(3) can be fitted at all. The bound is still measured
+            # and logged, and it still judges the closures.
+            if c["_sim3"] is not None:
                 fit, kind = c["_sim3"], "Sim3"
+                if not scale_ok(c["_sim3"][0], sb):
+                    print(f"{LOG} seam {a_}<->{b_}: Sim3 scale {c['_sim3'][0]:.4f} outside the session's bound — "
+                          f"kept free (declared)")
             elif c["_rigid"] is not None:
                 fit, kind = c["_rigid"], "rigid"
-                if c["_sim3"] is not None:
-                    print(f"{LOG} seam {a_}<->{b_}: Sim3 scale {c['_sim3'][0]:.4f} outside the session's bound — "
-                          f"the rigid fit instead")
+                print(f"{LOG} seam {a_}<->{b_}: no Sim3 could be fitted — the rigid fit (declared)")
             else:
-                print(f"{LOG} ⚠ seam {a_}<->{b_}: Sim3 scale outside the bound and no rigid fit — not an edge "
-                      f"(declared)")
+                print(f"{LOG} ⚠ seam {a_}<->{b_}: neither a Sim3 nor a rigid fit — not an edge (declared)")
                 continue
             s_, R_, t_, res_, n_used = fit
             edges.append({"a": c["a"], "b": c["b"], "s": float(s_), "R": np.asarray(R_, np.float64),
