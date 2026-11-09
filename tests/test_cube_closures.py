@@ -4,6 +4,7 @@ pass seen in its own frame, cube a and cube b each in theirs — the closure map
 import os
 
 import numpy as np
+import torch
 from scipy.spatial.transform import Rotation
 
 from loop_utils import cube_run as CR
@@ -56,9 +57,29 @@ def test_the_closure_maps_cube_b_onto_cube_a(tmp_path, metric):
                                       "extrinsic": np.tile(np.eye(4), (len(F), 1, 1))})
     (a, b, _i, _j, wa, wb), = run._bridge_items()
     wbr = _maps(world, wa + wb)
-    np.save(run._bridge_path(a, b, i, j), {"world_points": _apply(Tbr, wbr.reshape(-1, 3)).reshape(wbr.shape),
-                                           "world_points_conf": np.ones(wbr.shape[:3]),
-                                           "_stac_frames": wa + wb})
+    pred = {"world_points": torch.from_numpy(_apply(Tbr, wbr.reshape(-1, 3)).reshape((1,) + wbr.shape)),
+            "world_points_conf": torch.ones((1,) + wbr.shape[:3]), "depth": torch.ones((1,) + wbr.shape[:3] + (1,))}
+
+    class _Model:
+        def infer_chunk(self, views):
+            assert len(views) == len(wa) + len(wb)
+            return dict(pred)
+
+    class _VL:
+        model, img_list = _Model(), [f"frame_{g}.jpg" for g in range(run.n)]
+
+        def _stac_mask_sky(self, p, views):
+            pass
+
+        def _stac_stamp_digest(self):
+            return None
+
+    run.vl = _VL()
+    run.bridges()
+    (only,) = [f for f in os.listdir(run.un) if f.startswith("bridge")]
+    rec = np.load(os.path.join(run.un, only), allow_pickle=True).item()
+    assert only == f"bridge_fit_{a}_{b}_{i}_{j}.npy" and set(rec) == {"_stac_frames", "_stac_split", "fits",
+                                                                       "side_pts"}, "the fits only — no prediction"
     (e,) = run.closures()
     assert e["a"] == 1 and e["b"] == 0
     Xb = _apply(Tb, world[:200])

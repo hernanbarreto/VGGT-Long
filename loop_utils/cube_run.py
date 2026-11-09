@@ -235,9 +235,63 @@ class CubeRun:
         # (precision.cloud.fusion_witness_max_m, handed by the server); 0 = every point (declared)
         self.range_m = float(self.cfg.get('cube_range_m', 0.0))
 
-    # 1b. the revisit bridges (model loaded) ──────────────────────────────────────────────────
+    # 1b. the revisit bridges (model loaded, after the metric lock) ──────────────────────────────
     def _bridge_path(self, a, b, i, j):
-        return os.path.join(self.un, f"bridge_{a}_{b}_{i}_{j}.npy")
+        """A bridge's FITS onto its two cubes — never its prediction (pccr 2026-08-24, 2026-11-09: 1787 bridges × 252 MB
+        of Omega predictions filled the 450 GB quota; the graph reads only the fits)."""
+        return os.path.join(self.un, f"bridge_fit_{a}_{b}_{i}_{j}.npy")
+
+    def _cube_side(self, k, cache):
+        """(world points, confidence, extrinsic) of cube k as it lies on disk — after the metric lock — kept in a small
+        LRU (each cube file is ~0.7 GB; a bridge reads two)."""
+        if k in cache:
+            cache.move_to_end(k)
+            return cache[k]
+        dk = np.load(_path(self.un, k), allow_pickle=True).item()
+        wp = _wp(dk)
+        side = (wp, _conf(dk, wp.shape[:3]), _ext(dk))
+        del dk
+        cache[k] = side
+        while len(cache) > 6:
+            cache.popitem(last=False)
+        return side
+
+    def _bridge_fits(self, br, a, b, wa, wb, cache):
+        """Per side, the bridge's robust Sim(3) onto the cube on EXACT pixel correspondences (the same frames in both
+        passes) — ({'a': f3, 'b': f3}, cube a's side points) or (None, {}) when a side is starved or degenerate."""
+        from loop_utils.loop_bridges import robust_sim3
+        from loop_utils.stable_sample import pixel_keys
+        fits, side_pts = {}, {}
+        for side, k, win, off in (("a", a, wa, 0), ("b", b, wb, len(wa))):
+            wpk, confk, extk = self._cube_side(k, cache)
+            lb = np.arange(off, off + len(win))
+            lk = np.asarray([self.local[k][int(g)] for g in win])
+            pb, pk = _wp(br)[lb], wpk[lk]
+            shp = pb.shape[:3]
+            ok = (_conf(br, _wp(br).shape[:3])[lb] > 1e-5) & (confk[lk] > 1e-5)
+            rng_m = float(getattr(self, "range_m", 0.0))
+            if rng_m > 0:
+                # the range on the cube's side (metric; the bridge is in Omega's raw units)
+                ck = extk[lk][:, :3, 3]
+                ok &= np.linalg.norm(pk - ck[:, None, None, :], axis=-1) <= rng_m
+            flat = np.flatnonzero(ok.reshape(-1))
+            px = int(shp[1]) * int(shp[2])
+            keys = pixel_keys(np.asarray(win)[flat // px], flat % px)
+            f3 = robust_sim3(pb.reshape(-1, 3)[flat].astype(np.float64),
+                             pk.reshape(-1, 3)[flat].astype(np.float64), keys=keys)
+            # each side's scale is the bridge's raw Omega scale against a cube already in the metric lock's
+            # scale (~5–7× on pccr 2026-11-08: all 49 closures were refused here) — only the COMPOSED relative
+            # scale between the two cubes is held to SCALE_RANGE, in closures()
+            if f3 is None or not (float(f3[0]) > 0):
+                return None, {}
+            fits[side] = tuple(f3)
+            if side == "a":
+                cams = extk[lk][:, :3, 3]
+                q = pk.reshape(-1, 3)[flat].astype(np.float64)
+                side_pts = {"centroid": np.median(q[::max(1, len(q) // 20000)], axis=0).tolist(),
+                            "lever_m": float(np.median(np.linalg.norm(
+                                q[::max(1, len(q) // 20000)][:, None, :] - cams[None], axis=2).min(1)))}
+        return fits, side_pts
 
     def _bridge_items(self):
         """(cube a, cube b, i, j, window a, window b) per revisit whose ends lie in two cubes that share no frame
@@ -257,11 +311,15 @@ class CubeRun:
         return out
 
     def bridges(self):
-        """One joint Omega pass per revisit (both windows together), written to disk — read back by the graph."""
+        """One joint Omega pass per revisit (both windows together), fitted AT ONCE onto its two cubes as they lie on
+        disk after the metric lock; only the fits are written (``_bridge_path``) — read back by the graph. The
+        prediction itself is dropped: pccr 2026-08-24 (2026-11-09) handed 1787 bridges, 252 MB each."""
+        from collections import OrderedDict
         vl = self.vl
         items = self._bridge_items()
         print(f"{LOG} revisit bridges: {len(items)} of {len(self.revisits)} revisit(s) join two cubes that share "
               f"no frame")
+        cache = OrderedDict()
         for a, b, i, j, wa, wb in items:
             p = self._bridge_path(a, b, i, j)
             if os.path.exists(p):
@@ -281,59 +339,27 @@ class CubeRun:
                     pred[key] = pred[key].cpu().numpy().squeeze(0)
             pred['depth'] = np.squeeze(pred['depth'])
             vl._stac_mask_sky(pred, views)
-            pred['_stac_frames'] = wa + wb
-            pred['_stac_split'] = len(wa)
-            if vl._stac_stamp_digest() is not None:
-                pred['_stac_fork_stamp'] = vl._stac_stamp_digest()
-            np.save(p, pred)
+            fits, side_pts = self._bridge_fits(pred, a, b, wa, wb, cache)
             del pred
             torch.cuda.empty_cache()
+            rec = {'_stac_frames': wa + wb, '_stac_split': len(wa), 'fits': fits, 'side_pts': side_pts}
+            if vl._stac_stamp_digest() is not None:
+                rec['_stac_fork_stamp'] = vl._stac_stamp_digest()
+            np.save(p, rec)
             print(f"{LOG} bridge {a}<->{b} (revisit {i}<->{j}): {len(wa)}+{len(wb)} keyframes")
+        cache.clear()
 
     def closures(self) -> List[dict]:
-        """The loop edges of the graph: per bridge, its fit onto cube a and onto cube b on EXACT pixel
-        correspondences (the same frames in both passes), composed into cube b → cube a — the seam convention
-        ({"a": b, "b": a}: the transform maps edge["a"]'s coordinates onto edge["b"]'s)."""
-        from loop_utils.loop_bridges import robust_sim3
-        from loop_utils.stable_sample import pixel_keys
+        """The loop edges of the graph: per bridge, its fits onto cube a and onto cube b (``_bridge_fits``, on EXACT
+        pixel correspondences), composed into cube b → cube a — the seam convention ({"a": b, "b": a}: the transform
+        maps edge["a"]'s coordinates onto edge["b"]'s)."""
         out = []
         for a, b, i, j, wa, wb in self._bridge_items():
             p = self._bridge_path(a, b, i, j)
             if not os.path.exists(p):
                 continue
-            br = np.load(p, allow_pickle=True).item()
-            fits, side_pts = {}, {}
-            for side, k, win, off in (("a", a, wa, 0), ("b", b, wb, len(wa))):
-                dk = np.load(_path(self.un, k), allow_pickle=True).item()
-                lb = np.arange(off, off + len(win))
-                lk = np.asarray([self.local[k][int(g)] for g in win])
-                pb, pk = _wp(br)[lb], _wp(dk)[lk]
-                shp = pb.shape[:3]
-                ok = (_conf(br, _wp(br).shape[:3])[lb] > 1e-5) & (_conf(dk, _wp(dk).shape[:3])[lk] > 1e-5)
-                rng_m = float(getattr(self, "range_m", 0.0))
-                if rng_m > 0:
-                    # the range on the cube's side (metric; the bridge is in Omega's raw units)
-                    ck = _ext(dk)[lk][:, :3, 3]
-                    ok &= np.linalg.norm(pk - ck[:, None, None, :], axis=-1) <= rng_m
-                flat = np.flatnonzero(ok.reshape(-1))
-                px = int(shp[1]) * int(shp[2])
-                keys = pixel_keys(np.asarray(win)[flat // px], flat % px)
-                f3 = robust_sim3(pb.reshape(-1, 3)[flat].astype(np.float64),
-                                 pk.reshape(-1, 3)[flat].astype(np.float64), keys=keys)
-                # each side's scale is the bridge's raw Omega scale against a cube already in the metric lock's
-                # scale (~5–7× on pccr 2026-11-08: all 49 closures were refused here) — only the COMPOSED relative
-                # scale between the two cubes is held to SCALE_RANGE, below
-                if f3 is None or not (float(f3[0]) > 0):
-                    fits = None
-                    break
-                fits[side] = f3
-                if side == "a":
-                    cams = _ext(dk)[lk][:, :3, 3]
-                    q = pk.reshape(-1, 3)[flat].astype(np.float64)
-                    side_pts = {"centroid": np.median(q[::max(1, len(q) // 20000)], axis=0).tolist(),
-                                "lever_m": float(np.median(np.linalg.norm(
-                                    q[::max(1, len(q) // 20000)][:, None, :] - cams[None], axis=2).min(1)))}
-                del dk
+            rec = np.load(p, allow_pickle=True).item()
+            fits, side_pts = rec.get('fits'), rec.get('side_pts') or {}
             if not fits:
                 print(f"{LOG} ⚠ closure {a}<->{b} (revisit {i}<->{j}): a side starved or degenerate — not an edge "
                       f"(declared)")
@@ -1049,17 +1075,19 @@ def process_cubes(vl, *, images_to_u8, images_u8, save_ply, apply_sim3_direct):
         torch.cuda.empty_cache()
         run.witness_pass(k)
         torch.cuda.empty_cache()
-    if run.revisits and run.K > 1:
-        run.bridges()          # the revisit bridges need the model: before it is released
-    del vl.model
-    torch.cuda.empty_cache()
     if run.load_graph():
+        del vl.model
+        torch.cuda.empty_cache()
         print(f"{LOG} the graph of this layout and stamp is on disk (chunk_graph.json) — resumed past it")
     else:
         if any(os.path.exists(_path(run.al, k)) for k in range(run.K)):
             raise RuntimeError(f"{LOG} some cubes are placed and some are not, without a graph of this layout — "
                                f"delete _tmp_results_aligned and re-run")
         run.metric_lock()
+        if run.revisits and run.K > 1:
+            run.bridges()      # the model (still loaded) + the LOCKED cubes: each bridge is fitted as it is inferred
+        del vl.model
+        torch.cuda.empty_cache()
         run.graph(run.seams() if run.K > 1 else [])
     run.apply()
     if vl._stac_graph_cfg() is not None:
